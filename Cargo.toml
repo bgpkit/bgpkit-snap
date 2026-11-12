@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/snaptrie"]
+members = ["crates/bgpkit-snap"]
 resolver = "2"
 
 [workspace.package]

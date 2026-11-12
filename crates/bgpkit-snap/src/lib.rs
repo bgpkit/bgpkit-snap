@@ -202,8 +202,8 @@ fn projection<T: SnapValue>(
     meta.insert(
         "provenance".into(),
         json!({
-            "generator": "snaptrie-poc/0.0.1",
-            "producer": "snaptrie/0.0.1",
+            "generator": "bgpkit-snap/0.0.1",
+            "producer": "bgpkit-snap/0.0.1",
             "sources": [{"uri": source}],
         }),
     );

@@ -1,5 +1,5 @@
 [package]
-name = "snaptrie"
+name = "bgpkit-snap"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -2,12 +2,12 @@
 //! This is the alarm that fires if prefix-trie or rkyv ever change their
 //! archived layout.
 
+use bgpkit_snap::{Snapshot, Writer};
 use ipnet::IpNet;
-use snaptrie::{Snapshot, Writer};
 
 const CREATED: &str = "2026-11-12T00:00:00Z";
 const EXPECTED_CONTENT_ID: &str =
-    "3b31654da3255ab5a3ff17ae9d741104019b942be2115465c2600d584122fa24";
+    "cb0a6d0a4e1fd3fd6a75ae708bb67ad30539e9e19daaef1e53591afed1400864";
 
 fn root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

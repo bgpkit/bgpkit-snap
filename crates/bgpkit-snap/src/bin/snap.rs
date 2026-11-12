@@ -1,8 +1,8 @@
 use std::io::Write;
 
+use bgpkit_snap::{Snapshot, Writer};
 use clap::{Parser, Subcommand};
 use ipnet::IpNet;
-use snaptrie::{Snapshot, Writer};
 
 #[derive(Parser)]
 #[command(name = "snap", about = "bgpkit-snap PoC CLI")]

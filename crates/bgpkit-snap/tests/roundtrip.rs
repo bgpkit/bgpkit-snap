@@ -1,8 +1,8 @@
 //! Behaviour the format contract promises: round trip, determinism across
 //! insertion order, and rejection of every corruption the reader checks.
 
+use bgpkit_snap::{Error, Snapshot, Writer};
 use ipnet::IpNet;
-use snaptrie::{Error, Snapshot, Writer};
 
 const CREATED: &str = "2026-11-12T00:00:00Z";
 
