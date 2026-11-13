@@ -726,13 +726,11 @@ fn last_record_seq(path: &Path) -> Result<Option<u64>, Error> {
     let mut last = None;
     while off + 8 <= raw.len() {
         let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("4 bytes")) as usize;
-        if off + 4 + len > raw.len() {
+        // a zero or short length would slice backwards; it is a torn tail
+        if len < RECORD_FIXED_LEN || off + 4 + len > raw.len() {
             break;
         }
         let payload = &raw[off + 8..off + 4 + len];
-        if payload.len() < 8 {
-            break;
-        }
         last = Some(u64::from_le_bytes(
             payload[0..8].try_into().expect("8 bytes"),
         ));

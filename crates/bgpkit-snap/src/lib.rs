@@ -356,6 +356,11 @@ impl<T: SnapValue> Writer<T> {
             ));
         }
         let v6_bytes = rkyv::to_bytes::<RkyvError>(&self.v6).map_err(|_| Error::BodyHash)?;
+        if v6_bytes.len() as u64 >= 2 * 1024 * 1024 * 1024 {
+            return Err(Error::BadMeta(
+                "TRIE_V6 exceeds the 2 GiB archive limit".into(),
+            ));
+        }
         let mut trie_sections: Vec<(u16, &[u8])> = Vec::new();
         if !self.v4.is_empty() {
             trie_sections.push((ID_V4, &v4_bytes));

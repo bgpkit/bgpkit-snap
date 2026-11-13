@@ -452,3 +452,37 @@ fn a_new_incarnation_mints_the_generation_before_the_segment_header() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_zero_length_tail_does_not_panic_the_open_path() {
+    // Journal::open scans the last segment to resume the sequence; a zeroed
+    // length field there used to slice backwards
+    let dir = tmpdir("zero-len");
+    let tree_id = [14u8; 16];
+    let log_dir = dir.join("journal");
+    let generation;
+    {
+        let mut j = Journal::open(&log_dir, tree_id).unwrap();
+        generation = j.generation();
+        j.insert("10.50.0.0/16".parse().unwrap(), &1u32, 0).unwrap();
+        j.sync().unwrap();
+    }
+    let seg = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
+        .max()
+        .unwrap();
+    let mut raw = std::fs::read(&seg).unwrap();
+    let hdr = bgpkit_snap::journal::SEGMENT_HEADER_LEN;
+    raw[hdr..hdr + 4].copy_from_slice(&0u32.to_le_bytes());
+    std::fs::write(&seg, &raw).unwrap();
+
+    let j = Journal::open(&log_dir, tree_id).unwrap();
+    assert!(j.seq() >= 2, "the scan survives a zeroed length field");
+    drop(j);
+    let mut tree = Tree::<u32>::new();
+    let stats = journal::replay(&mut tree, &log_dir, 0, tree_id, generation).unwrap();
+    assert_eq!(stats.applied, 0, "the zeroed record is torn, not applied");
+    std::fs::remove_dir_all(&dir).ok();
+}
