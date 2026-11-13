@@ -486,3 +486,37 @@ fn a_zero_length_tail_does_not_panic_the_open_path() {
     assert_eq!(stats.applied, 0, "the zeroed record is torn, not applied");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn an_unreopened_tear_is_reported_before_any_truncation() {
+    let dir = tmpdir("tear-report");
+    let tree_id = [15u8; 16];
+    let log_dir = dir.join("journal");
+    let generation;
+    {
+        let mut j = Journal::open(&log_dir, tree_id).unwrap();
+        generation = j.generation();
+        j.insert("10.60.0.0/16".parse().unwrap(), &1u32, 0).unwrap();
+        j.insert("10.61.0.0/16".parse().unwrap(), &2u32, 0).unwrap();
+        j.sync().unwrap();
+    }
+    let seg = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
+        .max()
+        .unwrap();
+    let len = std::fs::metadata(&seg).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&seg)
+        .unwrap()
+        .set_len(len - 5)
+        .unwrap();
+
+    let mut tree = Tree::<u32>::new();
+    let stats = journal::replay(&mut tree, &log_dir, 0, tree_id, generation).unwrap();
+    assert!(stats.torn_bytes > 0, "a tear is reported by replay");
+    assert_eq!(stats.applied, 1, "only the complete record applies");
+    std::fs::remove_dir_all(&dir).ok();
+}

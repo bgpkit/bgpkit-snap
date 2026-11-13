@@ -94,16 +94,17 @@ after a crash between an append and a checkpoint.
 
 ## Known limitations
 
-Tracked for 1.0 final; none of them can silently drop or misread data in the
-current code, and each one makes the reader reject more rather than less:
+One deliberate gap remains at 1.0-rc1, plus two items for 1.0 final:
 
-1. `checkpoint` verifies the new snapshot's header before pruning segments, not
-   its body.
-2. The reader enforces that projection leaves re-serialize canonically but does
-   not yet reject a float leaf outright.
-3. Footer entry `flags` is not read, so an unknown section marked required is
-   accepted instead of refused.
-4. A torn segment tail is counted and reported but the file is not truncated.
+1. A torn segment tail is reported and left in place, not truncated. Truncating
+   it would require tolerating a sequence gap at that boundary, which would also
+   hide a genuinely lost segment; leaving the bytes makes the tear visible and
+   keeps the gap check strict.
+2. Segment header `major`/`minor` and record `flags` are not checked yet.
+3. Values inside a projection are validated for canonical form and for
+   integer-or-ASCII leaves, but the check walks the parsed document rather than
+   the bytes, so a producer with a different JSON writer must rely on the
+   re-serialization check to catch it.
 
 ## Building
 

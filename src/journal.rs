@@ -315,13 +315,18 @@ impl Journal {
     ///
     /// The previous snapshot and its segments survive until the new snapshot is
     /// on disk, so a crash mid-checkpoint replays cleanly against the old base.
-    pub fn checkpoint(
+    pub fn checkpoint<V>(
         &mut self,
-        tree: &Tree<impl Codec>,
+        tree: &Tree<V>,
         dir: impl AsRef<Path>,
         created_at: &str,
         source: &str,
-    ) -> Result<String, Error> {
+    ) -> Result<String, Error>
+    where
+        V: Codec,
+        V::Archived:
+            for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
+    {
         let bytes = tree.to_writer().finish_with(
             created_at,
             source,
@@ -345,8 +350,17 @@ impl Journal {
             f.write_all(&bytes)?;
             f.sync_all()?;
         }
+        // the bytes must be a valid object before anything is deleted: a
+        // truncated body would otherwise take the only other copy with it
+        crate::Snapshot::<V>::from_bytes(&bytes)?;
         std::fs::rename(&tmp_path, &final_path)?;
         File::open(dir)?.sync_all()?;
+        // and the file that landed on disk must be readable end to end
+        crate::Snapshot::<V>::open(
+            final_path
+                .to_str()
+                .ok_or_else(|| Error::BadMeta("snapshot path is not valid UTF-8".into()))?,
+        )?;
 
         let checkpoint = serde_json::json!({
             "snapshot_file": name,

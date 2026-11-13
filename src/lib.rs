@@ -556,6 +556,11 @@ impl<T: Codec> Snapshot<T> {
         if flags & 1 == 0 {
             return Err(Error::BadSectionTable("body hash flag is not set"));
         }
+        if flags & !1u32 != 0 || footer[12..16].iter().any(|b| *b != 0) {
+            return Err(Error::BadSectionTable(
+                "footer flag or reserved bits are undefined",
+            ));
+        }
         if count != header.section_count as usize {
             return Err(Error::BadSectionTable(
                 "footer count disagrees with the header",
@@ -568,12 +573,28 @@ impl<T: Codec> Snapshot<T> {
         for i in 0..count {
             let e = &footer[16 + i * ENTRY_LEN..16 + (i + 1) * ENTRY_LEN];
             let id = u16::from_le_bytes([e[0], e[1]]);
+            let kind = u16::from_le_bytes([e[2], e[3]]);
+            let entry_flags = u16::from_le_bytes([e[4], e[5]]);
             let align = e[6] as usize;
+            let pad = e[7];
             let off = u64::from_le_bytes(e[8..16].try_into().unwrap()) as usize;
             let len = u64::from_le_bytes(e[16..24].try_into().unwrap()) as usize;
             let hash = &e[24..56];
             if id <= prev_id && i > 0 {
                 return Err(Error::BadSectionTable("section ids are not ascending"));
+            }
+            if kind != id || pad != 0 || e[56..64].iter().any(|b| *b != 0) {
+                return Err(Error::BadSectionTable("footer entry fields are invalid"));
+            }
+            // an extension a reader does not implement must not be silently
+            // dropped when the writer marked it required
+            if entry_flags & 1 != 0 && !matches!(id, ID_META | ID_V4 | ID_V6) {
+                return Err(Error::BadSectionTable("unknown required section"));
+            }
+            if entry_flags & !1u16 != 0 {
+                return Err(Error::BadSectionTable(
+                    "footer entry flag bits are undefined",
+                ));
             }
             if align != ALIGN || !off.is_multiple_of(ALIGN) {
                 return Err(Error::SectionMisaligned(id));
@@ -684,6 +705,7 @@ impl<T: Codec> Snapshot<T> {
             content_id,
             _t: std::marker::PhantomData,
         };
+        snap.verify_projection_leaves()?;
         snap.verify_content_id()?;
         snap.verify_counts_and_probes()?;
         snap.verify_header_agreement(&header)?;
@@ -737,6 +759,31 @@ impl<T: Codec> Snapshot<T> {
                 let a = self.v6()?.get_lpm(&p)?;
                 Some((IpNet::V6(a.0), a.1))
             }
+        }
+    }
+
+    /// A projection leaf is a signed integer or an ASCII string. A float keeps
+    /// two implementations from agreeing on the hash input, so it is out of spec.
+    fn verify_projection_leaves(&self) -> Result<(), Error> {
+        fn walk(v: &serde_json::Value) -> Result<(), Error> {
+            match v {
+                serde_json::Value::Number(n) if n.as_i64().is_none() && n.as_u64().is_none() => {
+                    Err(Error::BadMeta("projection leaf is not an integer".into()))
+                }
+                serde_json::Value::String(s) => {
+                    if !s.is_ascii() || s.bytes().any(|b| b < 0x20 || b == b'"' || b == b'\\') {
+                        return Err(Error::BadMeta("projection string needs escaping".into()));
+                    }
+                    Ok(())
+                }
+                serde_json::Value::Array(a) => a.iter().try_for_each(walk),
+                serde_json::Value::Object(o) => o.values().try_for_each(walk),
+                _ => Ok(()),
+            }
+        }
+        match self.meta.get("projection") {
+            Some(p) => walk(p),
+            None => Err(Error::MissingMeta),
         }
     }
 

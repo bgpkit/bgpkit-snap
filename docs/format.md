@@ -254,17 +254,14 @@ Two snapshots over the same key space merge losslessly only when the value is a 
 
 ## 11. Known limitations of 1.0-rc1
 
-These are tracked for 1.0 final. None lets a reader accept an object it should
-reject in a way that changes an answer; they are gaps in strictness.
-
-1. `checkpoint` verifies the new snapshot's header before pruning segments, not
-   its body.
-2. A projection leaf must be a signed integer or an ASCII string, and the reader
-   enforces canonical re-serialization, but it does not reject a float leaf
-   outright.
-3. A footer entry's `flags` field is not read, so a section marked required by an
-   unknown extension is accepted instead of refused.
-4. A torn segment tail is reported but not truncated (section 9).
+1. A torn segment tail is reported and left in place rather than truncated. A
+   truncation would have to be accompanied by a rule that tolerates one missing
+   sequence at that boundary, and that rule would also mask a genuinely lost
+   segment, so the bytes stay and the gap check stays strict.
+2. Segment header `major`/`minor` and record `flags` are not validated yet.
+3. Projection leaves are checked after parsing META rather than over the raw
+   bytes; a producer whose JSON writer differs must rely on the canonical
+   re-serialization check.
 
 ## 12. Normative references
 
