@@ -10,9 +10,7 @@ const EXPECTED_CONTENT_ID: &str =
     "1e42418131d392f2c7504f01e5126ccca907261ef44317db323ea66edc97b4a3";
 
 fn root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("testdata")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata")
 }
 
 #[test]

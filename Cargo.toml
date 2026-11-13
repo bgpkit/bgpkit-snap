@@ -1,12 +1,41 @@
-[workspace]
-members = ["crates/bgpkit-snap"]
-resolver = "2"
-
-[workspace.package]
-version = "0.0.1"
+[package]
+name = "bgpkit-snap"
+version = "1.0.0-rc.1"
 edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "local PoC"
+rust-version = "1.88.0"
+license = "MIT"
+repository = "https://github.com/bgpkit/bgpkit-snap"
+readme = "README.md"
+description = "Versioned, memory-mappable container for prefix tries, with an append-only journal"
+keywords = ["bgp", "prefix", "trie", "snapshot", "mmap"]
+categories = ["network-programming", "data-structures", "filesystem"]
+
+[features]
+default = []
+# The `snap` CLI. Library users never pay for clap.
+cli = ["dep:clap"]
+
+[dependencies]
+prefix-trie = { version = "0.10", features = ["rkyv", "ipnet"] }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "aligned"] }
+ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+crc32c = "0.6"
+fs2 = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"], optional = true }
+
+[[bin]]
+name = "snap"
+path = "src/bin/snap.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "gen-fixture"
+path = "src/bin/gen_fixture.rs"
+required-features = ["cli"]
 
 [profile.release]
 debug = 1

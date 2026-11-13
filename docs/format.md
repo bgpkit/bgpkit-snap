@@ -1,4 +1,4 @@
-Source: /root/specs/bgpkit-snap/bgpkit-snap-format.md · generated 2026-11-12 · This document is the publishable format contract. It contains no BGPKIT-internal detail; the BGP value types and pipeline usage live in bgpkit-snap-design.md.
+Status: 1.0-rc1. The layout below is frozen for the release candidate; see section 11 for the limitations that remain before 1.0 final.
 
 # snap format 1.0
 
@@ -232,7 +232,7 @@ record: len u32 LE (bytes after this field, so a record is 4 + len)
 - A torn tail ends that segment, not the scan: replay reports the bytes, continues
   with the next segment, and accepts a forward jump in sequence only across that
   boundary, because the missing record was never fsynced and never acked.
-- A record is applied only if `crc32c` matches and `4 + len` lands on the next record boundary. A torn tail is truncated on open and the byte count is reported.
+- A record is applied only if `crc32c` matches and `4 + len` lands on the next record boundary. A torn tail ends that segment: replay reports the byte count and never applies the partial record. The file itself is left untouched, so the tear remains visible to the next reader.
 - **Durability.** `insert` and `withdraw` append to a buffered segment; a record is durable once `sync()` returns. A feed that must ack a peer after durability calls `sync()` before acking its batch, which is the group-commit path; a per-record ack would pay one fsync per record. A checkpoint writes the snapshot, fsyncs the file and the directory, writes `checkpoint.json` (`{snapshot_file, base_seq, tree_id, generation}`) by temporary file plus rename, fsyncs the directory again, and only then deletes segments wholly below `base_seq + 1`.
 - **Recovery.** Replay only records with `seq > base_seq` from segments whose
   `tree_id` and `generation` both match the snapshot's. `base_seq` is the highest
@@ -251,3 +251,27 @@ Checkpoint triggers, whichever comes first: 60 s since the last checkpoint, 250,
 ## 10. Merging
 
 Two snapshots over the same key space merge losslessly only when the value is a join-semilattice: set union, bitmap union, or count addition. Both archives iterate in key order, so a merge is a streaming k-way fold. A scalar value is not mergeable in this sense: picking one side silently drops the other. Mutable or session state is never mergeable, because a merged tree no longer knows which source contributed an entry.
+
+## 11. Known limitations of 1.0-rc1
+
+These are tracked for 1.0 final. None lets a reader accept an object it should
+reject in a way that changes an answer; they are gaps in strictness.
+
+1. `checkpoint` verifies the new snapshot's header before pruning segments, not
+   its body.
+2. A projection leaf must be a signed integer or an ASCII string, and the reader
+   enforces canonical re-serialization, but it does not reject a float leaf
+   outright.
+3. A footer entry's `flags` field is not read, so a section marked required by an
+   unknown extension is accepted instead of refused.
+4. A torn segment tail is reported but not truncated (section 9).
+
+## 12. Normative references
+
+- `rkyv` 0.8, little endian, aligned, with `bytecheck`, for every trie section.
+- `prefix-trie` 0.10, for the archived map layout.
+- BLAKE3 for section and body hashes, CRC-32C for the header and journal records.
+
+The archived layout is not described by this document; it is pinned by the
+golden object in the test suite, so a dependency bump that changes the layout
+fails the build rather than silently producing different bytes.
