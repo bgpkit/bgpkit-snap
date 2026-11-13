@@ -378,3 +378,77 @@ fn reopening_a_journal_that_holds_no_records_keeps_them_reachable() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_torn_tail_does_not_hide_records_from_the_next_segment() {
+    let dir = tmpdir("torn-then-restart");
+    let tree_id = [12u8; 16];
+    let log_dir = dir.join("journal");
+    let generation;
+    {
+        let mut j = Journal::open(&log_dir, tree_id).unwrap();
+        generation = j.generation();
+        j.insert("10.40.0.0/16".parse().unwrap(), &1u32, 0).unwrap();
+        j.insert("10.41.0.0/16".parse().unwrap(), &2u32, 0).unwrap();
+        j.sync().unwrap();
+    }
+    // tear the last record: the write was in flight when the process died
+    let seg = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
+        .max()
+        .unwrap();
+    let len = std::fs::metadata(&seg).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&seg)
+        .unwrap()
+        .set_len(len - 7)
+        .unwrap();
+
+    {
+        let mut j = Journal::open(&log_dir, tree_id).unwrap();
+        assert_eq!(j.generation(), generation, "a resume keeps the generation");
+        j.insert("10.42.0.0/16".parse().unwrap(), &3u32, 0).unwrap();
+        j.sync().unwrap();
+    }
+
+    let mut tree = Tree::<u32>::new();
+    let stats = journal::replay(&mut tree, &log_dir, 0, tree_id, generation).unwrap();
+    assert!(stats.torn_bytes > 0, "the tear is still reported");
+    assert_eq!(
+        stats.applied, 2,
+        "the surviving record plus the one after the restart"
+    );
+    assert!(tree.get("10.40.0.0/16".parse().unwrap()).is_some());
+    assert!(tree.get("10.42.0.0/16".parse().unwrap()).is_some());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_new_incarnation_mints_the_generation_before_the_segment_header() {
+    let dir = tmpdir("incarnation");
+    let tree_id = [13u8; 16];
+    let log_dir = dir.join("journal");
+    let first = Journal::open(&log_dir, tree_id).unwrap().generation();
+    let second = Journal::open_new_incarnation(&log_dir, tree_id).unwrap();
+    let second_gen = second.generation();
+    assert_ne!(first, second_gen, "a fork must not reuse the generation");
+    drop(second);
+
+    // every segment header must agree with the journal it belongs to
+    let seg = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
+        .max()
+        .unwrap();
+    let raw = std::fs::read(seg).unwrap();
+    assert_eq!(
+        &raw[28..44],
+        &second_gen,
+        "segment header carries the new generation"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

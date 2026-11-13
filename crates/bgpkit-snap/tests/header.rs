@@ -171,3 +171,29 @@ fn a_stream_snapshot_carries_replay_coordinates() {
         Some("11111111111111111111111111111111")
     );
 }
+
+#[test]
+fn a_footer_offset_overflow_is_rejected_not_panicked() {
+    let mut raw = build("test");
+    let h = Header::parse(&raw).unwrap();
+    let mut h2 = h.clone();
+    h2.footer_off = u64::MAX - 8;
+    raw[..192].copy_from_slice(&h2.encode());
+    let err = Snapshot::<u32>::from_bytes(&raw).unwrap_err();
+    assert!(
+        format!("{err}").to_lowercase().contains("overflow")
+            || format!("{err}").to_lowercase().contains("footer"),
+        "{err}"
+    );
+}
+
+#[test]
+fn acceptance_does_not_depend_on_where_the_callers_buffer_sits() {
+    let raw = build("test");
+    for shift in 0..16usize {
+        let mut buf = vec![0u8; raw.len() + shift];
+        buf[shift..].copy_from_slice(&raw);
+        let ok = Snapshot::<u32>::from_bytes(&buf[shift..]).is_ok();
+        assert!(ok, "shift {shift} changed the verdict");
+    }
+}

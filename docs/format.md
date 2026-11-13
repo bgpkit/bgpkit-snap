@@ -44,7 +44,7 @@ HEADER (192 B, replaces the 64-byte prefix of draft 0.1; offsets are absolute)
  188..192  header_crc32c u32 LE over bytes 0..188
 
 SECTIONS, each starting at the first 16-byte boundary at or after the previous
-end (zero padding between them), non-overlapping, the first at or after 192
+end (zero padding between them), non-overlapping, the first exactly at 192
 
 FOOTER, ends the file
   0..4    section_count u32 LE
@@ -76,7 +76,7 @@ bytes in the order the entries list them.
 3  TRIE_V6 the same for IPv6
 ```
 
-Rules: ids ascending and unique, META first, each section starts at the first 16-byte boundary at or after the previous section end (padding bytes are zero and belong to no section), the first starts at 192, and the last ends at or before `footer_off`, `meta_off`/`meta_len` in the header equal to the META entry, trie sections never compressed, at least one trie section present. A prefix-set is a trie whose value type is empty.
+Rules: ids ascending and unique, META first, each section starts at the first 16-byte boundary at or after the previous section end (padding bytes are zero and belong to no section), the first starts exactly at 192, and the last ends at or before `footer_off`, `meta_off`/`meta_len` in the header equal to the META entry, trie sections never compressed, at least one trie section present. A prefix-set is a trie whose value type is empty.
 
 ## 4. META
 
@@ -94,6 +94,9 @@ META is canonical JSON with three top-level keys:
   }
 }
 ```
+
+Leaves of `projection` are signed integers (event timestamps may precede the
+epoch) and ASCII strings without `"` or `\`. `content_id` is lowercase hex.
 
 `projection` carries: `canonical` (host bits zeroed, prefix form `network/len`),
 `counts` (`v4`, `v6`, omitted when a family has no entries), `families` (array of
@@ -220,7 +223,15 @@ record: len u32 LE (bytes after this field, so a record is 4 + len)
         value bytes (insert: the archived value in canonical form)
 ```
 
-- One writer per tree, enforced by a lock.
+- One writer per tree, enforced by a lock file held for the process lifetime.
+- Segment file names are a creation counter (`segment-<n>.log`), not a sequence
+  number. The next sequence comes from `state.json`, written by `sync()` after
+  the segment fsync, so a reopen cannot reissue a number even when the last
+  record is torn. Without `state.json` the writer falls back to the checkpoint
+  and the highest record on disk.
+- A torn tail ends that segment, not the scan: replay reports the bytes, continues
+  with the next segment, and accepts a forward jump in sequence only across that
+  boundary, because the missing record was never fsynced and never acked.
 - A record is applied only if `crc32c` matches and `4 + len` lands on the next record boundary. A torn tail is truncated on open and the byte count is reported.
 - **Durability.** `insert` and `withdraw` append to a buffered segment; a record is durable once `sync()` returns. A feed that must ack a peer after durability calls `sync()` before acking its batch, which is the group-commit path; a per-record ack would pay one fsync per record. A checkpoint writes the snapshot, fsyncs the file and the directory, writes `checkpoint.json` (`{snapshot_file, base_seq, tree_id, generation}`) by temporary file plus rename, fsyncs the directory again, and only then deletes segments wholly below `base_seq + 1`.
 - **Recovery.** Replay only records with `seq > base_seq` from segments whose
@@ -230,6 +241,7 @@ record: len u32 LE (bytes after this field, so a record is 4 + len)
   segment whose generation differs from `checkpoint.json`: sequence numbers are
   only unique within one incarnation.
 - **Retention.** Segments wholly at or below `base_seq` are deleted at the next checkpoint; a query older than the oldest retained segment returns a "history pruned" outcome rather than an answer derived from a later base.
+- **Incarnation.** `Journal::open` resumes the generation already on disk; starting a fresh incarnation (a restore, a fork, or a deliberate rebuild) MUST go through the entry point that mints a new generation before the segment header is written, or the segment and the checkpoint disagree.
 - **Restore and fork.** A journal restored from a backup, or copied to start a divergent tree, MUST mint a new `generation`. Reusing the old one lets two different states claim the same `(tree_id, generation, base_seq)`, which is exactly the confusion the generation exists to prevent.
 - **Checkpoint binding.** `checkpoint.json` names a snapshot; `tree_id`, `generation` and `base_seq` in it MUST equal the snapshot header's, and a reader MUST refuse the pair when they differ. A checkpoint from a later incarnation next to an older snapshot would otherwise replay from the wrong base.
 - Control records carry a subtype and an opaque payload defined by the value type's owner. The format defines no session, gap or timestamp semantics.

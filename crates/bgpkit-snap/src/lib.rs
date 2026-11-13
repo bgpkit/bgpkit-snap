@@ -348,6 +348,13 @@ impl<T: SnapValue> Writer<T> {
             .timestamp();
 
         let v4_bytes = rkyv::to_bytes::<RkyvError>(&self.v4).map_err(|_| Error::BodyHash)?;
+        // one archive is limited to 2 GiB by the 32-bit relative offsets; larger
+        // sets shard, and a writer must say so rather than emit an invalid object
+        if v4_bytes.len() as u64 >= 2 * 1024 * 1024 * 1024 {
+            return Err(Error::BadMeta(
+                "TRIE_V4 exceeds the 2 GiB archive limit".into(),
+            ));
+        }
         let v6_bytes = rkyv::to_bytes::<RkyvError>(&self.v6).map_err(|_| Error::BodyHash)?;
         let mut trie_sections: Vec<(u16, &[u8])> = Vec::new();
         if !self.v4.is_empty() {
@@ -528,7 +535,14 @@ impl<T: Codec> Snapshot<T> {
         }
         let footer_off = header.footer_off as usize;
 
-        let footer = &raw[footer_off..];
+        // every section byte is read from an aligned copy: rkyv validation
+        // depends on the alignment of the slice it is handed, so validating the
+        // caller's bytes would accept or reject one object depending on where
+        // the caller's buffer sits
+        let mut aligned = AlignedVec::with_capacity(raw.len());
+        aligned.extend_from_slice(raw);
+
+        let footer = &aligned[footer_off..];
         let count = u32::from_le_bytes(footer[0..4].try_into().unwrap()) as usize;
         if &footer[4..8] != FOOTER_MAGIC {
             return Err(Error::BadFooter);
@@ -559,15 +573,18 @@ impl<T: Codec> Snapshot<T> {
             if align != ALIGN || !off.is_multiple_of(ALIGN) {
                 return Err(Error::SectionMisaligned(id));
             }
-            if off < prev_end || off + len > footer_off {
+            let Some(end) = off.checked_add(len) else {
+                return Err(Error::SectionOverlap(id));
+            };
+            if off < prev_end || end > footer_off {
                 return Err(Error::SectionOverlap(id));
             }
-            if &blake3::hash(&raw[off..off + len]).as_bytes()[..] != hash {
+            if &blake3::hash(&aligned[off..off + len]).as_bytes()[..] != hash {
                 return Err(Error::SectionHash(id));
             }
             sections.push((id, off, len));
             prev_id = id;
-            prev_end = off + len;
+            prev_end = end;
         }
         if sections.first().map(|s| s.0) != Some(ID_META) {
             return Err(Error::MissingMeta);
@@ -597,19 +614,13 @@ impl<T: Codec> Snapshot<T> {
         {
             let mut h = blake3::Hasher::new();
             for (_, off, len) in &sections {
-                h.update(&raw[*off..*off + *len]);
+                h.update(&aligned[*off..*off + *len]);
             }
             let expect = &footer[16 + count * ENTRY_LEN..16 + count * ENTRY_LEN + 32];
             if h.finalize().as_bytes() != expect {
                 return Err(Error::BodyHash);
             }
         }
-
-        // copy into an aligned buffer first: rkyv validation depends on the
-        // alignment of the slice it is handed, so validating the caller's bytes
-        // would accept or reject the same object depending on where it sits
-        let mut aligned = AlignedVec::with_capacity(raw.len());
-        aligned.extend_from_slice(raw);
 
         // an untrusted object can carry a hash-consistent but structurally
         // invalid archive, so every trie section is checked before any
@@ -618,13 +629,13 @@ impl<T: Codec> Snapshot<T> {
             match *id {
                 ID_V4 => {
                     rkyv::access::<ArchivedPrefixMap<Ipv4Net, T>, RkyvError>(
-                        &raw[*off..*off + *len],
+                        &aligned[*off..*off + *len],
                     )
                     .map_err(|_| Error::BadSectionTable("TRIE_V4 archive is invalid"))?;
                 }
                 ID_V6 => {
                     rkyv::access::<ArchivedPrefixMap<Ipv6Net, T>, RkyvError>(
-                        &raw[*off..*off + *len],
+                        &aligned[*off..*off + *len],
                     )
                     .map_err(|_| Error::BadSectionTable("TRIE_V6 archive is invalid"))?;
                 }
@@ -862,13 +873,18 @@ impl<T: Codec> Snapshot<T> {
             (6u8, "v6_first", "first"),
             (6u8, "v6_last", "last"),
         ] {
-            let Some(want) = self
+            // an absent family carries no probe; a declared one must carry both
+            if (family == 4 && self.v4().is_none()) || (family == 6 && self.v6().is_none()) {
+                continue;
+            }
+            let want = self
                 .meta
                 .pointer(&format!("/projection/probe/{key}"))
                 .and_then(|v| v.as_str())
-            else {
-                continue;
-            };
+                .ok_or(Error::ProbeMismatch {
+                    family,
+                    which: probe,
+                })?;
             let Ok(p) = want.parse::<IpNet>() else {
                 return Err(Error::ProbeMismatch {
                     family,

@@ -88,7 +88,21 @@ pub struct Journal {
 
 impl Journal {
     /// Open (or create) a journal directory and start a new segment.
+    ///
+    /// The sequence continues from `state.json` when it exists, otherwise from
+    /// the checkpoint plus the highest record on disk. Segment file names are a
+    /// creation counter, not a sequence: decoupling them is what lets a reopen
+    /// always write a fresh segment without ever reusing a number.
     pub fn open(dir: impl AsRef<Path>, tree_id: [u8; 16]) -> Result<Self, Error> {
+        let generation = None;
+        Self::open_with(dir, tree_id, generation)
+    }
+
+    fn open_with(
+        dir: impl AsRef<Path>,
+        tree_id: [u8; 16],
+        generation: Option<[u8; 16]>,
+    ) -> Result<Self, Error> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
         // one writer per tree: an advisory lock held for the process lifetime
@@ -100,32 +114,29 @@ impl Journal {
         lock.try_lock_exclusive()
             .map_err(|_| Error::BadMeta("another writer holds this journal".into()))?;
         std::fs::write(dir.join("writer.pid"), std::process::id().to_string())?;
-        // reuse the generation of the segment already on disk, otherwise mint a
-        // new one for this incarnation
-        let generation = Self::existing_generation(&dir)?.unwrap_or_else(random_generation);
-        let start = Self::next_seq(&dir)?;
-        // a segment holding only its header must be appended to, not re-opened
-        // with a second header: the later records would be unreachable
-        let reuse_empty = Self::newest_is_header_only(&dir)?;
-        let seg_path = dir.join(format!("segment-{start:012}.log"));
+
+        let state = read_state(&dir)?;
+        let generation = match generation {
+            Some(g) => g,
+            None => state
+                .as_ref()
+                .map(|s| s.generation)
+                .or(Self::existing_generation(&dir)?)
+                .unwrap_or_else(random_generation),
+        };
+        let base = match state.as_ref() {
+            Some(s) => s.next_seq,
+            None => {
+                let checkpoint = read_checkpoint(&dir)?.map_or(0, |c| c.base_seq);
+                Self::scan_max_seq(&dir)?.map_or(checkpoint + 1, |m| (m + 1).max(checkpoint + 1))
+            }
+        };
+        let counter = Self::next_segment_counter(&dir)?;
+        let seg_path = dir.join(format!("segment-{counter:012}.log"));
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&seg_path)?;
-        if reuse_empty && file.metadata()?.len() == SEGMENT_HEADER_LEN as u64 {
-            file.sync_all()?;
-            return Ok(Self {
-                dir,
-                _lock: lock,
-                tree_id,
-                generation,
-                seg_path,
-                seg: BufWriter::new(file),
-                seg_bytes: SEGMENT_HEADER_LEN as u64,
-                seq: start,
-                records: 0,
-            });
-        }
         let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
         header.extend_from_slice(JOURNAL_MAGIC);
         header.extend_from_slice(&MAJOR.to_le_bytes());
@@ -135,6 +146,9 @@ impl Journal {
         header.extend_from_slice(&[0u8; 4]);
         file.write_all(&header)?;
         file.sync_all()?;
+        // the directory entry of a brand new segment must be durable before a
+        // record in it is acked
+        File::open(&dir)?.sync_all()?;
         Ok(Self {
             dir,
             _lock: lock,
@@ -143,82 +157,37 @@ impl Journal {
             seg_path,
             seg: BufWriter::new(file),
             seg_bytes: SEGMENT_HEADER_LEN as u64,
-            seq: start,
+            seq: base,
             records: 0,
         })
     }
 
-    /// Highest sequence already on disk plus one. Scanning the records rather
-    /// than trusting the segment name is what keeps a restarted incarnation from
-    /// reissuing sequence numbers.
-    fn next_seq(dir: &Path) -> Result<u64, Error> {
-        let mut segments: Vec<PathBuf> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("segment-") && n.ends_with(".log"))
-            })
-            .collect();
-        segments.sort();
-        let mut max = 0u64;
-        for path in segments {
-            let raw = std::fs::read(&path)?;
-            if raw.len() < SEGMENT_HEADER_LEN {
-                continue;
+    /// Highest valid record sequence on disk.
+    fn scan_max_seq(dir: &Path) -> Result<Option<u64>, Error> {
+        let mut max = None;
+        for path in segment_paths(dir)? {
+            if let Some(last) = last_record_seq(&path)? {
+                max = Some(max.map_or(last, |m: u64| m.max(last)));
             }
-            let mut off = SEGMENT_HEADER_LEN;
-            while off + 8 <= raw.len() {
-                let len =
-                    u32::from_le_bytes(raw[off..off + 4].try_into().expect("4 bytes")) as usize;
-                if off + 4 + len > raw.len() {
-                    break;
-                }
-                let payload = &raw[off + 8..off + 4 + len];
-                if payload.len() < 8 {
-                    break;
-                }
-                let seq = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
-                max = max.max(seq);
-                off += 4 + len;
+        }
+        Ok(max)
+    }
+
+    /// Next segment file number: one past the highest already present.
+    fn next_segment_counter(dir: &Path) -> Result<u64, Error> {
+        let mut max = 0u64;
+        for path in segment_paths(dir)? {
+            if let Some(n) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("segment-"))
+                .and_then(|n| n.strip_suffix(".log"))
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                max = max.max(n);
             }
         }
         Ok(max + 1)
-    }
-
-    pub fn generation(&self) -> [u8; 16] {
-        self.generation
-    }
-
-    /// Start a new incarnation in `dir`, minting a fresh generation. A restored
-    /// backup or a deliberate fork must use this, otherwise two divergent states
-    /// can claim the same (tree_id, generation, base_seq).
-    pub fn open_new_incarnation(dir: impl AsRef<Path>, tree_id: [u8; 16]) -> Result<Self, Error> {
-        let dir = dir.as_ref();
-        let generation_file = dir.join("generation.next");
-        std::fs::create_dir_all(dir)?;
-        let generation = random_generation();
-        std::fs::write(generation_file, hex(&generation))?;
-        let mut journal = Self::open(dir, tree_id)?;
-        journal.generation = generation;
-        Ok(journal)
-    }
-
-    /// True when the newest segment holds its header and no records.
-    fn newest_is_header_only(dir: &Path) -> Result<bool, Error> {
-        let mut segments: Vec<PathBuf> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("segment-") && n.ends_with(".log"))
-            })
-            .collect();
-        segments.sort();
-        let Some(last) = segments.last() else {
-            return Ok(false);
-        };
-        Ok(std::fs::metadata(last)?.len() == SEGMENT_HEADER_LEN as u64)
     }
 
     /// The generation recorded in the first segment on disk, if any.
@@ -246,6 +215,18 @@ impl Journal {
             }
         }
         Ok(None)
+    }
+
+    /// Start a new incarnation in `dir`, minting a fresh generation before the
+    /// segment header is written. A restored backup or a deliberate fork must
+    /// use this, otherwise two divergent states can claim the same coordinates.
+    pub fn open_new_incarnation(dir: impl AsRef<Path>, tree_id: [u8; 16]) -> Result<Self, Error> {
+        Self::open_with(dir, tree_id, Some(random_generation()))
+    }
+
+    /// The incarnation this writer belongs to.
+    pub fn generation(&self) -> [u8; 16] {
+        self.generation
     }
 
     pub fn seq(&self) -> u64 {
@@ -318,6 +299,15 @@ impl Journal {
     pub fn sync(&mut self) -> Result<(), Error> {
         self.seg.flush()?;
         self.seg.get_ref().sync_all()?;
+        // persist the sequence the next record will use, so a reopen cannot
+        // reissue a number even when the last record is torn
+        write_state(
+            &self.dir,
+            WriterState {
+                next_seq: self.seq,
+                generation: self.generation,
+            },
+        )?;
         Ok(())
     }
 
@@ -610,6 +600,7 @@ pub fn replay<V: Codec>(
         torn_bytes: 0,
     };
     let mut next_expected: Option<u64> = Some(base_seq + 1);
+    let mut after_torn = false;
     for path in segments {
         let mut raw = Vec::new();
         File::open(&path)?.read_to_end(&mut raw)?;
@@ -633,12 +624,14 @@ pub fn replay<V: Codec>(
             let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("4 bytes")) as usize;
             if len < RECORD_FIXED_LEN || off + 4 + len > raw.len() {
                 stats.torn_bytes += (raw.len() - off) as u64;
+                after_torn = true;
                 break;
             }
             let crc = u32::from_le_bytes(raw[off + 4..off + 8].try_into().expect("4 bytes"));
             let payload = &raw[off + 8..off + 4 + len];
             if crc32c::crc32c(payload) != crc {
                 stats.torn_bytes += (raw.len() - off) as u64;
+                after_torn = true;
                 break;
             }
             let record = parse_payload(payload)?;
@@ -648,7 +641,7 @@ pub fn replay<V: Codec>(
                 continue;
             }
             if let Some(expected) = next_expected {
-                if record.seq != expected {
+                if record.seq != expected && !(after_torn && record.seq > expected) {
                     return Err(Error::BadMeta(format!(
                         "journal sequence gap: expected {expected}, found {}",
                         record.seq
@@ -656,6 +649,7 @@ pub fn replay<V: Codec>(
                 }
             }
             next_expected = Some(record.seq + 1);
+            after_torn = false;
             match record.kind {
                 KIND_INSERT => {
                     tree.insert(record.prefix, V::decode(&record.value)?);
@@ -672,8 +666,9 @@ pub fn replay<V: Codec>(
             }
             stats.applied += 1;
         }
-        if off < raw.len() && stats.torn_bytes == 0 {
+        if off < raw.len() && !after_torn {
             stats.torn_bytes += (raw.len() - off) as u64;
+            after_torn = true;
         }
     }
     Ok(stats)
@@ -770,13 +765,74 @@ fn random_generation() -> [u8; 16] {
     generation
 }
 
+/// Durable writer state: everything a reopen needs without trusting file names.
+#[derive(Debug, Clone, Copy)]
+struct WriterState {
+    next_seq: u64,
+    generation: [u8; 16],
+}
+
+fn read_state(dir: &Path) -> Result<Option<WriterState>, Error> {
+    let Ok(raw) = std::fs::read(dir.join("state.json")) else {
+        return Ok(None);
+    };
+    let v: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|e| Error::BadMeta(e.to_string()))?;
+    let Some(next_seq) = v["next_seq"].as_u64() else {
+        return Ok(None);
+    };
+    let Some(generation) = v["generation"].as_str().and_then(parse_hex16) else {
+        return Ok(None);
+    };
+    Ok(Some(WriterState {
+        next_seq,
+        generation,
+    }))
+}
+
+fn write_state(dir: &Path, state: WriterState) -> Result<(), Error> {
+    let tmp = dir.join(".state.json.tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(
+            serde_json::to_vec(&serde_json::json!({
+                "next_seq": state.next_seq,
+                "generation": hex(&state.generation),
+            }))
+            .map_err(|e| Error::BadMeta(e.to_string()))?
+            .as_slice(),
+        )?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join("state.json"))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Segments in creation order.
+fn segment_paths(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("segment-") && n.ends_with(".log"))
+        })
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 fn parse_hex16(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
+    let bytes = s.as_bytes();
+    if bytes.len() != 32 || !bytes.iter().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 16];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+        let hi = (bytes[i * 2] as char).to_digit(16)? as u8;
+        let lo = (bytes[i * 2 + 1] as char).to_digit(16)? as u8;
+        *byte = hi << 4 | lo;
     }
     Some(out)
 }
