@@ -256,7 +256,10 @@ impl Journal {
 
         let checkpoint = serde_json::json!({
             "snapshot_file": name,
-            "base_seq": self.seq,
+            // the snapshot reflects records up to and including self.seq - 1;
+            // replay applies `seq > base_seq`, so storing self.seq would drop the
+            // first record appended after this checkpoint.
+            "base_seq": self.seq.saturating_sub(1),
             "tree_id": hex(&self.tree_id),
         });
         let cp_path = dir.join("checkpoint.json");

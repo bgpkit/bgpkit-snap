@@ -78,7 +78,7 @@ fn replay_reproduces_the_live_tree() {
         live_id, replayed_id,
         "replay must land on the same content id"
     );
-    assert_eq!(cp.base_seq, 5);
+    assert_eq!(cp.base_seq, 4, "base_seq is the last reflected sequence");
     assert_eq!(replayed.len(), 4);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -182,5 +182,58 @@ fn a_foreign_segment_is_rejected() {
         matches!(err, bgpkit_snap::Error::TypeMismatch { .. }),
         "{err}"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_first_record_after_a_checkpoint_survives_replay() {
+    // the crash window: checkpoint, then one more update, then a restart
+    let dir = tmpdir("after-checkpoint");
+    let base = base_snapshot(&dir);
+    let tree_id = [5u8; 16];
+    let log_dir = dir.join("journal");
+    let snap_dir = dir.join("snaps");
+
+    let mut live = Tree::open(&base).unwrap();
+    let mut j = Journal::open(&log_dir, tree_id).unwrap();
+    for (i, p) in ["10.9.0.0/16", "10.10.0.0/16"].iter().enumerate() {
+        let v = i as u32 + 20;
+        live.insert(p.parse().unwrap(), v);
+        j.insert(p.parse().unwrap(), &v, 0).unwrap();
+    }
+    j.sync().unwrap();
+    j.checkpoint(&live, &snap_dir, "2026-11-12T02:00:00Z", "journal-test")
+        .unwrap();
+
+    let late = "10.11.0.0/16".parse().unwrap();
+    live.insert(late, 77u32);
+    j.insert(late, &77u32, 0).unwrap();
+    j.sync().unwrap();
+
+    let cp = journal::read_checkpoint(&snap_dir)
+        .unwrap()
+        .expect("checkpoint");
+    let base_snap =
+        Snapshot::<u32>::open(snap_dir.join(&cp.snapshot_file).to_str().unwrap()).unwrap();
+    let mut replayed = Tree::open(&base_snap).unwrap();
+    let stats = journal::replay(&mut replayed, &log_dir, cp.base_seq, tree_id).unwrap();
+
+    assert_eq!(
+        stats.applied, 1,
+        "the record written after the checkpoint must apply"
+    );
+    assert!(
+        replayed.get(late).is_some(),
+        "post-checkpoint update is lost"
+    );
+    assert_eq!(
+        Snapshot::<u32>::from_bytes(&tree_bytes(&replayed))
+            .unwrap()
+            .content_id(),
+        Snapshot::<u32>::from_bytes(&tree_bytes(&live))
+            .unwrap()
+            .content_id()
+    );
+
     std::fs::remove_dir_all(&dir).ok();
 }
