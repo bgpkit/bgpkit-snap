@@ -27,7 +27,7 @@ HEADER (192 B, replaces the 64-byte prefix of draft 0.1; offsets are absolute)
   16..32   tree_id [16]   all zero when HAS_STREAM is clear
   32..48   generation [16] random per journal incarnation, zero when clear
   48..80   content_id [32] raw bytes, authoritative copy is in META
-  80..112  type_id [32]   ASCII, NUL padded, at least one zero byte
+  80..112  type_id [32]   ASCII; zero-padded only when type_id_len < 32
  112..120  base_seq u64 LE  last journal sequence the body reflects
  120..128  file_len u64 LE
  128..136  footer_off u64 LE
@@ -57,6 +57,17 @@ FOOTER, ends the file
     +4  flags u16  bit 0: required by readers (0 for all v1 sections)
     +6  align u8   must be 16
     +7  pad   u8   must be 0
+    +8  offset u64 LE  absolute, 16-byte aligned, >= 192
+   +16  len    u64 LE
+   +24  hash   [32]   blake3 of the section bytes
+   +56  reserved [8]  zero
+  body hash [32]      blake3 over the sections in file order
+```
+
+`footer_len` is not stored: it is `16 + 64 * section_count + 32`, and the footer
+must end the file. The body hash is computed over the concatenation of section
+bytes in the order the entries list them.
+
 ## 3. Sections
 
 ```text
@@ -65,7 +76,7 @@ FOOTER, ends the file
 3  TRIE_V6 the same for IPv6
 ```
 
-Rules: ids ascending and unique, META first, sections contiguous from offset 192 to `footer_off`, `meta_off`/`meta_len` in the header equal to the META entry, trie sections never compressed, at least one trie section present. A prefix-set is a trie whose value type is empty.
+Rules: ids ascending and unique, META first, each section starts at the first 16-byte boundary at or after the previous section end (padding bytes are zero and belong to no section), the first starts at 192, and the last ends at or before `footer_off`, `meta_off`/`meta_len` in the header equal to the META entry, trie sections never compressed, at least one trie section present. A prefix-set is a trie whose value type is empty.
 
 ## 4. META
 
@@ -96,9 +107,12 @@ set), `trie_layout`, and `value` (`type_id`, `width`).
 trie sections have the same `content_id` no matter who built them, from which
 path, or when: the id addresses data, not build history.
 
-Every value inside `projection` is an integer or an ASCII string. That is a
-contract, not a coincidence: it removes JSON escaping and number formatting from
-the hash input, so two implementations cannot disagree about the bytes.
+Every leaf inside `projection` is a non-negative integer or an ASCII string with
+no characters below 0x20. Values may be nested objects and arrays, whose keys the
+writer sorts by byte order and serialises with no whitespace. That contract is
+what removes JSON escaping and float formatting from the hash input; a projection
+field that needs a float, a non-ASCII string, or a control character is a major
+version change. The golden test pins the exact bytes.
 
 ## 5. Values
 
@@ -161,11 +175,26 @@ pins one.
 
 Emit sections in id order with 16-byte padding; build META from the data actually written; reject a trie section at or above 2 GiB with an error that says to shard; buffer the sink, because a joint archive produces over a million small writes; never compress a zero-copy section. The prefix is patched last, so the writer needs a seekable sink: a file, or a buffered multipart upload where the prefix rides in the first buffered part.
 
-## 8. Versioning, alignment, limits
+## 8. Invariants, versioning, alignment, limits
+
+Header invariants a reader MUST reject a violation of:
+
+1. `families` is non-zero and has no bit outside bits 0 and 1.
+2. A set family bit has a non-zero count; a clear bit has a zero count.
+3. `type_id_len` is 1..32, the bytes below it are printable ASCII, and every
+   byte above it is zero.
+4. With `HAS_EVENTS` clear, both timestamps are zero; with it set, both are
+   non-zero and `first_event_ts <= last_event_ts`.
+5. With `HAS_STREAM` clear, `tree_id`, `generation` and `base_seq` are all zero;
+   with it set, `tree_id` and `generation` are non-zero.
+6. `created_at` is non-zero.
+7. Flags and reserved bytes carry no bit outside their definition.
+
+## 8a. Versioning, alignment, limits
 
 - Major bumps when the prefix, footer, section ids or any archived layout changes meaning; minor for additive META keys, new section ids and new value types. Readers accept their major and any minor of that major; a minor bump never changes the layout of the header or the footer and never reuses reserved space for an incompatible meaning, and refuse a required section they do not know.
 - Container integers are little-endian.
-- The rkyv feature set is part of the format: `little_endian` and `aligned` on; `big_endian`, `unaligned` and all `pointer_width_*` off, explicitly, because Cargo feature unification can flip defaults. The crate asserts the configuration at build time and fails a checked-in fixture if it drifts.
+- The rkyv feature set is part of the format: `little_endian` and `aligned` on; `big_endian`, `unaligned` and all `pointer_width_*` off, explicitly, because Cargo feature unification can flip defaults. The crate pins these features in `Cargo.toml`; a consumer that enables an incompatible rkyv feature produces a compile error, not a silent layout change and fails a checked-in fixture if it drifts.
 - One archive stays under 2 GiB because the archive uses 32-bit relative offsets; entries stay under 4.3 G. Larger datasets shard by top-level prefix into several objects.
 
 ## 9. Journal
@@ -181,17 +210,17 @@ record: len u32 LE (bytes after this field, so a record is 4 + len)
         recv_ts i64 LE
         event_ts i64 LE (0 when absent)
         kind u8 (1 insert | 2 withdraw | 3 control)
-        family u8
+        family u8 (4 or 6)
         prefix_len u8
         flags u8 (zero in v1)
-        addr [16]
+        addr [16]  IPv4 in addr[0..4] with addr[4..16] zero; IPv6 in addr[0..16]
         value_len u32 LE
         value bytes (insert: the archived value in canonical form)
 ```
 
 - One writer per tree, enforced by a lock.
 - A record is applied only if `crc32c` matches and `4 + len` lands on the next record boundary. A torn tail is truncated on open and the byte count is reported.
-- **Durability.** A feed call returns after its segment is fsynced. A checkpoint writes the snapshot, fsyncs the file and the directory, writes `checkpoint.json` (`{snapshot_file, base_seq, tree_id, generation}`) by temporary file plus rename, fsyncs the directory again, and only then deletes segments wholly below `base_seq + 1`.
+- **Durability.** `insert` and `withdraw` append to a buffered segment; a record is durable once `sync()` returns. A feed that must ack a peer after durability calls `sync()` before acking its batch, which is the group-commit path; a per-record ack would pay one fsync per record. A checkpoint writes the snapshot, fsyncs the file and the directory, writes `checkpoint.json` (`{snapshot_file, base_seq, tree_id, generation}`) by temporary file plus rename, fsyncs the directory again, and only then deletes segments wholly below `base_seq + 1`.
 - **Recovery.** Replay only records with `seq > base_seq` from segments whose
   `tree_id` and `generation` both match the snapshot's. `base_seq` is the highest
   sequence the snapshot reflects, so the first record written after a checkpoint
@@ -199,6 +228,8 @@ record: len u32 LE (bytes after this field, so a record is 4 + len)
   segment whose generation differs from `checkpoint.json`: sequence numbers are
   only unique within one incarnation.
 - **Retention.** Segments wholly at or below `base_seq` are deleted at the next checkpoint; a query older than the oldest retained segment returns a "history pruned" outcome rather than an answer derived from a later base.
+- **Restore and fork.** A journal restored from a backup, or copied to start a divergent tree, MUST mint a new `generation`. Reusing the old one lets two different states claim the same `(tree_id, generation, base_seq)`, which is exactly the confusion the generation exists to prevent.
+- **Checkpoint binding.** `checkpoint.json` names a snapshot; `tree_id`, `generation` and `base_seq` in it MUST equal the snapshot header's, and a reader MUST refuse the pair when they differ. A checkpoint from a later incarnation next to an older snapshot would otherwise replay from the wrong base.
 - Control records carry a subtype and an opaque payload defined by the value type's owner. The format defines no session, gap or timestamp semantics.
 
 Checkpoint triggers, whichever comes first: 60 s since the last checkpoint, 250,000 records, a 64 MiB segment roll, or a control record that marks a natural boundary. Skip when nothing changed. Keep the previous snapshot and its segments until the new one is written, fsynced and re-opened cleanly.

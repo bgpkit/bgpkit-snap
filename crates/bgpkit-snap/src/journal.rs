@@ -9,6 +9,7 @@
 //! `len` counts the bytes after itself, so a record is `4 + len` bytes, and the
 //! CRC covers the bytes after the CRC field, never itself.
 
+use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 use ipnet::IpNet;
 use prefix_trie::{AsView, PrefixMap, TrieView};
 
-use crate::{Error, RkyvError, SnapValue, Snapshot, Writer, ID_V4, ID_V6, MAJOR, MINOR};
+use crate::{Error, RkyvError, Snapshot, Writer, ID_V4, ID_V6, MAJOR, MINOR};
 
 /// Segment magic. Deliberately different from the snapshot magic so a mixed-up
 /// file is rejected rather than parsed.
@@ -32,39 +33,7 @@ pub const KIND_INSERT: u8 = 1;
 pub const KIND_WITHDRAW: u8 = 2;
 pub const KIND_CONTROL: u8 = 3;
 
-/// Value types that can be written to and read back from a journal.
-///
-/// A blanket impl covers every value type whose derives give the archived form
-/// validation and deserialization, so no value type implements this by hand.
-pub trait Codec: SnapValue + Sized {
-    /// The archived bytes stored in a record.
-    fn encode(value: &Self) -> Result<Vec<u8>, Error>;
-    /// Rebuild an owned value from record bytes.
-    fn decode(bytes: &[u8]) -> Result<Self, Error>;
-    /// Copy an archived value (from a snapshot) into owned form.
-    fn materialize(archived: &Self::Archived) -> Result<Self, Error>;
-}
-
-impl<T> Codec for T
-where
-    T: SnapValue,
-    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>
-        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
-{
-    fn encode(value: &Self) -> Result<Vec<u8>, Error> {
-        rkyv::to_bytes::<RkyvError>(value)
-            .map(|bytes| bytes.to_vec())
-            .map_err(|_| Error::BodyHash)
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        rkyv::from_bytes::<T, RkyvError>(bytes).map_err(|_| Error::BodyHash)
-    }
-
-    fn materialize(archived: &T::Archived) -> Result<Self, Error> {
-        rkyv::deserialize::<T, RkyvError>(archived).map_err(|_| Error::BodyHash)
-    }
-}
+pub use crate::Codec;
 
 fn prefix_fields(prefix: IpNet) -> (u8, u8, [u8; 16]) {
     let mut addr = [0u8; 16];
@@ -105,6 +74,9 @@ pub struct Record {
 
 /// The append side. One writer per tree.
 pub struct Journal {
+    dir: PathBuf,
+    /// Advisory lock, held until this journal is dropped: one writer per tree.
+    _lock: File,
     tree_id: [u8; 16],
     generation: [u8; 16],
     seg_path: PathBuf,
@@ -119,19 +91,19 @@ impl Journal {
     pub fn open(dir: impl AsRef<Path>, tree_id: [u8; 16]) -> Result<Self, Error> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
+        // one writer per tree: an advisory lock held for the process lifetime
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("writer.lock"))?;
+        lock.try_lock_exclusive()
+            .map_err(|_| Error::BadMeta("another writer holds this journal".into()))?;
+        std::fs::write(dir.join("writer.pid"), std::process::id().to_string())?;
         // reuse the generation of the segment already on disk, otherwise mint a
         // new one for this incarnation
-        let generation = Self::existing_generation(&dir)?.unwrap_or_else(|| {
-            let mut h = blake3::Hasher::new();
-            h.update(b"snap-journal-generation\0");
-            h.update(&tree_id);
-            h.update(&now_ts().to_le_bytes());
-            h.update(&std::process::id().to_le_bytes());
-            let mut generation = [0u8; 16];
-            generation.copy_from_slice(&h.finalize().as_bytes()[..16]);
-            generation
-        });
-        let start = Self::last_seq(&dir)?.map_or(1, |s| s + 1);
+        let generation = Self::existing_generation(&dir)?.unwrap_or_else(random_generation);
+        let start = Self::next_seq(&dir)?;
         let seg_path = dir.join(format!("segment-{start:012}.log"));
         let mut file = OpenOptions::new()
             .create(true)
@@ -147,6 +119,8 @@ impl Journal {
         file.write_all(&header)?;
         file.sync_all()?;
         Ok(Self {
+            dir,
+            _lock: lock,
             tree_id,
             generation,
             seg_path,
@@ -157,22 +131,42 @@ impl Journal {
         })
     }
 
-    fn last_seq(dir: &Path) -> Result<Option<u64>, Error> {
-        let mut last = None;
-        for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+    /// Highest sequence already on disk plus one. Scanning the records rather
+    /// than trusting the segment name is what keeps a restarted incarnation from
+    /// reissuing sequence numbers.
+    fn next_seq(dir: &Path) -> Result<u64, Error> {
+        let mut segments: Vec<PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("segment-") && n.ends_with(".log"))
+            })
+            .collect();
+        segments.sort();
+        let mut max = 0u64;
+        for path in segments {
+            let raw = std::fs::read(&path)?;
+            if raw.len() < SEGMENT_HEADER_LEN {
                 continue;
-            };
-            if let Some(rest) = name.strip_prefix("segment-") {
-                if let Some(digits) = rest.strip_suffix(".log") {
-                    if let Ok(seq) = digits.parse::<u64>() {
-                        last = last.max(Some(seq));
-                    }
+            }
+            let mut off = SEGMENT_HEADER_LEN;
+            while off + 8 <= raw.len() {
+                let len =
+                    u32::from_le_bytes(raw[off..off + 4].try_into().expect("4 bytes")) as usize;
+                if off + 4 + len > raw.len() {
+                    break;
                 }
+                let payload = &raw[off + 8..off + 4 + len];
+                if payload.len() < 8 {
+                    break;
+                }
+                let seq = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+                max = max.max(seq);
+                off += 4 + len;
             }
         }
-        Ok(last)
+        Ok(max + 1)
     }
 
     pub fn generation(&self) -> [u8; 16] {
@@ -336,13 +330,14 @@ impl Journal {
         std::fs::rename(&cp_tmp, &cp_path)?;
         File::open(dir)?.sync_all()?;
 
-        self.prune_segments(dir)?;
+        self.prune_segments()?;
         Ok(name)
     }
 
     /// Delete segments whose records are all covered by the checkpoint.
-    fn prune_segments(&mut self, dir: &Path) -> Result<(), Error> {
-        for entry in std::fs::read_dir(dir)? {
+    fn prune_segments(&mut self) -> Result<(), Error> {
+        let covered = self.seq.saturating_sub(1);
+        for entry in std::fs::read_dir(&self.dir)? {
             let path = entry?.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -354,15 +349,11 @@ impl Journal {
             if path == self.seg_path {
                 continue;
             }
-            let first = name
-                .trim_start_matches("segment-")
-                .trim_end_matches(".log")
-                .parse::<u64>()
-                .ok();
-            if let Some(first) = first {
-                if first <= self.seq {
-                    std::fs::remove_file(&path)?;
-                }
+            let Some(last) = last_record_seq(&path)? else {
+                continue;
+            };
+            if last <= covered {
+                std::fs::remove_file(&path)?;
             }
         }
         Ok(())
@@ -391,7 +382,11 @@ impl<V: Codec> Tree<V> {
 
     /// Load every entry of a snapshot into owned memory. This is the cost of
     /// mutating a snapshot: there is no in-place edit path.
-    pub fn open(snapshot: &Snapshot<V>) -> Result<Self, Error> {
+    pub fn open(snapshot: &Snapshot<V>) -> Result<Self, Error>
+    where
+        V::Archived:
+            for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
+    {
         let mut tree = Self::new();
         if let Some(map) = snapshot.v4() {
             for (p, v) in map.view().iter() {
@@ -471,6 +466,7 @@ pub struct Checkpoint {
     pub snapshot_file: String,
     pub base_seq: u64,
     pub generation: [u8; 16],
+    pub tree_id: [u8; 16],
 }
 
 /// Read `checkpoint.json`, if the directory has one.
@@ -488,6 +484,10 @@ pub fn read_checkpoint(dir: impl AsRef<Path>) -> Result<Option<Checkpoint>, Erro
     let base_seq = v["base_seq"]
         .as_u64()
         .ok_or_else(|| Error::BadMeta("checkpoint.json: base_seq".into()))?;
+    let tree_id = v["tree_id"]
+        .as_str()
+        .and_then(parse_hex16)
+        .ok_or_else(|| Error::BadMeta("checkpoint.json: tree_id".into()))?;
     let generation = v["generation"]
         .as_str()
         .and_then(parse_hex16)
@@ -496,7 +496,34 @@ pub fn read_checkpoint(dir: impl AsRef<Path>) -> Result<Option<Checkpoint>, Erro
         snapshot_file,
         base_seq,
         generation,
+        tree_id,
     }))
+}
+
+/// Check that `checkpoint.json` describes the snapshot it names.
+///
+/// Reads only the snapshot's 192-byte header, so it needs no value type: the
+/// tree id, generation and base sequence must match the checkpoint exactly, or
+/// replay would start from the wrong base.
+pub fn verify_checkpoint_binding(dir: impl AsRef<Path>) -> Result<Checkpoint, Error> {
+    let dir = dir.as_ref();
+    let cp = read_checkpoint(dir)?.ok_or_else(|| Error::BadMeta("no checkpoint.json".into()))?;
+    let path = dir.join(&cp.snapshot_file);
+    let mut raw = [0u8; crate::header::HEADER_LEN];
+    {
+        let mut f = File::open(&path)?;
+        f.read_exact(&mut raw)?;
+    }
+    let header = crate::Header::parse(&raw)?;
+    if header.tree_id != cp.tree_id
+        || header.generation != cp.generation
+        || header.base_seq != cp.base_seq
+    {
+        return Err(Error::BadMeta(
+            "checkpoint.json does not describe the snapshot it names".into(),
+        ));
+    }
+    Ok(cp)
 }
 
 /// Replay every record with `seq > base_seq` into `tree`.
@@ -529,6 +556,7 @@ pub fn replay<V: Codec>(
         skipped: 0,
         torn_bytes: 0,
     };
+    let mut next_expected: Option<u64> = None;
     for path in segments {
         let mut raw = Vec::new();
         File::open(&path)?.read_to_end(&mut raw)?;
@@ -561,6 +589,15 @@ pub fn replay<V: Codec>(
                 break;
             }
             let record = parse_payload(payload)?;
+            if let Some(expected) = next_expected {
+                if record.seq != expected {
+                    return Err(Error::BadMeta(format!(
+                        "journal sequence gap: expected {expected}, found {}",
+                        record.seq
+                    )));
+                }
+            }
+            next_expected = Some(record.seq + 1);
             if record.seq <= base_seq {
                 stats.skipped += 1;
             } else {
@@ -625,6 +662,55 @@ fn now_ts() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Highest valid record sequence in a segment.
+fn last_record_seq(path: &Path) -> Result<Option<u64>, Error> {
+    let raw = std::fs::read(path)?;
+    if raw.len() < SEGMENT_HEADER_LEN {
+        return Ok(None);
+    }
+    let mut off = SEGMENT_HEADER_LEN;
+    let mut last = None;
+    while off + 8 <= raw.len() {
+        let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("4 bytes")) as usize;
+        if off + 4 + len > raw.len() {
+            break;
+        }
+        let payload = &raw[off + 8..off + 4 + len];
+        if payload.len() < 8 {
+            break;
+        }
+        last = Some(u64::from_le_bytes(
+            payload[0..8].try_into().expect("8 bytes"),
+        ));
+        off += 4 + len;
+    }
+    Ok(last)
+}
+
+/// 16 bytes from the OS RNG. A deterministic hash is not an incarnation id:
+/// two journals opened in the same second would share coordinates.
+fn random_generation() -> [u8; 16] {
+    let mut generation = [0u8; 16];
+    if let Ok(mut f) = File::open("/dev/urandom") {
+        if f.read_exact(&mut generation).is_ok() {
+            return generation;
+        }
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"snap-journal-generation\0");
+    h.update(&now_ts().to_le_bytes());
+    h.update(&std::process::id().to_le_bytes());
+    h.update(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    generation.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    generation
 }
 
 fn parse_hex16(s: &str) -> Option<[u8; 16]> {

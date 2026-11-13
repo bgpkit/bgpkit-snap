@@ -297,3 +297,52 @@ fn a_foreign_generation_is_rejected() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_restarted_incarnation_continues_the_sequence() {
+    // reopening an existing journal must not reissue sequence numbers, or replay
+    // silently discards everything written after the restart
+    let dir = tmpdir("restart");
+    let tree_id = [6u8; 16];
+    let log_dir = dir.join("journal");
+    let generation;
+    {
+        let mut j = Journal::open(&log_dir, tree_id).unwrap();
+        for (i, p) in ["10.20.0.0/16", "10.21.0.0/16", "10.22.0.0/16"]
+            .iter()
+            .enumerate()
+        {
+            j.insert(p.parse().unwrap(), &(i as u32 + 1), 0).unwrap();
+        }
+        j.sync().unwrap();
+        generation = j.generation();
+        assert_eq!(j.seq(), 4, "three records consumed sequences 1..3");
+    }
+
+    let mut reopened = Journal::open(&log_dir, tree_id).unwrap();
+    assert_eq!(
+        reopened.generation(),
+        generation,
+        "generation follows the segments"
+    );
+    assert_eq!(
+        reopened.seq(),
+        4,
+        "the sequence resumes after the last record"
+    );
+    reopened
+        .insert("10.23.0.0/16".parse().unwrap(), &4u32, 0)
+        .unwrap();
+    reopened.sync().unwrap();
+    drop(reopened);
+
+    let mut tree = Tree::<u32>::new();
+    let stats = journal::replay(&mut tree, &log_dir, 0, tree_id, generation).unwrap();
+    assert_eq!(
+        stats.applied, 4,
+        "every record, including the one after the restart"
+    );
+    assert_eq!(tree.len(), 4);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

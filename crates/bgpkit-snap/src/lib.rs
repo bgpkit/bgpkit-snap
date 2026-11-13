@@ -9,6 +9,7 @@ use std::fmt;
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use prefix_trie::rkyv::ArchivedPrefixMap;
+
 use prefix_trie::PrefixMap;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::util::AlignedVec;
@@ -130,6 +131,40 @@ pub trait SnapValue: rkyv::Archive + Clone + for<'a> rkyv::Serialize<HighSer<'a>
     fn canonicalize(&mut self) {}
 }
 
+/// Value types that can be written to and read back from a journal.
+///
+/// A blanket impl covers every value type whose derives give the archived form
+/// validation and deserialization, so no value type implements this by hand.
+pub trait Codec: SnapValue + Sized {
+    /// The archived bytes stored in a record.
+    fn encode(value: &Self) -> Result<Vec<u8>, Error>;
+    /// Rebuild an owned value from record bytes.
+    fn decode(bytes: &[u8]) -> Result<Self, Error>;
+    /// Copy an archived value (from a snapshot) into owned form.
+    fn materialize(archived: &Self::Archived) -> Result<Self, Error>;
+}
+
+impl<T> Codec for T
+where
+    T: SnapValue,
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>
+        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
+{
+    fn encode(value: &Self) -> Result<Vec<u8>, Error> {
+        rkyv::to_bytes::<RkyvError>(value)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|_| Error::BodyHash)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        rkyv::from_bytes::<T, RkyvError>(bytes).map_err(|_| Error::BodyHash)
+    }
+
+    fn materialize(archived: &T::Archived) -> Result<Self, Error> {
+        rkyv::deserialize::<T, RkyvError>(archived).map_err(|_| Error::BodyHash)
+    }
+}
+
 impl SnapValue for u32 {
     const TYPE_ID: &'static str = "snap.u32:v1";
     const WIDTH: u32 = 4;
@@ -222,7 +257,13 @@ fn data_projection<T: SnapValue>(
     }
     meta.insert(
         "trie_layout".into(),
-        json!({"crate": "prefix-trie", "key_bits": 32, "node_bits": 5, "rkyv": "0.8", "version": "0.10"}),
+        json!({
+            "crate": "prefix-trie",
+            "key_bits": {"v4": 32, "v6": 128},
+            "node_bits": 5,
+            "rkyv": "0.8",
+            "version": "0.10"
+        }),
     );
     meta.insert(
         "value".into(),
@@ -443,7 +484,7 @@ impl<T: SnapValue> Writer<T> {
 
 // ---------------------------------------------------------------- reader
 
-pub struct Snapshot<T: SnapValue> {
+pub struct Snapshot<T: Codec> {
     bytes: AlignedVec,
     meta: serde_json::Value,
     sections: Vec<(u16, usize, usize)>,
@@ -451,22 +492,32 @@ pub struct Snapshot<T: SnapValue> {
     _t: std::marker::PhantomData<T>,
 }
 
-impl<T: SnapValue> fmt::Debug for Snapshot<T> {
+impl<T: Codec> fmt::Debug for Snapshot<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Snapshot")
             .field("content_id", &self.content_id)
-            .field("sections", &self.sections.len())
+            .field("entries", &self.len())
             .field("entries", &self.len())
             .finish()
     }
 }
 
-impl<T: SnapValue> Snapshot<T> {
-    pub fn open(path: &str) -> Result<Self, Error> {
+impl<T: Codec> Snapshot<T> {
+    /// Opening is the only place that needs the validating bound: it proves the
+    /// archives are sound, after which the unchecked views below are safe.
+    pub fn open(path: &str) -> Result<Self, Error>
+    where
+        T::Archived:
+            for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
+    {
         Self::from_bytes(&std::fs::read(path)?)
     }
 
-    pub fn from_bytes(raw: &[u8]) -> Result<Self, Error> {
+    pub fn from_bytes(raw: &[u8]) -> Result<Self, Error>
+    where
+        T::Archived:
+            for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
+    {
         let header = Header::parse(raw)?;
         header.check_layout(raw.len())?;
         if header.type_id != T::TYPE_ID {
@@ -537,6 +588,27 @@ impl<T: SnapValue> Snapshot<T> {
             let expect = &footer[16 + count * ENTRY_LEN..16 + count * ENTRY_LEN + 32];
             if h.finalize().as_bytes() != expect {
                 return Err(Error::BodyHash);
+            }
+        }
+
+        // an untrusted object can carry a hash-consistent but structurally
+        // invalid archive, so every trie section is checked before any
+        // unchecked access below is allowed to run
+        for (id, off, len) in &sections {
+            match *id {
+                ID_V4 => {
+                    rkyv::access::<ArchivedPrefixMap<Ipv4Net, T>, RkyvError>(
+                        &raw[*off..*off + *len],
+                    )
+                    .map_err(|_| Error::BadSectionTable("TRIE_V4 archive is invalid"))?;
+                }
+                ID_V6 => {
+                    rkyv::access::<ArchivedPrefixMap<Ipv6Net, T>, RkyvError>(
+                        &raw[*off..*off + *len],
+                    )
+                    .map_err(|_| Error::BadSectionTable("TRIE_V6 archive is invalid"))?;
+                }
+                _ => {}
             }
         }
 
@@ -640,9 +712,9 @@ impl<T: SnapValue> Snapshot<T> {
         let mut h = framed_hasher();
         h.update(CONTENT_DOMAIN);
         h.update(&proj_bytes);
-        for id in [ID_V4, ID_V6] {
-            if let Some(s) = self.section(id) {
-                update_framed(&mut h, id, s);
+        for (id, off, len) in &self.sections {
+            if *id != ID_META {
+                update_framed(&mut h, *id, &self.bytes[*off..*off + *len]);
             }
         }
         let got = h.finalize().to_hex().to_string();
@@ -782,9 +854,19 @@ impl<T: SnapValue> Snapshot<T> {
                     which: probe,
                 });
             };
-            let found = match (family, p) {
-                (4, IpNet::V4(p)) => self.v4().and_then(|m| m.get(&p)).is_some(),
-                (6, IpNet::V6(p)) => self.v6().and_then(|m| m.get(&p)).is_some(),
+            let found = match (family, key, p) {
+                (4, "v4_first", IpNet::V4(p)) => {
+                    self.v4().and_then(|m| m.iter().next().map(|(k, _)| k)) == Some(p)
+                }
+                (4, "v4_last", IpNet::V4(p)) => {
+                    self.v4().and_then(|m| m.iter().last().map(|(k, _)| k)) == Some(p)
+                }
+                (6, "v6_first", IpNet::V6(p)) => {
+                    self.v6().and_then(|m| m.iter().next().map(|(k, _)| k)) == Some(p)
+                }
+                (6, "v6_last", IpNet::V6(p)) => {
+                    self.v6().and_then(|m| m.iter().last().map(|(k, _)| k)) == Some(p)
+                }
                 _ => false,
             };
             if !found {
