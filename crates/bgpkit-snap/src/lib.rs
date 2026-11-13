@@ -15,11 +15,11 @@ use rkyv::util::AlignedVec;
 
 pub mod journal;
 
-pub const MAGIC: &[u8; 8] = b"BGPKSNAP";
+pub mod header;
+
+pub use header::{Header, HeaderInputs, StreamRef, HEADER_LEN, MAGIC, MAJOR, MINOR};
+
 pub const FOOTER_MAGIC: &[u8; 4] = b"SNPF";
-pub const MAJOR: u16 = 1;
-pub const MINOR: u16 = 0;
-pub const PREFIX_LEN: usize = 64;
 pub const ENTRY_LEN: usize = 64;
 pub const ALIGN: usize = 16;
 const CONTENT_DOMAIN: &[u8] = b"snap-content-v1\0";
@@ -149,10 +149,13 @@ fn jstr(s: &str) -> serde_json::Value {
 /// Build the META projection (everything except `content_id` and
 /// `provenance.created_at`). `serde_json::Map` is BTreeMap-backed by default,
 /// so keys serialize sorted, which is the canonical form the contract wants.
-fn projection<T: SnapValue>(
+/// The hashed projection: data only, never provenance. Every value is an
+/// integer or an ASCII string, so canonical serialization cannot vary between
+/// implementations.
+fn data_projection<T: SnapValue>(
     v4: &PrefixMap<Ipv4Net, T>,
     v6: &PrefixMap<Ipv6Net, T>,
-    source: &str,
+    inputs: &HeaderInputs,
 ) -> serde_json::Value {
     use serde_json::{json, Map, Value};
 
@@ -201,14 +204,22 @@ fn projection<T: SnapValue>(
     meta.insert("families".into(), Value::Array(families));
     meta.insert("kind".into(), jstr("prefix-map"));
     meta.insert("probe".into(), Value::Object(probe));
-    meta.insert(
-        "provenance".into(),
-        json!({
-            "generator": "bgpkit-snap/0.0.1",
-            "producer": "bgpkit-snap/0.0.1",
-            "sources": [{"uri": source}],
-        }),
-    );
+    if let Some(stream) = inputs.stream {
+        meta.insert(
+            "stream".into(),
+            json!({
+                "base_seq": stream.base_seq,
+                "generation": hex16(&stream.generation),
+                "tree_id": hex16(&stream.tree_id),
+            }),
+        );
+    }
+    if inputs.first_event_ts != 0 || inputs.last_event_ts != 0 {
+        meta.insert(
+            "events".into(),
+            json!({"first_event_ts": inputs.first_event_ts, "last_event_ts": inputs.last_event_ts}),
+        );
+    }
     meta.insert(
         "trie_layout".into(),
         json!({"crate": "prefix-trie", "key_bits": 32, "node_bits": 5, "rkyv": "0.8", "version": "0.10"}),
@@ -218,6 +229,14 @@ fn projection<T: SnapValue>(
         json!({"note": "PoC", "type_id": T::TYPE_ID, "width": T::WIDTH}),
     );
     Value::Object(meta)
+}
+
+fn hex16(bytes: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 fn framed_hasher() -> blake3::Hasher {
@@ -273,11 +292,22 @@ impl<T: SnapValue> Writer<T> {
 
     /// Serialize into the container. `created_at` must be RFC 3339.
     pub fn finish(self, created_at: &str, source: &str) -> Result<Vec<u8>, Error> {
+        self.finish_with(created_at, source, HeaderInputs::default())
+    }
+
+    /// Serialize, declaring the stream state and event window the body reflects.
+    pub fn finish_with(
+        self,
+        created_at: &str,
+        source: &str,
+        inputs: HeaderInputs,
+    ) -> Result<Vec<u8>, Error> {
+        let created_unix = chrono::DateTime::parse_from_rfc3339(created_at)
+            .map_err(|e| Error::BadMeta(format!("created_at is not RFC 3339: {e}")))?
+            .timestamp();
+
         let v4_bytes = rkyv::to_bytes::<RkyvError>(&self.v4).map_err(|_| Error::BodyHash)?;
         let v6_bytes = rkyv::to_bytes::<RkyvError>(&self.v6).map_err(|_| Error::BodyHash)?;
-
-        // only families that carry entries get a section, and content_id covers
-        // exactly the sections that are written
         let mut trie_sections: Vec<(u16, &[u8])> = Vec::new();
         if !self.v4.is_empty() {
             trie_sections.push((ID_V4, &v4_bytes));
@@ -286,9 +316,9 @@ impl<T: SnapValue> Writer<T> {
             trie_sections.push((ID_V6, &v6_bytes));
         }
 
-        // content_id covers the canonical META projection plus the non-META
-        // sections, so it is not circular and is producer independent.
-        let mut proj = projection(&self.v4, &self.v6, source);
+        // content_id covers the data projection and the trie sections. Provenance
+        // is outside it on purpose: the id addresses data, not build history.
+        let proj = data_projection(&self.v4, &self.v6, &inputs);
         let proj_bytes = serde_json::to_vec(&proj).map_err(|e| Error::BadMeta(e.to_string()))?;
         let mut id_hasher = framed_hasher();
         id_hasher.update(CONTENT_DOMAIN);
@@ -296,67 +326,59 @@ impl<T: SnapValue> Writer<T> {
         for (id, bytes) in &trie_sections {
             update_framed(&mut id_hasher, *id, bytes);
         }
-        let content_id = id_hasher.finalize().to_hex().to_string();
+        let content_hash = id_hasher.finalize();
+        let content_id_hex = content_hash.to_hex().to_string();
 
-        // full META: projection + content_id + provenance.created_at
-        {
-            let obj = proj.as_object_mut().ok_or(Error::MissingMeta)?;
-            obj.insert("content_id".into(), jstr(&content_id));
-            if let Some(prov) = obj.get_mut("provenance").and_then(|p| p.as_object_mut()) {
-                prov.insert("created_at".into(), jstr(created_at));
-            }
-        }
-        let meta_bytes = serde_json::to_vec(&proj).map_err(|e| Error::BadMeta(e.to_string()))?;
+        // META nests the hashed projection verbatim, so a reader can rehash the
+        // exact bytes the writer hashed without reconstructing anything.
+        let meta = serde_json::json!({
+            "projection": proj,
+            "content_id": content_id_hex,
+            "provenance": {
+                "generator": "bgpkit-snap/0.0.1",
+                "producer": "bgpkit-snap/0.0.1",
+                "created_at": created_at,
+                "sources": [{"uri": source}],
+            },
+        });
+        let meta_bytes = serde_json::to_vec(&meta).map_err(|e| Error::BadMeta(e.to_string()))?;
 
-        // layout: only families that actually carry entries get a section
-        let mut trie_sections: Vec<(u16, &[u8])> = Vec::new();
-        if !self.v4.is_empty() {
-            trie_sections.push((ID_V4, &v4_bytes));
-        }
-        if !self.v6.is_empty() {
-            trie_sections.push((ID_V6, &v6_bytes));
-        }
         let mut offsets: Vec<(u16, u64, u64, [u8; 32])> = Vec::new();
-        let mut body: Vec<u8> = Vec::new(); // sections after the 64-byte prefix
-
+        let mut body: Vec<u8> = Vec::new();
         let push_section = |body: &mut Vec<u8>,
                             offsets: &mut Vec<(u16, u64, u64, [u8; 32])>,
                             id: u16,
                             bytes: &[u8]| {
-            while !(PREFIX_LEN + body.len()).is_multiple_of(ALIGN) {
+            while !(HEADER_LEN + body.len()).is_multiple_of(ALIGN) {
                 body.push(0);
             }
-            let off = (PREFIX_LEN + body.len()) as u64;
+            let off = (HEADER_LEN + body.len()) as u64;
             body.extend_from_slice(bytes);
             offsets.push((id, off, bytes.len() as u64, *blake3::hash(bytes).as_bytes()));
         };
-
         push_section(&mut body, &mut offsets, ID_META, &meta_bytes);
         for (id, bytes) in trie_sections {
             push_section(&mut body, &mut offsets, id, bytes);
         }
 
-        // body hash covers every section in file order, META included
         let body_hash = {
             let mut h = blake3::Hasher::new();
-            for (id, off, len, _) in &offsets {
-                let _ = id;
-                let start = (*off as usize) - PREFIX_LEN;
+            for (_, off, len, _) in &offsets {
+                let start = (*off as usize) - HEADER_LEN;
                 h.update(&body[start..start + *len as usize]);
             }
             h.finalize()
         };
 
-        // footer
         let mut footer = Vec::new();
         footer.extend_from_slice(&(offsets.len() as u32).to_le_bytes());
         footer.extend_from_slice(FOOTER_MAGIC);
-        footer.extend_from_slice(&1u32.to_le_bytes()); // flags: body hash present
-        footer.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        footer.extend_from_slice(&1u32.to_le_bytes());
+        footer.extend_from_slice(&0u32.to_le_bytes());
         for (id, off, len, hash) in &offsets {
             footer.extend_from_slice(&id.to_le_bytes());
-            footer.extend_from_slice(&id.to_le_bytes()); // kind
-            footer.extend_from_slice(&0u16.to_le_bytes()); // flags
+            footer.extend_from_slice(&id.to_le_bytes());
+            footer.extend_from_slice(&0u16.to_le_bytes());
             footer.push(ALIGN as u8);
             footer.push(0);
             footer.extend_from_slice(&off.to_le_bytes());
@@ -366,20 +388,54 @@ impl<T: SnapValue> Writer<T> {
         }
         footer.extend_from_slice(body_hash.as_bytes());
 
-        let footer_off = (PREFIX_LEN + body.len()) as u64;
-        let footer_len = footer.len() as u64;
-        let file_len = footer_off + footer_len;
+        let footer_off = (HEADER_LEN + body.len()) as u64;
+        let file_len = footer_off + footer.len() as u64;
+        let meta_entry = offsets
+            .iter()
+            .find(|(id, _, _, _)| *id == ID_META)
+            .expect("META is always written first");
 
-        let mut out = vec![0u8; PREFIX_LEN];
-        out[0..8].copy_from_slice(MAGIC);
-        out[8..10].copy_from_slice(&MAJOR.to_le_bytes());
-        out[10..12].copy_from_slice(&MINOR.to_le_bytes());
-        out[12..16].copy_from_slice(&(PREFIX_LEN as u32).to_le_bytes());
-        out[16..24].copy_from_slice(&file_len.to_le_bytes());
-        out[24..32].copy_from_slice(&footer_off.to_le_bytes());
-        out[32..36].copy_from_slice(&(footer_len as u32).to_le_bytes());
+        let (flags, tree_id, generation, base_seq) = match inputs.stream {
+            Some(s) => (header::FLAG_HAS_STREAM, s.tree_id, s.generation, s.base_seq),
+            None => (0u16, [0u8; 16], [0u8; 16], 0u64),
+        };
+        let flags = if inputs.first_event_ts != 0 || inputs.last_event_ts != 0 {
+            flags | header::FLAG_HAS_EVENTS
+        } else {
+            flags
+        };
+        let mut families = 0u16;
+        if !self.v4.is_empty() {
+            families |= header::FAMILY_V4;
+        }
+        if !self.v6.is_empty() {
+            families |= header::FAMILY_V6;
+        }
+        let header = Header {
+            flags,
+            tree_id,
+            generation,
+            content_id: *content_hash.as_bytes(),
+            type_id: T::TYPE_ID.to_string(),
+            base_seq,
+            file_len,
+            footer_off,
+            meta_off: meta_entry.1,
+            meta_len: meta_entry.2 as u32,
+            section_count: offsets.len() as u32,
+            count_v4: self.v4.len() as u32,
+            count_v6: self.v6.len() as u32,
+            first_event_ts: inputs.first_event_ts,
+            last_event_ts: inputs.last_event_ts,
+            created_at: created_unix,
+            families,
+        };
+
+        let mut out = header.encode().to_vec();
         out.extend_from_slice(&body);
         out.extend_from_slice(&footer);
+        // the writer refuses to emit an object its own reader would reject
+        Header::parse(&out)?;
         debug_assert_eq!(out.len() as u64, file_len);
         Ok(out)
     }
@@ -411,35 +467,15 @@ impl<T: SnapValue> Snapshot<T> {
     }
 
     pub fn from_bytes(raw: &[u8]) -> Result<Self, Error> {
-        if raw.len() < PREFIX_LEN {
-            return Err(Error::Truncated {
-                need: PREFIX_LEN,
-                have: raw.len(),
+        let header = Header::parse(raw)?;
+        header.check_layout(raw.len())?;
+        if header.type_id != T::TYPE_ID {
+            return Err(Error::TypeMismatch {
+                expected: T::TYPE_ID,
+                found: header.type_id.clone(),
             });
         }
-        if &raw[0..8] != MAGIC {
-            return Err(Error::BadMagic);
-        }
-        let major = u16::from_le_bytes([raw[8], raw[9]]);
-        if major != MAJOR {
-            return Err(Error::UnsupportedMajor(major));
-        }
-        let prefix_len = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]) as usize;
-        let file_len = u64::from_le_bytes(raw[16..24].try_into().unwrap());
-        let footer_off = u64::from_le_bytes(raw[24..32].try_into().unwrap()) as usize;
-        let footer_len = u32::from_le_bytes(raw[32..36].try_into().unwrap()) as usize;
-        if prefix_len != PREFIX_LEN {
-            return Err(Error::BadSectionTable("prefix_len is not 64"));
-        }
-        if file_len as usize != raw.len() {
-            return Err(Error::Truncated {
-                need: file_len as usize,
-                have: raw.len(),
-            });
-        }
-        if footer_off + footer_len != raw.len() {
-            return Err(Error::BadSectionTable("footer does not end the file"));
-        }
+        let footer_off = header.footer_off as usize;
 
         let footer = &raw[footer_off..];
         let count = u32::from_le_bytes(footer[0..4].try_into().unwrap()) as usize;
@@ -450,10 +486,15 @@ impl<T: SnapValue> Snapshot<T> {
         if flags & 1 == 0 {
             return Err(Error::BadSectionTable("body hash flag is not set"));
         }
+        if count != header.section_count as usize {
+            return Err(Error::BadSectionTable(
+                "footer count disagrees with the header",
+            ));
+        }
 
         let mut sections: Vec<(u16, usize, usize)> = Vec::new();
         let mut prev_id = 0u16;
-        let mut prev_end = PREFIX_LEN;
+        let mut prev_end = HEADER_LEN;
         for i in 0..count {
             let e = &footer[16 + i * ENTRY_LEN..16 + (i + 1) * ENTRY_LEN];
             let id = u16::from_le_bytes([e[0], e[1]]);
@@ -480,6 +521,12 @@ impl<T: SnapValue> Snapshot<T> {
         if sections.first().map(|s| s.0) != Some(ID_META) {
             return Err(Error::MissingMeta);
         }
+        if sections[0].1 as u64 != header.meta_off || sections[0].2 as u64 != header.meta_len as u64
+        {
+            return Err(Error::BadSectionTable(
+                "META entry disagrees with the header",
+            ));
+        }
 
         // body hash over sections in file order
         {
@@ -505,7 +552,7 @@ impl<T: SnapValue> Snapshot<T> {
             serde_json::from_slice(&aligned[meta_off..meta_off + meta_len])
                 .map_err(|e| Error::BadMeta(e.to_string()))?;
         let declared = meta
-            .pointer("/value/type_id")
+            .pointer("/projection/value/type_id")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -530,6 +577,7 @@ impl<T: SnapValue> Snapshot<T> {
         };
         snap.verify_content_id()?;
         snap.verify_counts_and_probes()?;
+        snap.verify_header_agreement(&header)?;
         Ok(snap)
     }
 
@@ -584,14 +632,11 @@ impl<T: SnapValue> Snapshot<T> {
     }
 
     fn verify_content_id(&self) -> Result<(), Error> {
-        let mut proj = self.meta.clone();
-        if let Some(obj) = proj.as_object_mut() {
-            obj.remove("content_id");
-            if let Some(prov) = obj.get_mut("provenance").and_then(|p| p.as_object_mut()) {
-                prov.remove("created_at");
-            }
-        }
-        let proj_bytes = serde_json::to_vec(&proj).map_err(|e| Error::BadMeta(e.to_string()))?;
+        let proj = self
+            .meta
+            .get("projection")
+            .ok_or_else(|| Error::BadMeta("META has no projection".into()))?;
+        let proj_bytes = serde_json::to_vec(proj).map_err(|e| Error::BadMeta(e.to_string()))?;
         let mut h = framed_hasher();
         h.update(CONTENT_DOMAIN);
         h.update(&proj_bytes);
@@ -607,13 +652,107 @@ impl<T: SnapValue> Snapshot<T> {
         Ok(())
     }
 
+    /// Rule 13: every field the header projects must equal the META copy, or a
+    /// spliced header could describe an object that is not there.
+    fn verify_header_agreement(&self, header: &Header) -> Result<(), Error> {
+        let bad = |what: &str| Error::BadMeta(format!("header disagrees with META on {what}"));
+        if self.meta.pointer("/content_id").and_then(|v| v.as_str())
+            != Some(header.content_id_hex().as_str())
+        {
+            return Err(bad("content_id"));
+        }
+        let p = |path: &str| self.meta.pointer(path);
+        if p("/projection/value/type_id").and_then(|v| v.as_str()) != Some(header.type_id.as_str())
+        {
+            return Err(bad("type_id"));
+        }
+        for (path, want) in [
+            ("/projection/counts/v4", header.count_v4 as u64),
+            ("/projection/counts/v6", header.count_v6 as u64),
+        ] {
+            let got = p(path).and_then(|v| v.as_u64()).unwrap_or(0);
+            if got != want {
+                return Err(bad(path));
+            }
+        }
+        let families: u64 = p("/projection/families")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64())
+                    .fold(0u64, |acc, f| match f {
+                        4 => acc | header::FAMILY_V4 as u64,
+                        6 => acc | header::FAMILY_V6 as u64,
+                        _ => acc,
+                    })
+            })
+            .unwrap_or(u64::MAX);
+        if families != header.families as u64 {
+            return Err(bad("families"));
+        }
+        let created = self
+            .meta
+            .pointer("/provenance/created_at")
+            .and_then(|v| v.as_str());
+        let created_unix = created
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.timestamp());
+        if created_unix != Some(header.created_at) {
+            return Err(bad("created_at"));
+        }
+        match header.flags & header::FLAG_HAS_EVENTS {
+            0 => {
+                if p("/projection/events").is_some() {
+                    return Err(bad("events"));
+                }
+            }
+            _ => {
+                if p("/projection/events/first_event_ts").and_then(|v| v.as_i64())
+                    != Some(header.first_event_ts)
+                {
+                    return Err(bad("first_event_ts"));
+                }
+                if p("/projection/events/last_event_ts").and_then(|v| v.as_i64())
+                    != Some(header.last_event_ts)
+                {
+                    return Err(bad("last_event_ts"));
+                }
+            }
+        }
+        match header.flags & header::FLAG_HAS_STREAM {
+            0 => {
+                if p("/projection/stream").is_some() {
+                    return Err(bad("stream"));
+                }
+            }
+            _ => {
+                if p("/projection/stream/tree_id").and_then(|v| v.as_str())
+                    != Some(hex16(&header.tree_id).as_str())
+                {
+                    return Err(bad("tree_id"));
+                }
+                if p("/projection/stream/generation").and_then(|v| v.as_str())
+                    != Some(hex16(&header.generation).as_str())
+                {
+                    return Err(bad("generation"));
+                }
+                if p("/projection/stream/base_seq").and_then(|v| v.as_u64())
+                    != Some(header.base_seq)
+                {
+                    return Err(bad("base_seq"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn verify_counts_and_probes(&self) -> Result<(), Error> {
         for (family, n) in [
             (4u8, self.v4().map(|m| m.len()).unwrap_or(0) as u64),
             (6u8, self.v6().map(|m| m.len()).unwrap_or(0) as u64),
         ] {
             let key = format!("v{family}");
-            if let Some(v) = self.meta.pointer(&format!("/counts/{key}")) {
+            if let Some(v) = self.meta.pointer(&format!("/projection/counts/{key}")) {
                 let meta_n = v.as_u64().unwrap_or(0);
                 if meta_n != n {
                     return Err(Error::CountMismatch {
@@ -632,7 +771,7 @@ impl<T: SnapValue> Snapshot<T> {
         ] {
             let Some(want) = self
                 .meta
-                .pointer(&format!("/probe/{key}"))
+                .pointer(&format!("/projection/probe/{key}"))
                 .and_then(|v| v.as_str())
             else {
                 continue;

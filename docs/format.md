@@ -12,22 +12,41 @@ Non-goals: SQL or a query planner, by-value search (find all keys with value X),
 
 ## 2. Object layout
 
+This header supersedes the 64-byte `PREFIX` of draft 0.1. An object that only
+satisfies the old prefix layout is not a v1 object and MUST be rejected.
+
 One immutable file, conventionally named `<content_id>.snap`.
 
 ```text
-PREFIX (64 B)
-  0..8    magic "BGPKSNAP"
-  8..10   major u16 LE (1)
-  10..12  minor u16 LE (0)
-  12..16  prefix_len u32 LE (64)
-  16..24  file_len u64 LE
-  24..32  footer_off u64 LE
-  32..36  footer_len u32 LE
-  36..64  reserved, zero
+HEADER (192 B, replaces the 64-byte prefix of draft 0.1; offsets are absolute)
+   0..8    magic "BGPKSNAP"
+   8..10   major u16 LE (1)
+  10..12   minor u16 LE (0)
+  12..14   header_len u16 LE (192)
+  14..16   flags u16 LE   bit 0: HAS_STREAM, bit 1: HAS_EVENTS, rest zero
+  16..32   tree_id [16]   all zero when HAS_STREAM is clear
+  32..48   generation [16] random per journal incarnation, zero when clear
+  48..80   content_id [32] raw bytes, authoritative copy is in META
+  80..112  type_id [32]   ASCII, NUL padded, at least one zero byte
+ 112..120  base_seq u64 LE  last journal sequence the body reflects
+ 120..128  file_len u64 LE
+ 128..136  footer_off u64 LE
+ 136..144  meta_off u64 LE
+ 144..148  meta_len u32 LE
+ 148..152  section_count u32 LE
+ 152..156  count_v4 u32 LE
+ 156..160  count_v6 u32 LE
+ 160..168  first_event_ts i64 LE
+ 168..176  last_event_ts i64 LE
+ 176..184  created_at i64 LE   Unix seconds, never zero
+ 184..186  families u16 LE     bit 0 v4, bit 1 v6, no other bit
+ 186..188  type_id_len u16 LE  1..32
+ 188..192  header_crc32c u32 LE over bytes 0..188
 
-SECTIONS, each at a 16-byte aligned offset, contiguous, non-overlapping
+SECTIONS, each at a 16-byte aligned absolute offset, contiguous and
+non-overlapping, starting at or after 192
 
-FOOTER
+FOOTER, ends the file
   0..4    section_count u32 LE
   4..8    footer_magic "SNPF"
   8..12   flags u32 LE   bit 0: body hash present (must be 1 in v1)
@@ -38,16 +57,6 @@ FOOTER
     +4  flags u16  bit 0: required by readers (0 for all v1 sections)
     +6  align u8   must be 16
     +7  pad   u8   must be 0
-    +8  offset u64
-    +16 len    u64
-    +24 blake3 [32] over the section bytes, no padding included
-    +56 reserved [8] zero
-  body_blake3 [32] over every section's bytes concatenated in file order,
-  META included, no padding, no footer bytes
-```
-
-The magic is a compatibility marker, not a brand: a reader must reject an unknown major and name the highest major it supports.
-
 ## 3. Sections
 
 ```text
@@ -56,34 +65,40 @@ The magic is a compatibility marker, not a brand: a reader must reject an unknow
 3  TRIE_V6 the same for IPv6
 ```
 
-Rules: ids ascending and unique, META first, sections contiguous from offset 64 to `footer_off`, trie sections never compressed, at least one trie section present. A prefix-set is a trie whose value type is empty.
+Rules: ids ascending and unique, META first, sections contiguous from offset 192 to `footer_off`, `meta_off`/`meta_len` in the header equal to the META entry, trie sections never compressed, at least one trie section present. A prefix-set is a trie whose value type is empty.
 
 ## 4. META
 
-Canonical JSON: UTF-8, sorted keys, integers and strings only, no floats, no insignificant whitespace. Unknown keys are ignored by readers.
+META is canonical JSON with three top-level keys:
 
 ```json
 {
-  "canonical": {"host_bits": "zeroed", "prefix_form": "network/len"},
-  "content_id": "9f2c...",
-  "counts": {"v4": 1042325, "v6": 246175},
-  "families": [4, 6],
-  "kind": "prefix-map",
-  "probe": {"v4_first": "1.0.0.0/24", "v4_last": "223.255.255.0/24"},
-  "provenance": {"created_at": "2026-11-12T22:14:09Z", "generator": "tool/0.9.4", "producer": "bgpkit-snap/0.1.0", "sources": [{"sha256": "ab12...", "uri": "https://example.org/input"}]},
-  "trie_layout": {"crate": "prefix-trie", "key_bits": 32, "node_bits": 5, "rkyv": "0.8", "version": "0.10.2"},
-  "value": {"note": "free text for humans, never parsed", "type_id": "snap.u32:v1", "width": 4}
+  "projection": { "...": "the hashed data projection, see section 6" },
+  "content_id": "<64 hex chars>",
+  "provenance": {
+    "generator": "bgpkit-snap/<version>",
+    "producer": "bgpkit-snap/<version>",
+    "created_at": "<RFC 3339, matches header.created_at>",
+    "sources": [{"uri": "<where the data came from>"}]
+  }
 }
 ```
 
-- `kind` is `prefix-set` or `prefix-map`.
-- `families` lists the families actually present; a query for an absent family is an error, not an empty result.
-- `value.type_id` is the only link between bytes and meaning. A reader refuses a mismatch against the type it was asked for.
-- `probe` holds the first and last entry per family, checked by exact lookup at open. It catches the one confusion the archive itself cannot: a trie read with the wrong key type validates and returns wrong prefixes.
-- `content_id` is BLAKE3 over the domain string `snap-content-v1\0`, then the canonical META projection, then every non-META section in id order framed `id u16 LE || len u64 LE || bytes`. The projection is META with `content_id` and `created_at` removed and re-serialized canonically, so pinning the id authenticates every other metadata field.
-- `created_at` is the only non-deterministic field, and it sits outside the projection, so equal data shares a `content_id`.
-- The hashes detect corruption. Tamper-evidence comes from pinning the `content_id` outside the object; nothing here is a signature.
-- Reserved bytes must be zero in major 1, and a reader rejects non-zero.
+`projection` carries: `canonical` (host bits zeroed, prefix form `network/len`),
+`counts` (`v4`, `v6`, omitted when a family has no entries), `families` (array of
+4 and 6), `kind` (`prefix-map`), `probe` (first and last key per family, so a
+reader can prove the archive it decoded is the one META describes), `stream`
+(`tree_id`, `generation`, `base_seq`, present only when `HAS_STREAM` is set),
+`events` (`first_event_ts`, `last_event_ts`, present only when `HAS_EVENTS` is
+set), `trie_layout`, and `value` (`type_id`, `width`).
+
+`provenance` is never hashed. Two objects with the same `projection` and the same
+trie sections have the same `content_id` no matter who built them, from which
+path, or when: the id addresses data, not build history.
+
+Every value inside `projection` is an integer or an ASCII string. That is a
+contract, not a coincidence: it removes JSON escaping and number formatting from
+the hash input, so two implementations cannot disagree about the bytes.
 
 ## 5. Values
 
@@ -101,15 +116,46 @@ Export is not a format concern. The only primitive the format provides is ordere
 
 ## 6. Reader
 
+A reader may stop after step 1 and answer identification questions from the
+header alone, but it MUST report that answer as unverified, because only steps
+4 through 6 prove the bytes match the claims.
+
 In order:
 
-1. Read 64 bytes; check magic, `prefix_len`, major.
-2. Check `file_len` against available bytes before fetching anything else.
-3. Read the footer at `footer_off`; require `footer_off + footer_len == file_len`, check the magic, the flags bit, and `section_count`.
-4. Require META first, ascending unique ids, `align = 16`, `pad = 0`, `offset % 16 == 0`, `offset + len <= footer_off`, and no two entries overlapping.
-5. Verify each section's `blake3`, then `body_blake3`, then recompute `content_id`. All mandatory.
-6. Present section bytes with at least 16-byte alignment (a memory map or an aligned copy, never a plain byte vector), check `value.type_id` against the requested type, then validate the archive.
-7. Compare `counts` and every `probe` entry by exact lookup.
+1. Read 192 bytes. Check magic, `major`, `header_len = 192`, `header_crc32c`,
+   `flags` bits, `families`, `type_id_len`, `created_at != 0`, and the stream and
+   event window invariants (section 8). Any failure is a rejection.
+2. If `file_len` is known (HTTP `Content-Length`), compare it before fetching the
+   body.
+3. Check `footer_off + 16 + 64 * section_count + 32 == file_len`, then read the
+   footer: magic, flags bit 0, and `section_count` equal to the header's.
+4. Require META first, ascending unique ids, `align = 16`, `pad = 0`,
+   `offset % 16 == 0`, `offset + len <= footer_off`, no two entries overlapping,
+   no section below 192, and the META entry equal to `meta_off`/`meta_len`.
+5. Verify each section's `blake3`, then `body_blake3`, then recompute
+   `content_id` from `projection` and the trie sections.
+6. Check that every header field the projection also carries agrees with META:
+   `content_id`, `type_id`, both counts, `families`, `created_at`, and the
+   `stream` and `events` objects. A disagreement is a rejection: this is what
+   makes a spliced header impossible to use.
+7. Present section bytes with at least 16-byte alignment (a memory map or an
+   aligned copy, never a plain byte vector), check `type_id`, then validate the
+   archive.
+8. Compare `counts` and every `probe` entry by exact lookup.
+
+## 6a. content_id
+
+`content_id = blake3( "snap-content-v1\0" || canonical_json(projection) ||
+framed(ID_V4, bytes) || framed(ID_V6, bytes) )`, where `framed(id, bytes)` is
+`id u16 LE || len u64 LE || bytes`, and only sections that are present are
+framed. META and the footer are not hashed, and neither is anything under
+`provenance`.
+
+Canonical JSON here means: keys sorted by byte order at every level, no
+whitespace, integers only, strings ASCII with no escapes required (section 4),
+UTF-8 otherwise. A conforming writer and reader must produce identical bytes for
+the same `projection`; the test vector in `crates/bgpkit-snap/tests/golden.rs`
+pins one.
 
 ## 7. Writer
 
@@ -117,7 +163,7 @@ Emit sections in id order with 16-byte padding; build META from the data actuall
 
 ## 8. Versioning, alignment, limits
 
-- Major bumps when the prefix, footer, section ids or any archived layout changes meaning; minor for additive META keys, new section ids and new value types. Readers accept their major and any minor, and refuse a required section they do not know.
+- Major bumps when the prefix, footer, section ids or any archived layout changes meaning; minor for additive META keys, new section ids and new value types. Readers accept their major and any minor of that major; a minor bump never changes the layout of the header or the footer and never reuses reserved space for an incompatible meaning, and refuse a required section they do not know.
 - Container integers are little-endian.
 - The rkyv feature set is part of the format: `little_endian` and `aligned` on; `big_endian`, `unaligned` and all `pointer_width_*` off, explicitly, because Cargo feature unification can flip defaults. The crate asserts the configuration at build time and fails a checked-in fixture if it drifts.
 - One archive stays under 2 GiB because the archive uses 32-bit relative offsets; entries stay under 4.3 G. Larger datasets shard by top-level prefix into several objects.
@@ -127,7 +173,8 @@ Emit sections in id order with 16-byte padding; build META from the data actuall
 The journal is how a mutable tree becomes a snapshot without losing updates. It is not an audit log and not the durable record.
 
 ```text
-segment header (32 B): magic "BGPKLOG" | version u16 | pad u16 | tree_id [16] | pad [4]
+segment header (48 B): magic "BGPKLOG\0" | major u16 | minor u16 | tree_id [16] |
+                      generation [16] | pad [4]
 record: len u32 LE (bytes after this field, so a record is 4 + len)
         crc32c u32 LE (over the bytes after this field, never over itself)
         seq u64 LE (dense, monotonic)
@@ -144,9 +191,14 @@ record: len u32 LE (bytes after this field, so a record is 4 + len)
 
 - One writer per tree, enforced by a lock.
 - A record is applied only if `crc32c` matches and `4 + len` lands on the next record boundary. A torn tail is truncated on open and the byte count is reported.
-- **Durability.** A feed call returns after its segment is fsynced. A checkpoint writes the snapshot, fsyncs the file and the directory, writes `checkpoint.json` (`{snapshot_file, base_seq, tree_id}`) by temporary file plus rename, fsyncs the directory again, and only then deletes segments wholly below `base_seq + 1`.
-- **Recovery.** Replay only records with `seq > base_seq` from segments whose `tree_id` matches the snapshot's.
-- **Retention.** Segments below `base_seq` are deleted at the next checkpoint; a query older than the oldest retained segment returns a "history pruned" outcome rather than an answer derived from a later base.
+- **Durability.** A feed call returns after its segment is fsynced. A checkpoint writes the snapshot, fsyncs the file and the directory, writes `checkpoint.json` (`{snapshot_file, base_seq, tree_id, generation}`) by temporary file plus rename, fsyncs the directory again, and only then deletes segments wholly below `base_seq + 1`.
+- **Recovery.** Replay only records with `seq > base_seq` from segments whose
+  `tree_id` and `generation` both match the snapshot's. `base_seq` is the highest
+  sequence the snapshot reflects, so the first record written after a checkpoint
+  has `seq == base_seq + 1` and is always replayed. A reader MUST refuse a
+  segment whose generation differs from `checkpoint.json`: sequence numbers are
+  only unique within one incarnation.
+- **Retention.** Segments wholly at or below `base_seq` are deleted at the next checkpoint; a query older than the oldest retained segment returns a "history pruned" outcome rather than an answer derived from a later base.
 - Control records carry a subtype and an opaque payload defined by the value type's owner. The format defines no session, gap or timestamp semantics.
 
 Checkpoint triggers, whichever comes first: 60 s since the last checkpoint, 250,000 records, a 64 MiB segment roll, or a control record that marks a natural boundary. Skip when nothing changed. Keep the previous snapshot and its segments until the new one is written, fsynced and re-opened cleanly.

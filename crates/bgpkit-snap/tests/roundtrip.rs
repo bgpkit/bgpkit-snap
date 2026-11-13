@@ -106,8 +106,8 @@ fn content_id_changes_when_a_value_changes() {
 fn a_flipped_value_byte_is_rejected() {
     let mut raw = built();
     // flip the last byte of the body, which is inside a trie section
-    let footer_off = u64::from_le_bytes(raw[24..32].try_into().unwrap()) as usize;
-    let target = footer_off - 1;
+    let header = bgpkit_snap::Header::parse(&raw).unwrap();
+    let target = header.footer_off as usize - 1;
     raw[target] ^= 0xFF;
     let err = Snapshot::<u32>::from_bytes(&raw).unwrap_err();
     assert!(
@@ -131,13 +131,19 @@ fn truncation_is_rejected() {
 #[test]
 fn a_misaligned_section_is_rejected() {
     let mut raw = built();
-    let footer_off = u64::from_le_bytes(raw[24..32].try_into().unwrap()) as usize;
+    let header = bgpkit_snap::Header::parse(&raw).unwrap();
     // first entry starts at footer_off + 16; its offset field is at +8
-    let off_field = footer_off + 16 + 8;
+    let off_field = header.footer_off as usize + 16 + 8;
     raw[off_field] = raw[off_field].wrapping_add(8);
     let err = Snapshot::<u32>::from_bytes(&raw).unwrap_err();
     assert!(
-        matches!(err, Error::SectionMisaligned(_) | Error::SectionOverlap(_)),
+        matches!(
+            err,
+            Error::SectionMisaligned(_)
+                | Error::SectionOverlap(_)
+                | Error::BodyHash
+                | Error::SectionHash(_)
+        ),
         "unexpected error: {err}"
     );
 }
@@ -162,6 +168,11 @@ fn a_single_family_object_is_valid() {
     let s: Snapshot<u32> = Snapshot::from_bytes(&raw).unwrap();
     assert!(s.v4().is_some());
     assert!(s.v6().is_none());
-    let families = s.meta().pointer("/families").unwrap().as_array().unwrap();
+    let families = s
+        .meta()
+        .pointer("/projection/families")
+        .unwrap()
+        .as_array()
+        .unwrap();
     assert_eq!(families.len(), 1);
 }

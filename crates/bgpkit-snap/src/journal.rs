@@ -21,8 +21,10 @@ use crate::{Error, RkyvError, SnapValue, Snapshot, Writer, ID_V4, ID_V6, MAJOR, 
 /// Segment magic. Deliberately different from the snapshot magic so a mixed-up
 /// file is rejected rather than parsed.
 pub const JOURNAL_MAGIC: &[u8; 8] = b"BGPKLOG\0";
-/// Segment header: magic 8 + version 2 + pad 2 + tree_id 16 + pad 4.
-pub const SEGMENT_HEADER_LEN: usize = 32;
+/// Segment header: magic 8 + version 2 + minor 2 + tree_id 16 + generation 16 +
+/// pad 4. The generation makes sequence numbers unique across journal
+/// incarnations, so a stale snapshot cannot be replayed against a new journal.
+pub const SEGMENT_HEADER_LEN: usize = 48;
 /// Fixed record bytes after the length field, with an empty value.
 pub const RECORD_FIXED_LEN: usize = 52;
 
@@ -104,6 +106,7 @@ pub struct Record {
 /// The append side. One writer per tree.
 pub struct Journal {
     tree_id: [u8; 16],
+    generation: [u8; 16],
     seg_path: PathBuf,
     seg: BufWriter<File>,
     seg_bytes: u64,
@@ -116,6 +119,18 @@ impl Journal {
     pub fn open(dir: impl AsRef<Path>, tree_id: [u8; 16]) -> Result<Self, Error> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
+        // reuse the generation of the segment already on disk, otherwise mint a
+        // new one for this incarnation
+        let generation = Self::existing_generation(&dir)?.unwrap_or_else(|| {
+            let mut h = blake3::Hasher::new();
+            h.update(b"snap-journal-generation\0");
+            h.update(&tree_id);
+            h.update(&now_ts().to_le_bytes());
+            h.update(&std::process::id().to_le_bytes());
+            let mut generation = [0u8; 16];
+            generation.copy_from_slice(&h.finalize().as_bytes()[..16]);
+            generation
+        });
         let start = Self::last_seq(&dir)?.map_or(1, |s| s + 1);
         let seg_path = dir.join(format!("segment-{start:012}.log"));
         let mut file = OpenOptions::new()
@@ -127,11 +142,13 @@ impl Journal {
         header.extend_from_slice(&MAJOR.to_le_bytes());
         header.extend_from_slice(&MINOR.to_le_bytes());
         header.extend_from_slice(&tree_id);
+        header.extend_from_slice(&generation);
         header.extend_from_slice(&[0u8; 4]);
         file.write_all(&header)?;
         file.sync_all()?;
         Ok(Self {
             tree_id,
+            generation,
             seg_path,
             seg: BufWriter::new(file),
             seg_bytes: SEGMENT_HEADER_LEN as u64,
@@ -156,6 +173,37 @@ impl Journal {
             }
         }
         Ok(last)
+    }
+
+    pub fn generation(&self) -> [u8; 16] {
+        self.generation
+    }
+
+    /// The generation recorded in the first segment on disk, if any.
+    fn existing_generation(dir: &Path) -> Result<Option<[u8; 16]>, Error> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(None);
+        };
+        let mut names: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("segment-") && n.ends_with(".log"))
+            })
+            .collect();
+        names.sort();
+        for path in names {
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if bytes.len() >= SEGMENT_HEADER_LEN && &bytes[..8] == JOURNAL_MAGIC {
+                let mut generation = [0u8; 16];
+                generation.copy_from_slice(&bytes[28..44]);
+                return Ok(Some(generation));
+            }
+        }
+        Ok(None)
     }
 
     pub fn seq(&self) -> u64 {
@@ -240,7 +288,19 @@ impl Journal {
         created_at: &str,
         source: &str,
     ) -> Result<String, Error> {
-        let bytes = tree.to_writer().finish(created_at, source)?;
+        let bytes = tree.to_writer().finish_with(
+            created_at,
+            source,
+            crate::HeaderInputs {
+                stream: Some(crate::StreamRef {
+                    tree_id: self.tree_id,
+                    generation: self.generation,
+                    base_seq: self.seq.saturating_sub(1),
+                }),
+                first_event_ts: 0,
+                last_event_ts: 0,
+            },
+        )?;
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let name = format!("snapshot-{}.snap", self.seq);
@@ -261,6 +321,7 @@ impl Journal {
             // first record appended after this checkpoint.
             "base_seq": self.seq.saturating_sub(1),
             "tree_id": hex(&self.tree_id),
+            "generation": hex(&self.generation),
         });
         let cp_path = dir.join("checkpoint.json");
         let cp_tmp = dir.join(".checkpoint.json.tmp");
@@ -409,6 +470,7 @@ pub struct ReplayStats {
 pub struct Checkpoint {
     pub snapshot_file: String,
     pub base_seq: u64,
+    pub generation: [u8; 16],
 }
 
 /// Read `checkpoint.json`, if the directory has one.
@@ -426,9 +488,14 @@ pub fn read_checkpoint(dir: impl AsRef<Path>) -> Result<Option<Checkpoint>, Erro
     let base_seq = v["base_seq"]
         .as_u64()
         .ok_or_else(|| Error::BadMeta("checkpoint.json: base_seq".into()))?;
+    let generation = v["generation"]
+        .as_str()
+        .and_then(parse_hex16)
+        .ok_or_else(|| Error::BadMeta("checkpoint.json: generation".into()))?;
     Ok(Some(Checkpoint {
         snapshot_file,
         base_seq,
+        generation,
     }))
 }
 
@@ -441,6 +508,7 @@ pub fn replay<V: Codec>(
     dir: impl AsRef<Path>,
     base_seq: u64,
     tree_id: [u8; 16],
+    generation: [u8; 16],
 ) -> Result<ReplayStats, Error> {
     let dir = dir.as_ref();
     let mut segments: Vec<PathBuf> = Vec::new();
@@ -471,6 +539,12 @@ pub fn replay<V: Codec>(
             return Err(Error::TypeMismatch {
                 expected: "journal tree_id",
                 found: hex(&raw[12..28]),
+            });
+        }
+        if raw[28..44] != generation {
+            return Err(Error::TypeMismatch {
+                expected: "journal generation",
+                found: hex(&raw[28..44]),
             });
         }
         let mut off = SEGMENT_HEADER_LEN;
@@ -551,6 +625,17 @@ fn now_ts() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn parse_hex16(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 fn hex(bytes: &[u8]) -> String {

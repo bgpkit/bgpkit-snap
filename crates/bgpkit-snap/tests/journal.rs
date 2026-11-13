@@ -66,7 +66,12 @@ fn replay_reproduces_the_live_tree() {
     let cp = journal::read_checkpoint(&snap_dir)
         .unwrap()
         .expect("checkpoint written");
-    let stats = journal::replay(&mut replayed, &log_dir, 0, tree_id).unwrap();
+    let generation = journal::read_checkpoint(&snap_dir)
+        .unwrap()
+        .map(|c| c.generation)
+        .unwrap_or_else(|| journal_generation(&log_dir));
+    let _ = generation;
+    let stats = journal::replay(&mut replayed, &log_dir, 0, tree_id, generation).unwrap();
     assert_eq!(stats.applied, 4, "every record applies from an empty base");
     let replayed_bytes = tree_bytes(&replayed);
     let replayed_id = Snapshot::<u32>::from_bytes(&replayed_bytes)
@@ -118,7 +123,14 @@ fn torn_tail_is_reported_and_not_applied() {
     drop(file);
 
     let mut tree = Tree::<u32>::new();
-    let stats = journal::replay(&mut tree, &log_dir, 0, tree_id).unwrap();
+    let stats = journal::replay(
+        &mut tree,
+        &log_dir,
+        0,
+        tree_id,
+        journal_generation(&log_dir),
+    )
+    .unwrap();
     assert_eq!(stats.applied, 2, "the torn record is not applied");
     assert!(stats.torn_bytes > 0, "the torn bytes are reported");
     assert_eq!(tree.len(), 2);
@@ -157,7 +169,14 @@ fn corrupted_record_stops_the_scan() {
     drop(f);
 
     let mut tree = Tree::<u32>::new();
-    let stats = journal::replay(&mut tree, &log_dir, 0, tree_id).unwrap();
+    let stats = journal::replay(
+        &mut tree,
+        &log_dir,
+        0,
+        tree_id,
+        journal_generation(&log_dir),
+    )
+    .unwrap();
     assert_eq!(
         stats.applied, 0,
         "a record that fails its CRC is never applied"
@@ -177,7 +196,14 @@ fn a_foreign_segment_is_rejected() {
         j.sync().unwrap();
     }
     let mut tree = Tree::<u32>::new();
-    let err = journal::replay(&mut tree, &log_dir, 0, [2u8; 16]).unwrap_err();
+    let err = journal::replay(
+        &mut tree,
+        &log_dir,
+        0,
+        [2u8; 16],
+        journal_generation(&log_dir),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, bgpkit_snap::Error::TypeMismatch { .. }),
         "{err}"
@@ -216,7 +242,8 @@ fn the_first_record_after_a_checkpoint_survives_replay() {
     let base_snap =
         Snapshot::<u32>::open(snap_dir.join(&cp.snapshot_file).to_str().unwrap()).unwrap();
     let mut replayed = Tree::open(&base_snap).unwrap();
-    let stats = journal::replay(&mut replayed, &log_dir, cp.base_seq, tree_id).unwrap();
+    let stats =
+        journal::replay(&mut replayed, &log_dir, cp.base_seq, tree_id, cp.generation).unwrap();
 
     assert_eq!(
         stats.applied, 1,
@@ -235,5 +262,38 @@ fn the_first_record_after_a_checkpoint_survives_replay() {
             .content_id()
     );
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Read the generation out of a segment header, for tests that replay without a
+/// checkpoint.
+fn journal_generation(dir: &std::path::Path) -> [u8; 16] {
+    let path = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
+        .min()
+        .unwrap();
+    let raw = std::fs::read(path).unwrap();
+    let mut generation = [0u8; 16];
+    generation.copy_from_slice(&raw[28..44]);
+    generation
+}
+
+#[test]
+fn a_foreign_generation_is_rejected() {
+    let dir = tmpdir("generation");
+    let log_dir = dir.join("journal");
+    {
+        let mut j = Journal::open(&log_dir, [4u8; 16]).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), &7u32, 0).unwrap();
+        j.sync().unwrap();
+    }
+    let mut tree = Tree::<u32>::new();
+    let err = journal::replay(&mut tree, &log_dir, 0, [4u8; 16], [9u8; 16]).unwrap_err();
+    assert!(
+        matches!(err, bgpkit_snap::Error::TypeMismatch { .. }),
+        "{err}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -76,9 +76,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Cmd::Info { file } => {
-            let s: Snapshot<u32> = Snapshot::open(&file)?;
-            println!("{}", serde_json::to_string_pretty(s.meta())?);
-            println!("content_id: {}", s.content_id());
+            // identification costs one 192-byte read, never the body
+            let mut raw = [0u8; bgpkit_snap::header::HEADER_LEN];
+            {
+                use std::io::Read;
+                let mut f = std::fs::File::open(&file)?;
+                f.read_exact(&mut raw)?;
+            }
+            let h = bgpkit_snap::Header::parse(&raw)?;
+            let families = h.families;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "content_id": h.content_id_hex(),
+                    "counts": {"v4": h.count_v4, "v6": h.count_v6},
+                    "families": families,
+                    "type_id": h.type_id,
+                    "file_len": h.file_len,
+                    "created_at": h.created_at,
+                    "event_window": [h.first_event_ts, h.last_event_ts],
+                    "stream": h.flags & bgpkit_snap::header::FLAG_HAS_STREAM != 0,
+                }))?
+            );
         }
         Cmd::Verify { file } => {
             let s: Snapshot<u32> = Snapshot::open(&file)?;

@@ -7,7 +7,7 @@ use ipnet::IpNet;
 
 const CREATED: &str = "2026-11-12T00:00:00Z";
 const EXPECTED_CONTENT_ID: &str =
-    "cb0a6d0a4e1fd3fd6a75ae708bb67ad30539e9e19daaef1e53591afed1400864";
+    "9ae07d1d2078d6b2d0387b8c8d9ccd45badb65233878862e989db89789b29c79";
 
 fn root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
