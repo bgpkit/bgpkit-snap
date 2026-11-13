@@ -96,6 +96,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "created_at": h.created_at,
                     "event_window": [h.first_event_ts, h.last_event_ts],
                     "stream": h.flags & bgpkit_snap::header::FLAG_HAS_STREAM != 0,
+                    // this answer comes from the header alone, so it is a claim
+                    "verified": false,
                 }))?
             );
         }

@@ -251,15 +251,19 @@ impl Header {
                 have: actual_len,
             });
         }
-        if self.footer_off + footer_len != self.file_len {
+        let Some(footer_end) = self.footer_off.checked_add(footer_len) else {
+            return Err(Error::BadSectionTable("footer offset overflows"));
+        };
+        if footer_end != self.file_len {
             return Err(Error::BadSectionTable("footer does not end the file"));
         }
         if self.footer_off < HEADER_LEN as u64 {
             return Err(Error::BadSectionTable("footer overlaps the header"));
         }
-        if self.meta_off < HEADER_LEN as u64
-            || self.meta_off + self.meta_len as u64 > self.footer_off
-        {
+        let Some(meta_end) = self.meta_off.checked_add(self.meta_len as u64) else {
+            return Err(Error::BadSectionTable("META offset overflows"));
+        };
+        if self.meta_off < HEADER_LEN as u64 || meta_end > self.footer_off {
             return Err(Error::BadSectionTable("META is outside the body"));
         }
         Ok(())

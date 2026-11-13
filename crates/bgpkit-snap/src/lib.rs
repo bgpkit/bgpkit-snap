@@ -572,6 +572,20 @@ impl<T: Codec> Snapshot<T> {
         if sections.first().map(|s| s.0) != Some(ID_META) {
             return Err(Error::MissingMeta);
         }
+        // a family section may only exist when the header declares that family,
+        // otherwise a reader would answer from data the object says it has not got
+        for (id, family_bit, count) in [
+            (ID_V4, header::FAMILY_V4, header.count_v4),
+            (ID_V6, header::FAMILY_V6, header.count_v6),
+        ] {
+            let present = sections.iter().any(|s| s.0 == id);
+            let declared = header.families & family_bit != 0;
+            if present != declared || (present && count == 0) {
+                return Err(Error::BadSectionTable(
+                    "section disagrees with the declared families",
+                ));
+            }
+        }
         if sections[0].1 as u64 != header.meta_off || sections[0].2 as u64 != header.meta_len as u64
         {
             return Err(Error::BadSectionTable(
@@ -590,6 +604,12 @@ impl<T: Codec> Snapshot<T> {
                 return Err(Error::BodyHash);
             }
         }
+
+        // copy into an aligned buffer first: rkyv validation depends on the
+        // alignment of the slice it is handed, so validating the caller's bytes
+        // would accept or reject the same object depending on where it sits
+        let mut aligned = AlignedVec::with_capacity(raw.len());
+        aligned.extend_from_slice(raw);
 
         // an untrusted object can carry a hash-consistent but structurally
         // invalid archive, so every trie section is checked before any
@@ -612,17 +632,18 @@ impl<T: Codec> Snapshot<T> {
             }
         }
 
-        // copy into an aligned buffer; a plain Vec is not a legal input
-        let mut aligned = AlignedVec::with_capacity(raw.len());
-        aligned.extend_from_slice(raw);
-
         let (_, meta_off, meta_len) = *sections
             .iter()
             .find(|s| s.0 == ID_META)
             .ok_or(Error::MissingMeta)?;
+        let meta_bytes = &aligned[meta_off..meta_off + meta_len];
         let meta: serde_json::Value =
-            serde_json::from_slice(&aligned[meta_off..meta_off + meta_len])
-                .map_err(|e| Error::BadMeta(e.to_string()))?;
+            serde_json::from_slice(meta_bytes).map_err(|e| Error::BadMeta(e.to_string()))?;
+        // canonical form is part of the contract: anything that does not
+        // re-serialize to the exact bytes received is out of spec
+        if serde_json::to_vec(&meta).map_err(|e| Error::BadMeta(e.to_string()))? != meta_bytes {
+            return Err(Error::BadMeta("META is not in canonical form".into()));
+        }
         let declared = meta
             .pointer("/projection/value/type_id")
             .and_then(|v| v.as_str())

@@ -346,3 +346,35 @@ fn a_restarted_incarnation_continues_the_sequence() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn reopening_a_journal_that_holds_no_records_keeps_them_reachable() {
+    // an empty segment already carries its header; a second header written into
+    // it would hide every record appended afterwards
+    let dir = tmpdir("empty-reopen");
+    let tree_id = [8u8; 16];
+    let log_dir = dir.join("journal");
+    let generation;
+    {
+        let j = Journal::open(&log_dir, tree_id).unwrap();
+        generation = j.generation();
+    }
+    {
+        let mut j = Journal::open(&log_dir, tree_id).unwrap();
+        j.insert("10.30.0.0/16".parse().unwrap(), &1u32, 0).unwrap();
+        j.sync().unwrap();
+    }
+    let mut tree = Tree::<u32>::new();
+    let stats = journal::replay(&mut tree, &log_dir, 0, tree_id, generation).unwrap();
+    assert_eq!(
+        stats.applied, 1,
+        "the record written after the reopen must apply"
+    );
+    assert_eq!(
+        stats.torn_bytes, 0,
+        "no second header may be mistaken for data"
+    );
+    assert_eq!(tree.len(), 1);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -104,11 +104,28 @@ impl Journal {
         // new one for this incarnation
         let generation = Self::existing_generation(&dir)?.unwrap_or_else(random_generation);
         let start = Self::next_seq(&dir)?;
+        // a segment holding only its header must be appended to, not re-opened
+        // with a second header: the later records would be unreachable
+        let reuse_empty = Self::newest_is_header_only(&dir)?;
         let seg_path = dir.join(format!("segment-{start:012}.log"));
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&seg_path)?;
+        if reuse_empty && file.metadata()?.len() == SEGMENT_HEADER_LEN as u64 {
+            file.sync_all()?;
+            return Ok(Self {
+                dir,
+                _lock: lock,
+                tree_id,
+                generation,
+                seg_path,
+                seg: BufWriter::new(file),
+                seg_bytes: SEGMENT_HEADER_LEN as u64,
+                seq: start,
+                records: 0,
+            });
+        }
         let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
         header.extend_from_slice(JOURNAL_MAGIC);
         header.extend_from_slice(&MAJOR.to_le_bytes());
@@ -171,6 +188,37 @@ impl Journal {
 
     pub fn generation(&self) -> [u8; 16] {
         self.generation
+    }
+
+    /// Start a new incarnation in `dir`, minting a fresh generation. A restored
+    /// backup or a deliberate fork must use this, otherwise two divergent states
+    /// can claim the same (tree_id, generation, base_seq).
+    pub fn open_new_incarnation(dir: impl AsRef<Path>, tree_id: [u8; 16]) -> Result<Self, Error> {
+        let dir = dir.as_ref();
+        let generation_file = dir.join("generation.next");
+        std::fs::create_dir_all(dir)?;
+        let generation = random_generation();
+        std::fs::write(generation_file, hex(&generation))?;
+        let mut journal = Self::open(dir, tree_id)?;
+        journal.generation = generation;
+        Ok(journal)
+    }
+
+    /// True when the newest segment holds its header and no records.
+    fn newest_is_header_only(dir: &Path) -> Result<bool, Error> {
+        let mut segments: Vec<PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("segment-") && n.ends_with(".log"))
+            })
+            .collect();
+        segments.sort();
+        let Some(last) = segments.last() else {
+            return Ok(false);
+        };
+        Ok(std::fs::metadata(last)?.len() == SEGMENT_HEADER_LEN as u64)
     }
 
     /// The generation recorded in the first segment on disk, if any.
@@ -255,7 +303,9 @@ impl Journal {
         value: &V,
         event_ts: i64,
     ) -> Result<u64, Error> {
-        let bytes = V::encode(value)?;
+        let mut value = value.clone();
+        value.canonicalize();
+        let bytes = V::encode(&value)?;
         self.append(KIND_INSERT, prefix, &bytes, now_ts(), event_ts)
     }
 
@@ -330,6 +380,9 @@ impl Journal {
         std::fs::rename(&cp_tmp, &cp_path)?;
         File::open(dir)?.sync_all()?;
 
+        // the snapshot must be readable before anything is deleted; a corrupt
+        // rename would otherwise destroy the only other copy of the history
+        verify_checkpoint_binding(dir)?;
         self.prune_segments()?;
         Ok(name)
     }
@@ -556,7 +609,7 @@ pub fn replay<V: Codec>(
         skipped: 0,
         torn_bytes: 0,
     };
-    let mut next_expected: Option<u64> = None;
+    let mut next_expected: Option<u64> = Some(base_seq + 1);
     for path in segments {
         let mut raw = Vec::new();
         File::open(&path)?.read_to_end(&mut raw)?;
@@ -578,7 +631,7 @@ pub fn replay<V: Codec>(
         let mut off = SEGMENT_HEADER_LEN;
         while off + 4 <= raw.len() {
             let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("4 bytes")) as usize;
-            if off + 4 + len > raw.len() {
+            if len < RECORD_FIXED_LEN || off + 4 + len > raw.len() {
                 stats.torn_bytes += (raw.len() - off) as u64;
                 break;
             }
@@ -589,6 +642,11 @@ pub fn replay<V: Codec>(
                 break;
             }
             let record = parse_payload(payload)?;
+            off += 4 + len;
+            if record.seq <= base_seq {
+                stats.skipped += 1;
+                continue;
+            }
             if let Some(expected) = next_expected {
                 if record.seq != expected {
                     return Err(Error::BadMeta(format!(
@@ -598,22 +656,21 @@ pub fn replay<V: Codec>(
                 }
             }
             next_expected = Some(record.seq + 1);
-            if record.seq <= base_seq {
-                stats.skipped += 1;
-            } else {
-                match record.kind {
-                    KIND_INSERT => {
-                        tree.insert(record.prefix, V::decode(&record.value)?);
-                    }
-                    KIND_WITHDRAW => {
-                        tree.withdraw(record.prefix);
-                    }
-                    KIND_CONTROL => {}
-                    _ => {}
+            match record.kind {
+                KIND_INSERT => {
+                    tree.insert(record.prefix, V::decode(&record.value)?);
                 }
-                stats.applied += 1;
+                KIND_WITHDRAW => {
+                    tree.withdraw(record.prefix);
+                }
+                KIND_CONTROL => {}
+                other => {
+                    return Err(Error::BadMeta(format!(
+                        "journal record has unknown kind {other}"
+                    )))
+                }
             }
-            off += 4 + len;
+            stats.applied += 1;
         }
         if off < raw.len() && stats.torn_bytes == 0 {
             stats.torn_bytes += (raw.len() - off) as u64;

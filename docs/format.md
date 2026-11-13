@@ -43,8 +43,8 @@ HEADER (192 B, replaces the 64-byte prefix of draft 0.1; offsets are absolute)
  186..188  type_id_len u16 LE  1..32
  188..192  header_crc32c u32 LE over bytes 0..188
 
-SECTIONS, each at a 16-byte aligned absolute offset, contiguous and
-non-overlapping, starting at or after 192
+SECTIONS, each starting at the first 16-byte boundary at or after the previous
+end (zero padding between them), non-overlapping, the first at or after 192
 
 FOOTER, ends the file
   0..4    section_count u32 LE
@@ -160,10 +160,12 @@ In order:
 ## 6a. content_id
 
 `content_id = blake3( "snap-content-v1\0" || canonical_json(projection) ||
-framed(ID_V4, bytes) || framed(ID_V6, bytes) )`, where `framed(id, bytes)` is
-`id u16 LE || len u64 LE || bytes`, and only sections that are present are
-framed. META and the footer are not hashed, and neither is anything under
-`provenance`.
+framed(section) for every non-META section in ascending id order )`, where
+`framed(id, bytes)` is `id u16 LE || len u64 LE || bytes` and META is skipped.
+Framing every non-META section is what keeps a section added by a later minor
+version inside the object identity: two objects that differ in such a section
+must have different ids. The header and the footer are not hashed, and neither is
+anything under `provenance`.
 
 Canonical JSON here means: keys sorted by byte order at every level, no
 whitespace, integers only, strings ASCII with no escapes required (section 4),
