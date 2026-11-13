@@ -1,9 +1,8 @@
 //! `bgpkit-snap` PoC: a versioned prefix-trie container.
 //!
-//! One immutable object = a 64-byte prefix, sections (META, TRIE_V4, TRIE_V6)
+//! One immutable object = a 192-byte header, sections (META, TRIE_V4, TRIE_V6)
 //! and a footer with per-section hashes. The normative contract is
-//! `/root/specs/bgpkit-snap/bgpkit-snap-format.md`; this file is the working
-//! PoC of it, not the shipped crate.
+//! `docs/format.md`; this crate is its reference implementation.
 
 use std::fmt;
 
