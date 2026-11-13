@@ -13,6 +13,8 @@ use prefix_trie::PrefixMap;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::util::AlignedVec;
 
+pub mod journal;
+
 pub const MAGIC: &[u8; 8] = b"BGPKSNAP";
 pub const FOOTER_MAGIC: &[u8; 4] = b"SNPF";
 pub const MAJOR: u16 = 1;
