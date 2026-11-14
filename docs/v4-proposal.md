@@ -113,8 +113,8 @@ Snapshot::section_bytes(id) -> Option<&[u8]>
 Snapshot::header() -> &Header
 
 pub trait Validator {
-    // asked once per section at open: a required section nobody knows is refused
-    // with its id
+    // asked at open only about a required section the reader does not implement;
+    // answering false refuses the object and names its id
     fn knows(&self, entry: &Entry) -> bool;
     // cross-section checks, run once at open before any value is handed out
     fn validate(&self, view: &SnapshotView<'_>) -> Result<(), Error>;
@@ -213,7 +213,11 @@ does not match: that is a torn tail, and the records after it are not trusted.
 A record may be skipped only because a checkpoint already covers its sequence
 number. Any other disagreement between the expected number and the number found
 is an error: a hole in the middle of a journal is data loss, and a reader that
-skipped it would answer from a smaller tree than the writer committed. A
+skipped it would answer from a smaller tree than the writer committed. A torn
+frame at the end of a segment is the one case where the writer may keep going:
+the bytes were never acknowledged, so the next append cuts them away and writes
+the same sequence number again in the same segment, and nothing after the tear is
+read. A
 segment whose crc fails therefore cannot be followed by a later segment that
 replays as if nothing were missing.
 
