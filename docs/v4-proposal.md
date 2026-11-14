@@ -178,7 +178,7 @@ decimal index zero-padded to twelve digits, so lexicographic order is numeric
 order; a reader that sorted `segment-1.log` and `segment-10.log` as strings would
 replay them out of order and refuse the journal.
 
-A segment starts with a 48-byte header:
+A segment starts with a 48-byte header, its integers in little endian:
 
 | offset | size | field |
 | --- | --- | --- |
@@ -189,8 +189,9 @@ A segment starts with a 48-byte header:
 | 28 | 16 | generation |
 | 44 | 4 | reserved, zero |
 
-A record is framed `len u32 | crc32c u32 | payload`. `len` counts the crc field
-and the payload. `crc32c` covers the payload only. The payload is:
+A record is framed `len u32 | crc32c u32 | payload`, every integer in little
+endian. `len` counts the crc field and the payload. `crc32c` covers the payload
+only. The payload is:
 
 | offset | size | field |
 | --- | --- | --- |
