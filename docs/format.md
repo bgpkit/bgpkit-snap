@@ -1,274 +1,303 @@
-Status: 1.0-rc1. The layout below is frozen for the release candidate; see section 11 for the limitations that remain before 1.0 final.
-
 # snap format 1.0
 
-An immutable, memory-mappable container for a prefix trie with arbitrary values, plus an append-only journal for building one incrementally.
+Status: normative for 1.0.0-rc.2. This document is the byte contract for the
+container and the journal. It replaces the draft that shipped with 1.0.0-rc.1,
+which is kept as [`format-rc1.md`](format-rc1.md) for reference only.
 
-## 1. Scope and non-goals
+Scope: an immutable, memory-mappable container for a prefix trie with arbitrary
+values, an append-only journal for building one incrementally, and the rules a
+reader must apply before it answers. What a section's bytes mean is named by the
+value type; this document says where they are and how they are covered.
 
-The container holds one prefix trie per address family, a canonical JSON metadata block, and integrity hashes. It is read by memory mapping and validating once, then querying in place. It is written in one pass and never modified.
-
-Non-goals: SQL or a query planner, by-value search (find all keys with value X), partial or ranged reads, multi-writer concurrency, and any guarantee about the trie's internal byte layout beyond the version recorded in the metadata.
-
-## 2. Object layout
-
-This header supersedes the 64-byte `PREFIX` of draft 0.1. An object that only
-satisfies the old prefix layout is not a v1 object and MUST be rejected.
-
-One immutable file, conventionally named `<content_id>.snap`.
+## 1. What the object is
 
 ```text
-HEADER (192 B, replaces the 64-byte prefix of draft 0.1; offsets are absolute)
-   0..8    magic "BGPKSNAP"
-   8..10   major u16 LE (1)
-  10..12   minor u16 LE (0)
-  12..14   header_len u16 LE (192)
-  14..16   flags u16 LE   bit 0: HAS_STREAM, bit 1: HAS_EVENTS, rest zero
-  16..32   tree_id [16]   all zero when HAS_STREAM is clear
-  32..48   generation [16] random per journal incarnation, zero when clear
-  48..80   content_id [32] raw bytes, authoritative copy is in META
-  80..112  type_id [32]   ASCII; zero-padded only when type_id_len < 32
- 112..120  base_seq u64 LE  last journal sequence the body reflects
- 120..128  file_len u64 LE
- 128..136  footer_off u64 LE
- 136..144  meta_off u64 LE
- 144..148  meta_len u32 LE
- 148..152  section_count u32 LE
- 152..156  count_v4 u32 LE
- 156..160  count_v6 u32 LE
- 160..168  first_event_ts i64 LE
- 168..176  last_event_ts i64 LE
- 176..184  created_at i64 LE   Unix seconds, never zero
- 184..186  families u16 LE     bit 0 v4, bit 1 v6, no other bit
- 186..188  type_id_len u16 LE  1..32
- 188..192  header_crc32c u32 LE over bytes 0..188
-
-SECTIONS, each starting at the first 16-byte boundary at or after the previous
-end (zero padding between them), non-overlapping, the first exactly at 192
-
-FOOTER, ends the file
-  0..4    section_count u32 LE
-  4..8    footer_magic "SNPF"
-  8..12   flags u32 LE   bit 0: body hash present (must be 1 in v1)
-  12..16  reserved, zero
-  entries, 64 bytes each, fields at fixed offsets
-    +0  id    u16  1 META, 2 TRIE_V4, 3 TRIE_V6
-    +2  kind  u16  same values as id
-    +4  flags u16  bit 0: required by readers (0 for all v1 sections)
-    +6  align u8   must be 16
-    +7  pad   u8   must be 0
-    +8  offset u64 LE  absolute, 16-byte aligned, >= 192
-   +16  len    u64 LE
-   +24  hash   [32]   blake3 of the section bytes
-   +56  reserved [8]  zero
-  body hash [32]      blake3 over the sections in file order
+HEADER 192 B (fixed, one read identifies the object)
+SECTION TABLE at 192, one 64 B entry per section
+SECTIONS, packed in ascending id order, each starting on a 16-byte boundary
 ```
 
-`footer_len` is not stored: it is `16 + 64 * section_count + 32`, and the footer
-must end the file. The body hash is computed over the concatenation of section
-bytes in the order the entries list them.
+No META, no footer, no JSON, no projection, no body hash.
 
-## 3. Sections
+### Header, field by field
+
+`created_at`, `content_id` and the crc sit after the hashed prefix, so the hash
+input is one contiguous range `0..148` with no field-order puzzle.
+
+| offset | size | field | why it cannot be deleted |
+| --- | --- | --- | --- |
+| 0 | 8 | magic `BGPKSNAP` | without it any byte stream parses |
+| 8 | 2 | major | a future body read as v4 frames parses but means something else |
+| 10 | 2 | flags | bit 0 has stream coordinates, bit 1 has a coverage window; the only place to add an optional feature without a major bump |
+| 12 | 16 | tree_id | replay must refuse a snapshot of another tree |
+| 28 | 16 | generation | without it a restore or fork reuses `(tree_id, seq)` |
+| 44 | 8 | base_seq | replay would start from the wrong record |
+| 52 | 32 | type_id | a trie read with the wrong value interpretation answers wrongly |
+| 84 | 8 | file_len | distinguishes "ends here" from "trailing bytes appended" |
+| 92 | 4 | section_count | bounds the table |
+| 96 | 4 | section_table_len | `64 * section_count`, so a reader can range-read exactly the table and detect a mismatch |
+| 100 | 16 | window `[i64; 2]`, unix seconds UTC | "is this value still valid" cannot be recovered from the data |
+| 116 | 32 | reserved | zero; keeps the hashed prefix 148 bytes long |
+| 148 | 8 | created_at, unix seconds UTC | operational ordering; deliberately outside the hash |
+| 156 | 32 | content_id | dedup and "is this the object I asked for"; cannot hash itself |
+| 188 | 4 | crc32c over bytes `0..188` | covers the header bytes the hash cannot: `content_id` and `created_at` |
+
+Every integer in the header and the table is little-endian.
+
+`HASH_END` = 148. Everything before it is a claim about the data and is hashed;
+the three tail fields are bookkeeping. The header crc is computed over
+`header[0..188]`, that is every byte before the crc field itself.
+
+### Section table entry, 64 B
 
 ```text
-1  META    canonical JSON (section 4), always present, always first
-2  TRIE_V4 a zero-copy archive of a prefix map keyed by IPv4 prefixes
-3  TRIE_V6 the same for IPv6
+ 0  id u16          which section
+ 2  kind u32        'V4\0\0' / 'V6\0\0' / 'PAY\0' / anything a profile defines
+ 6  flags u16       bit 0 required: a reader that does not know this id must refuse
+ 8  len u64         section length; no offset, it is computed by packing
+16  reserved [48]   zero
 ```
 
-Rules: ids ascending and unique, META first, each section starts at the first 16-byte boundary at or after the previous section end (padding bytes are zero and belong to no section), the first starts exactly at 192, and the last ends at or before `footer_off`, `meta_off`/`meta_len` in the header equal to the META entry, trie sections never compressed, at least one trie section present. A prefix-set is a trie whose value type is empty.
+Offsets are computed: sections are packed in ascending id order, each starting at
+the first 16-byte boundary at or after the previous end. Nothing to disagree
+about, one less field to lie. The bytes skipped to reach that boundary are zero,
+and a reader refuses an object where they are not, because two writers must agree
+on what they emit even though the padding is outside the content id.
 
-## 4. META
+No per-section hashes. `content_id` covers every section, so a corrupt object is
+caught at open; locating which section is damaged is not a requirement anyone has
+demonstrated, and it costs 32 B per section plus a rule about which bytes they
+cover.
 
-META is canonical JSON with three top-level keys:
+### Identity
 
-```json
-{
-  "projection": { "...": "the hashed data projection, see section 6" },
-  "content_id": "<64 hex chars>",
-  "provenance": {
-    "generator": "bgpkit-snap/<version>",
-    "producer": "bgpkit-snap/<version>",
-    "created_at": "<RFC 3339, matches header.created_at>",
-    "sources": [{"uri": "<where the data came from>"}]
-  }
+```text
+content_id = blake3( "bgpkit-snap-v4\0"
+                   || header[0..148]          (created_at excluded by placement)
+                   || table bytes
+                   || every section's bytes, ascending id )
+```
+
+The header prefix is a contiguous range, so there is no "which fields are
+excluded" ambiguity: `created_at` lives after the prefix, `content_id` and the
+crc live after it too.
+
+## 2. Reference API
+
+This section describes the Rust crate, not the bytes. Another implementation is
+free to expose the same object differently; what it must not do is accept or emit
+bytes that disagree with sections 1 and 3.
+
+```rust
+pub trait SnapValue: Archive + Clone + Serialize<HighSer> {
+    const TYPE_ID: &str;
+    fn canonicalize(&mut self) {}          // default: no-op
+}
+
+pub struct Opts<'a> {
+    pub created_at: &'a str,
+    pub stream: Option<StreamRef>,          // tree_id, generation, base_seq
+    pub window: Option<(i64, i64)>,
+    pub extras: &'a [ExtraSection],         // id, kind, required, bytes
+}
+
+pub struct ExtraSection<'a> { pub id: u16, pub kind: [u8;4], pub required: bool, pub bytes: &'a [u8] }
+
+Writer::<T>::new()
+Writer::insert(prefix, value)               // replaces an existing value
+Writer::len()
+Writer::finish(&Opts) -> Result<Vec<u8>>    // caller writes the file
+
+Snapshot::<T>::open(path)                   // refuses unknown required sections
+Snapshot::<T>::open_with(path, &dyn Validator)
+Snapshot::<T>::from_bytes(&[u8])            // and from_bytes_with
+Snapshot::search(ip: IpAddr) -> Option<(IpNet, &T::Archived)>
+Snapshot::search_prefix(prefix) -> Option<(IpNet, &T::Archived)>
+Snapshot::children(prefix) -> Vec<(IpNet, &T::Archived)>   // the prefix itself when
+                                                          // stored, plus what is under it
+Snapshot::section_bytes(id) -> Option<&[u8]>
+Snapshot::header() -> &Header
+
+pub trait Validator {
+    // asked at open only about a required section the reader does not implement;
+    // answering false refuses the object and names its id
+    fn knows(&self, entry: &Entry) -> bool;
+    // cross-section checks, run once at open before any value is handed out
+    fn validate(&self, view: &SnapshotView<'_>) -> Result<(), Error>;
 }
 ```
 
-Leaves of `projection` are signed integers (event timestamps may precede the
-epoch) and ASCII strings without `"` or `\`. `content_id` is lowercase hex.
+`WIDTH` is gone: it was an invariant callers could get wrong and nothing consumed
+it. `replay`, sequence numbers, generations and the writer lock are not public
+API; the journal owns them.
 
-`projection` carries: `canonical` (host bits zeroed, prefix form `network/len`),
-`counts` (`v4`, `v6`, omitted when a family has no entries), `families` (array of
-4 and 6), `kind` (`prefix-map`), `probe` (first and last key per family, so a
-reader can prove the archive it decoded is the one META describes), `stream`
-(`tree_id`, `generation`, `base_seq`, present only when `HAS_STREAM` is set),
-`events` (`first_event_ts`, `last_event_ts`, present only when `HAS_EVENTS` is
-set), `trie_layout`, and `value` (`type_id`, `width`).
+### What a family section holds
 
-`provenance` is never hashed. Two objects with the same `projection` and the same
-trie sections have the same `content_id` no matter who built them, from which
-path, or when: the id addresses data, not build history.
+The container contract above is independent of what a section's bytes mean; the
+`type_id` names the value type and, with it, the encoding of the family sections.
+For the value types this crate defines, a family section is an
+`rkyv 0.8` archive, with `little_endian`, `std`, `bytecheck` and `aligned`, of
+`prefix_trie` 0.10's `PrefixMap<Ipv4Net, T>` or `PrefixMap<Ipv6Net, T>`, where `T`
+is the profile's own archive type. The layout of that archive is rkyv's, not
+this document's.
 
-Every leaf inside `projection` is a non-negative integer or an ASCII string with
-no characters below 0x20. Values may be nested objects and arrays, whose keys the
-writer sorts by byte order and serialises with no whitespace. That contract is
-what removes JSON escaping and float formatting from the hash input; a projection
-field that needs a float, a non-ASCII string, or a control character is a major
-version change. The golden test pins the exact bytes.
+An implementation that cannot decode that layout must refuse the object and say
+so; it must not guess, and it must not treat the section as empty. Reading the
+header, the table, the identity and the journal framing needs none of this, so a
+tool that only inspects objects is unaffected.
 
-## 5. Values
+### Section ids
 
-A value type is the only extension point. A type declares a stable id, a canonical form, and a canonical order when the type is not already canonical:
+| id | kind | meaning |
+| --- | --- | --- |
+| 2 | `V4` | the IPv4 trie archive |
+| 3 | `V6` | the IPv6 trie archive |
+| 16 and up | caller | this profile's own sections |
 
-```text
-type_id        value              canonical form
-snap.none:v1   ()                 prefix set, no value
-snap.u32:v1    u32                plain scalar
-snap.u64:v1    u64                plain scalar
-<T>::vN        user types         declared by the type, with a canonicalizer
+A section whose kind is `V4` is at id 2 and a section whose kind is `V6` is at
+id 3. A reader rejects any other pairing rather than ignoring the section,
+because ignoring it turns a disagreement into an empty answer.
+
+## 3. Journal
+
+One owner: `Journal<T>` holds the live tree, the blob arena, the segment writer,
+the writer lock and the directory, and it recovers on open.
+
+```rust
+Journal::<T>::open(dir, tree_id, Option<PayloadSection>) -> Result<Journal<T>>
+journal.insert(prefix, &value)                  // updates the tree and the log
+journal.insert_with_blob(prefix, &value, &blob) // also appends blob to the arena
+journal.withdraw(prefix)
+journal.sync()                                  // durable on return
+journal.checkpoint(&opts) -> Result<PathBuf>     // verified before pruning
+journal.len()
 ```
 
-Export is not a format concern. The only primitive the format provides is ordered iteration over `(prefix, value)`; a consumer that wants JSON, CSV or Parquet writes it from that iterator with whatever library it already uses. Every non-scalar type must sort its inner collections before serializing. Archive byte identity holds only when the value is canonical; without that rule two logically equal data sets hash differently and content addressing stops working. A new type is a minor version change; changing an existing type's layout or meaning requires a new `:vN`.
+### Journal bytes
 
-## 6. Reader
+A journal is a directory: `writer.lock`, `state.json`,
+`segment-<12-digit index>.log` and `snapshot-<seq>.snap`. The
+`type_id` is ASCII, NUL-terminated, zero-filled to 32 bytes; a reader refuses a
+field without a terminator or with non-printable bytes. Reserved and padding
+bytes are zero. Segment names are the
+decimal index zero-padded to twelve digits, so lexicographic order is numeric
+order; a reader that sorted `segment-1.log` and `segment-10.log` as strings would
+replay them out of order and refuse the journal.
 
-A reader may stop after step 1 and answer identification questions from the
-header alone, but it MUST report that answer as unverified, because only steps
-4 through 6 prove the bytes match the claims.
+A segment starts with a 48-byte header, its integers in little endian:
 
-In order:
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 8 | magic `BGPKLOG\0` |
+| 8 | 2 | version, 4 |
+| 10 | 2 | flags, 0 |
+| 12 | 16 | tree id |
+| 28 | 16 | generation |
+| 44 | 4 | reserved, zero |
 
-1. Read 192 bytes. Check magic, `major`, `header_len = 192`, `header_crc32c`,
-   `flags` bits, `families`, `type_id_len`, `created_at != 0`, and the stream and
-   event window invariants (section 8). Any failure is a rejection.
-2. If `file_len` is known (HTTP `Content-Length`), compare it before fetching the
-   body.
-3. Check `footer_off + 16 + 64 * section_count + 32 == file_len`, then read the
-   footer: magic, flags bit 0, and `section_count` equal to the header's.
-4. Require META first, ascending unique ids, `align = 16`, `pad = 0`,
-   `offset % 16 == 0`, `offset + len <= footer_off`, no two entries overlapping,
-   no section below 192, and the META entry equal to `meta_off`/`meta_len`.
-5. Verify each section's `blake3`, then `body_blake3`, then recompute
-   `content_id` from `projection` and the trie sections.
-6. Check that every header field the projection also carries agrees with META:
-   `content_id`, `type_id`, both counts, `families`, `created_at`, and the
-   `stream` and `events` objects. A disagreement is a rejection: this is what
-   makes a spliced header impossible to use.
-7. Present section bytes with at least 16-byte alignment (a memory map or an
-   aligned copy, never a plain byte vector), check `type_id`, then validate the
-   archive.
-8. Compare `counts` and every `probe` entry by exact lookup.
+A record is framed `len u32 | crc32c u32 | payload`, every integer in little
+endian. `len` counts the crc field and the payload. `crc32c` covers the payload
+only. The payload is:
 
-## 6a. content_id
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 8 | sequence number |
+| 8 | 8 | receive time, unix seconds |
+| 16 | 8 | event time, unix seconds |
+| 24 | 1 | kind: 1 insert, 2 withdraw |
+| 25 | 1 | family: 4 or 6 |
+| 26 | 1 | prefix length |
+| 27 | 1 | flags, 0 |
+| 28 | 16 | address in network order; IPv4 in bytes 0..4, bytes 4..16 zero |
+| 44 | 4 | value length |
+| 48 | value length | value, the profile's archive bytes |
+| 48 + value length | 4 | blob length |
+| 52 + value length | blob length | blob |
 
-`content_id = blake3( "snap-content-v1\0" || canonical_json(projection) ||
-framed(section) for every non-META section in ascending id order )`, where
-`framed(id, bytes)` is `id u16 LE || len u64 LE || bytes` and META is skipped.
-Framing every non-META section is what keeps a section added by a later minor
-version inside the object identity: two objects that differ in such a section
-must have different ids. The header and the footer are not hashed, and neither is
-anything under `provenance`.
+Replay stops at the first frame whose length runs past the file or whose crc
+does not match: that is a torn tail, and the records after it are not trusted.
+A record may be skipped only because a checkpoint already covers its sequence
+number. Any other disagreement between the expected number and the number found
+is an error: a hole in the middle of a journal is data loss, and a reader that
+skipped it would answer from a smaller tree than the writer committed. A torn
+frame at the end of a segment is the one case where the writer may keep going:
+the bytes were never acknowledged, so the next append cuts them away and writes
+the same sequence number again in the same segment, and nothing after the tear is
+read. A
+segment whose crc fails therefore cannot be followed by a later segment that
+replays as if nothing were missing.
 
-Canonical JSON here means: keys sorted by byte order at every level, no
-whitespace, integers only, strings ASCII with no escapes required (section 4),
-UTF-8 otherwise. A conforming writer and reader must produce identical bytes for
-the same `projection`; the test vector in `crates/bgpkit-snap/tests/golden.rs`
-pins one.
+A `state.json` that exists but cannot be read is an error, never an absent
+state: silently treating it as absent would reset `next_seq` and could overwrite
+a live checkpoint. The checkpoint named by the state file must carry the same
+tree id and generation as the journal it belongs to, or recovery refuses it.
 
-## 7. Writer
+`insert_with_blob` requires a payload section: a blob exists to back one, and
+without it the bytes would be written to the segment and dropped by the next
+checkpoint.
 
-Emit sections in id order with 16-byte padding; build META from the data actually written; reject a trie section at or above 2 GiB with an error that says to shard; buffer the sink, because a joint archive produces over a million small writes; never compress a zero-copy section. The prefix is patched last, so the writer needs a seekable sink: a file, or a buffered multipart upload where the prefix rides in the first buffered part.
+`state.json` is the commit record: `next_seq`, `tree_id`, `generation` and,
+once a checkpoint exists, `checkpoint: {seq, file}`. It is written atomically
+after an fsync of the segment or the snapshot, so a checkpoint can only be
+named by a state file that survived.
 
-## 8. Invariants, versioning, alignment, limits
+Recovery order: load the named checkpoint, replay records above its sequence
+number, refuse to hand out a number at or below `next_seq`, and prune a segment
+only when every record in it is covered by a checkpoint.
 
-Header invariants a reader MUST reject a violation of:
-
-1. `families` is non-zero and has no bit outside bits 0 and 1.
-2. A set family bit has a non-zero count; a clear bit has a zero count.
-3. `type_id_len` is 1..32, the bytes below it are printable ASCII, and every
-   byte above it is zero.
-4. With `HAS_EVENTS` clear, both timestamps are zero; with it set, both are
-   non-zero and `first_event_ts <= last_event_ts`.
-5. With `HAS_STREAM` clear, `tree_id`, `generation` and `base_seq` are all zero;
-   with it set, `tree_id` and `generation` are non-zero.
-6. `created_at` is non-zero.
-7. Flags and reserved bytes carry no bit outside their definition.
-
-## 8a. Versioning, alignment, limits
-
-- Major bumps when the prefix, footer, section ids or any archived layout changes meaning; minor for additive META keys, new section ids and new value types. Readers accept their major and any minor of that major; a minor bump never changes the layout of the header or the footer and never reuses reserved space for an incompatible meaning, and refuse a required section they do not know.
-- Container integers are little-endian.
-- The rkyv feature set is part of the format: `little_endian` and `aligned` on; `big_endian`, `unaligned` and all `pointer_width_*` off, explicitly, because Cargo feature unification can flip defaults. The crate pins these features in `Cargo.toml`; a consumer that enables an incompatible rkyv feature produces a compile error, not a silent layout change and fails a checked-in fixture if it drifts.
-- One archive stays under 2 GiB because the archive uses 32-bit relative offsets; entries stay under 4.3 G. Larger datasets shard by top-level prefix into several objects.
-
-## 9. Journal
-
-The journal is how a mutable tree becomes a snapshot without losing updates. It is not an audit log and not the durable record.
+Test vector, two records and a checkpoint:
 
 ```text
-segment header (48 B): magic "BGPKLOG\0" | major u16 | minor u16 | tree_id [16] |
-                      generation [16] | pad [4]
-record: len u32 LE (bytes after this field, so a record is 4 + len)
-        crc32c u32 LE (over the bytes after this field, never over itself)
-        seq u64 LE (dense, monotonic)
-        recv_ts i64 LE
-        event_ts i64 LE (0 when absent)
-        kind u8 (1 insert | 2 withdraw | 3 control)
-        family u8 (4 or 6)
-        prefix_len u8
-        flags u8 (zero in v1)
-        addr [16]  IPv4 in addr[0..4] with addr[4..16] zero; IPv6 in addr[0..16]
-        value_len u32 LE
-        value bytes (insert: the archived value in canonical form)
+header  4247504b4c4f47000400000011111111111111111111111111111111
+        2222222222222222222222222222222200000000
+record  3c000000e8faa880 0100000000000000 0000000000000000 0000000000000000
+        01 04 08 00 0a000000 000000000000000000000000 04000000 07000000
+        00000000
+record  4300000037180cdd 0200000000000000 0000000000000000 0000000000000000
+        01 04 18 00 c0000200 000000000000000000000000 04000000 09000000
+        07000000 7061796c6f6164
+state   {"checkpoint":{"file":"snapshot-3.snap","seq":2},
+        "generation":"22222222222222222222222222222222",
+        "next_seq":3,"tree_id":"11111111111111111111111111111111"}
 ```
 
-- One writer per tree, enforced by a lock file held for the process lifetime.
-- Segment file names are a creation counter (`segment-<n>.log`), not a sequence
-  number. The next sequence comes from `state.json`, written by `sync()` after
-  the segment fsync, so a reopen cannot reissue a number even when the last
-  record is torn. Without `state.json` the writer falls back to the checkpoint
-  and the highest record on disk.
-- A torn tail ends that segment, not the scan: replay reports the bytes, continues
-  with the next segment, and accepts a forward jump in sequence only across that
-  boundary, because the missing record was never fsynced and never acked.
-- A record is applied only if `crc32c` matches and `4 + len` lands on the next record boundary. A torn tail ends that segment: replay reports the byte count and never applies the partial record. The file itself is left untouched, so the tear remains visible to the next reader.
-- **Durability.** `insert` and `withdraw` append to a buffered segment; a record is durable once `sync()` returns. A feed that must ack a peer after durability calls `sync()` before acking its batch, which is the group-commit path; a per-record ack would pay one fsync per record. A checkpoint writes the snapshot, fsyncs the file and the directory, writes `checkpoint.json` (`{snapshot_file, base_seq, tree_id, generation}`) by temporary file plus rename, fsyncs the directory again, and only then deletes segments wholly below `base_seq + 1`.
-- **Recovery.** Replay only records with `seq > base_seq` from segments whose
-  `tree_id` and `generation` both match the snapshot's. `base_seq` is the highest
-  sequence the snapshot reflects, so the first record written after a checkpoint
-  has `seq == base_seq + 1` and is always replayed. A reader MUST refuse a
-  segment whose generation differs from `checkpoint.json`: sequence numbers are
-  only unique within one incarnation.
-- **Retention.** Segments wholly at or below `base_seq` are deleted at the next checkpoint; a query older than the oldest retained segment returns a "history pruned" outcome rather than an answer derived from a later base.
-- **Incarnation.** `Journal::open` resumes the generation already on disk; starting a fresh incarnation (a restore, a fork, or a deliberate rebuild) MUST go through the entry point that mints a new generation before the segment header is written, or the segment and the checkpoint disagree.
-- **Restore and fork.** A journal restored from a backup, or copied to start a divergent tree, MUST mint a new `generation`. Reusing the old one lets two different states claim the same `(tree_id, generation, base_seq)`, which is exactly the confusion the generation exists to prevent.
-- **Checkpoint binding.** `checkpoint.json` names a snapshot; `tree_id`, `generation` and `base_seq` in it MUST equal the snapshot header's, and a reader MUST refuse the pair when they differ. A checkpoint from a later incarnation next to an older snapshot would otherwise replay from the wrong base.
-- Control records carry a subtype and an opaque payload defined by the value type's owner. The format defines no session, gap or timestamp semantics.
+`examples/journal_vector.rs` regenerates these bytes; it passes the generation
+explicitly (`Journal::open_with`), so the vector is the same on every run rather
+than carrying whatever the journal minted.
 
-Checkpoint triggers, whichever comes first: 60 s since the last checkpoint, 250,000 records, a 64 MiB segment roll, or a control record that marks a natural boundary. Skip when nothing changed. Keep the previous snapshot and its segments until the new one is written, fsynced and re-opened cleanly.
+## 4. Conformance
 
-## 10. Merging
+A conforming writer emits the bytes described above. A conforming reader refuses
+anything else, and never returns a value it could not verify.
 
-Two snapshots over the same key space merge losslessly only when the value is a join-semilattice: set union, bitmap union, or count addition. Both archives iterate in key order, so a merge is a streaming k-way fold. A scalar value is not mergeable in this sense: picking one side silently drops the other. Mutable or session state is never mergeable, because a merged tree no longer knows which source contributed an entry.
+Two byte-pinned artifacts make drift detectable:
 
-## 11. Known limitations of 1.0-rc1
+- **Golden object.** A tree with `10.0.0.0/8 → 1`, `10.1.0.0/16 → 2`,
+  `192.0.2.0/24 → 3`, `2001:db8::/32 → 4`, `created_at` 2026-11-14T00:00:00Z and
+  window `[1790000000, 1794355200]`, with the profile type
+  `golden.v:v1`, is 612 bytes, blake3
+  `d0ed63727b2d9212492b09f78bb652b9eba754b004815e0c792f1b238a9b9925`, content id
+  `1a808769533d26aca6d24c918e21094e0842cfc7f14ebf270c71f58d1538224f`, and the
+  same bytes for any insertion order.
+- **Journal vector.** The two-record segment and state file printed in section 3,
+  regenerated by `examples/journal_vector.rs` with an explicit generation.
 
-1. A torn segment tail is reported and left in place rather than truncated. A
-   truncation would have to be accompanied by a rule that tolerates one missing
-   sequence at that boundary, and that rule would also mask a genuinely lost
-   segment, so the bytes stay and the gap check stays strict.
-2. Segment header `major`/`minor` and record `flags` are not validated yet.
-3. Projection leaves are checked after parsing META rather than over the raw
-   bytes; a producer whose JSON writer differs must rely on the canonical
-   re-serialization check.
+The implementation's own test suite is listed under "Development" in the README;
+those file names are not part of this contract.
 
-## 12. Normative references
+## 5. Design notes: what the 1.0.0-rc.1 draft had, and why it is gone
 
-- `rkyv` 0.8, little endian, aligned, with `bytecheck`, for every trie section.
-- `prefix-trie` 0.10, for the archived map layout.
-- BLAKE3 for section and body hashes, CRC-32C for the header and journal records.
+This section is not normative. It records the reasoning so a future reader does
+not reintroduce what was measured to be useless.
 
-The archived layout is not described by this document; it is pinned by the
-golden object in the test suite, so a dependency bump that changes the layout
-fails the build rather than silently producing different bytes.
+- META and the projection: redundant once the header is the claim and rkyv
+  validation is the proof; it existed to cross-check itself.
+- Footer: the file is immutable, so "append at the end" was never used, and a
+  tail range read is worse on object storage than a read at offset 192.
+- Per-section hashes: `content_id` covers every section.
+- `WIDTH`, `type_id_len`, `minor`, `header_len`, `table_off`, per-entry offsets.
+- Public `replay`, caller-supplied stream identity, `verify_checkpoint_binding`.
+
+Kept despite advice to delete: `kind` in the table. Family confusion is a
+measured failure (an IPv4 archive read as IPv6 validates and returns wrong
+networks), and four bytes per section is the cheapest place to stop it.

@@ -9,8 +9,42 @@ data built in any insertion order produces byte-identical files, so an object's
 identity is a hash of its content. A journal turns a live, mutable tree into the
 next snapshot without losing updates.
 
-Status: **1.0-rc1**. The layout is frozen for release candidates; see
-[Known limitations](#known-limitations) before depending on it.
+Status: **1.0.0-rc.2**. The layout is frozen for release candidates; see
+[Scope](#scope-and-what-this-is-not) and [Known limitations](#known-limitations)
+before depending on it.
+
+The normative byte contract is [`docs/format.md`](docs/format.md). The draft that
+shipped with 1.0.0-rc.1 is kept as
+[`docs/format-rc1.md`](docs/format-rc1.md) for reference only.
+
+## Scope and what this is not
+
+What this crate contributes, and what a reader can rely on:
+
+- **An object is identifiable and verifiable from its first 192 bytes plus one
+  hash.** Type, tree, coverage window, section count, file length and content id
+  are in the header; the content id covers the header prefix, the section table
+  and every section. This part is language-neutral: a Go, Python or JS tool can
+  read and check it without this crate.
+- **Recovery never answers with less than the writer committed.** The journal's
+  commit record, strict sequence adjacency, checkpoint identity checks and torn
+  tail rule are documented in [`docs/format.md`](docs/format.md) and covered by
+  tests, including a 400-operation random sequence that must survive a restart.
+- **Negative results, with measurements.** IPv4 mapped into an IPv6 trie costs
+  twice the size and 3.8x the lookup time; per-section hashes were not worth
+  their bytes; a metadata section duplicated what the header and rkyv validation
+  already prove; a family tag is required because an IPv4 archive read as IPv6
+  validates and returns wrong prefixes.
+
+What it does not provide:
+
+- **A portable trie encoding.** A family section is an `rkyv` archive of a
+  `prefix_trie` map, pinned by version. Reading or writing one outside Rust means
+  reimplementing that layout. The container rules are portable; the payload is
+  not.
+- **A query engine, a database, or cross-language bindings.** There is no query
+  language, no transactions across objects, no in-place update path, and no
+  partial reads.
 
 ## What it is for
 
@@ -79,8 +113,7 @@ snap search example.snap 10.1.2.3
 
 ## The format
 
-The normative contract is [`docs/v4-proposal.md`](docs/v4-proposal.md). Short
-version:
+The normative contract is [`docs/format.md`](docs/format.md). Short version:
 
 ```text
 header (192 B)   magic, version, flags, tree_id, generation, base_seq,
@@ -96,33 +129,44 @@ sections         packed in ascending id order, 16-byte aligned
   checked rkyv access is the proof.
 - A section the reader does not know and that the writer marked required is
   refused, by id, unless the caller registers a `Validator` for it.
+- Bytes the document fixes to zero are checked, not assumed: padding, the type id
+  tail, the reserved header block, a section entry's tail, a record's flags, the
+  twelve bytes behind an IPv4 address, and a segment header's version, flags and
+  reserved word.
 
 ## Journal
 
 ```text
-segments   segment-<n>.log, 48-byte header with tree_id + generation,
-           length+crc32c framed records, dense sequence numbers
-checkpoint snapshot + checkpoint.json, verified against each other
-state      state.json: the next sequence, written after the segment fsync
+segments   segment-<12-digit index>.log, 48-byte header with tree_id + generation,
+           length + crc32c framed records, dense sequence numbers
+state      state.json: next sequence, identity, and the checkpoint it belongs to
+checkpoint snapshot-<seq>.snap, verified against the live tree before it is named
 ```
 
-A torn tail ends its segment and is reported, never applied. A restart resumes
-after the highest record on disk, so sequence numbers are never reissued, even
-after a crash between an append and a checkpoint.
+`sync` makes a record durable. `checkpoint` builds an ordinary object, verifies it
+end to end, writes it, and only then records it in `state.json` and prunes the
+segments it fully covers. A restart loads that checkpoint, replays the records
+above it, and refuses to hand out a sequence number that was already committed.
+
+A torn tail is the one tolerated failure: those bytes were never acknowledged, so
+the next append cuts them away and reuses the number. Everything else (a hole, an
+unreadable segment header, an unreadable or malformed `state.json`, a checkpoint
+from another tree or generation) is an error rather than a smaller tree.
 
 ## Known limitations
 
-One deliberate gap remains at 1.0-rc1, plus two items for 1.0 final:
-
-1. A torn segment tail is reported and left in place, not truncated. Truncating
-   it would require tolerating a sequence gap at that boundary, which would also
-   hide a genuinely lost segment; leaving the bytes makes the tear visible and
-   keeps the gap check strict.
-2. Segment header `major`/`minor` and record `flags` are not checked yet.
-3. Values inside a projection are validated for canonical form and for
-   integer-or-ASCII leaves, but the check walks the parsed document rather than
-   the bytes, so a producer with a different JSON writer must rely on the
-   re-serialization check to catch it.
+1. **One consumer.** The crate is used by `wayback-rpki` for its ROA index. It
+   has no other in-tree user yet, and no external user. The API is shaped by that
+   one workload.
+2. **Trie bodies are rkyv.** See above. A change in `rkyv` or `prefix-trie`'s
+   archived layout is a format change; the golden object test exists to make that
+   failure loud rather than silent.
+3. **`content_id` excludes `created_at`.** Two objects with the same data and
+   different creation times share an id. That is deliberate (identity is content),
+   but it means the id does not name a byte sequence.
+4. **No partial or ranged reads.** A reader validates the whole object at open,
+   which is what makes later answers cheap; an object larger than the address
+   space a reader accepts is rejected rather than partially served.
 
 ## Building
 

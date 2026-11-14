@@ -2,7 +2,7 @@
 //!
 //! The container owns framing, identity and integrity. It knows nothing about
 //! what a trie holds beyond the value type's `TYPE_ID`, and nothing about what a
-//! client section means. See `docs/v4-proposal.md`.
+//! client section means. See `docs/format.md`.
 
 use std::fmt;
 
