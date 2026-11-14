@@ -40,6 +40,8 @@ input is one contiguous range `0..148` with no field-order puzzle.
 | 156 | 32 | content_id | dedup and "is this the object I asked for"; cannot hash itself |
 | 188 | 4 | crc32c over bytes `0..188` | covers the header bytes the hash cannot: `content_id` and `created_at` |
 
+Every integer in the header and the table is little-endian.
+
 `HASH_END` = 148. Everything before it is a claim about the data and is hashed;
 the three tail fields are bookkeeping. The header crc is computed over
 `header[0..188]`, that is every byte before the crc field itself.
@@ -104,14 +106,18 @@ Snapshot::<T>::open(path)                   // refuses unknown required sections
 Snapshot::<T>::open_with(path, &dyn Validator)
 Snapshot::<T>::from_bytes(&[u8])            // and from_bytes_with
 Snapshot::search(ip: IpAddr) -> Option<(IpNet, &T::Archived)>
-Snapshot::children(prefix) -> iterator over the subtree
+Snapshot::search_prefix(prefix) -> Option<(IpNet, &T::Archived)>
+Snapshot::children(prefix) -> Vec<(IpNet, &T::Archived)>   // the prefix itself when
+                                                          // stored, plus what is under it
 Snapshot::section_bytes(id) -> Option<&[u8]>
 Snapshot::header() -> &Header
 
 pub trait Validator {
-    // runs once at open, after the table and identity check, before any value
-    // is handed out; may reject the object
-    fn validate(&self, snap: &SnapshotView<'_>) -> Result<(), Error>;
+    // asked once per section at open: a required section nobody knows is refused
+    // with its id
+    fn knows(&self, entry: &Entry) -> bool;
+    // cross-section checks, run once at open before any value is handed out
+    fn validate(&self, view: &SnapshotView<'_>) -> Result<(), Error>;
 }
 ```
 
@@ -164,8 +170,7 @@ journal.len()
 ### Journal bytes
 
 A journal is a directory: `writer.lock`, `state.json`,
-`segment-<12-digit index>.log` and
-`snapshot-<seq>.snap`. Every integer in the header, the table and a record is little-endian. The
+`segment-<12-digit index>.log` and `snapshot-<seq>.snap`. The
 `type_id` is ASCII, NUL-terminated, zero-filled to 32 bytes; a reader refuses a
 field without a terminator or with non-printable bytes. Reserved and padding
 bytes are zero. Segment names are the
@@ -258,11 +263,12 @@ than carrying whatever the journal minted.
    trip whose replay reproduces the payload section byte for byte.
 3. A downstream crate under `tests/downstream/` adds a value type and a section
    with no change to `src/`.
-4. Golden objects: plain and with payload, byte-pinned.
+4. A golden object: 612 bytes, byte-pinned, and the same bytes for any insertion
+   order.
 5. Header-only peek answers type, id, counts of sections, sizes, stream and
    window in one 192-byte read.
-6. `open` refuses an unknown required section and says which id; `open_with`
-   accepts it once a validator is registered.
+6. `open` refuses an unknown required section and names its id; `open_with`
+   accepts it once a validator answers `knows`.
 7. `cargo package` builds standalone, no internal names in docs.
 
 ## 5. Deleted from earlier drafts, with the reason
