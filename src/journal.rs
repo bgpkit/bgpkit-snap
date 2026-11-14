@@ -59,6 +59,8 @@ pub struct Journal<T: Codec> {
     seg: Option<Segment>,
     seg_path: Option<PathBuf>,
     seg_index: u64,
+    /// Offset to cut back to before the next append, set when a write failed.
+    seg_dirty_from: Option<u64>,
     seq: u64,
     base_seq: u64,
     v4: PrefixMap<ipnet::Ipv4Net, T>,
@@ -134,6 +136,7 @@ where
             seg: None,
             seg_path: None,
             seg_index: index,
+            seg_dirty_from: None,
             seq: 1,
             base_seq: 0,
             v4: PrefixMap::new(),
@@ -175,6 +178,22 @@ where
         });
         self.seg_path = Some(path);
         self.write_segment_header()
+    }
+
+    /// Remove the bytes a failed write left behind. Only the writing side calls
+    /// this, and only for bytes it wrote itself in this session: recovery never
+    /// truncates, because there a short segment may mean a lost one.
+    fn discard_torn_write(&mut self) -> Result<(), Error> {
+        let Some(offset) = self.seg_dirty_from.take() else {
+            return Ok(());
+        };
+        if let Some(seg) = self.seg.as_mut() {
+            seg.file.flush()?;
+            seg.file.get_ref().set_len(offset)?;
+            seg.file.get_ref().sync_all()?;
+            seg.bytes = offset;
+        }
+        Ok(())
     }
 
     fn write_segment_header(&mut self) -> Result<(), Error> {
@@ -432,13 +451,22 @@ where
         if self.seg.is_none() {
             self.open_segment()?;
         }
+        self.discard_torn_write()?;
+        let start = self.seg.as_ref().expect("segment just opened").bytes;
         let len = (payload.len() + 4) as u32;
         let crc = crc32c::crc32c(&payload);
         let seg = self.seg.as_mut().expect("segment just opened");
-        seg.file.write_all(&len.to_le_bytes())?;
-        seg.file.write_all(&crc.to_le_bytes())?;
-        seg.file.write_all(&payload)?;
-        seg.bytes += 4 + payload.len() as u64;
+        let mut write = || -> std::io::Result<()> {
+            seg.file.write_all(&len.to_le_bytes())?;
+            seg.file.write_all(&crc.to_le_bytes())?;
+            seg.file.write_all(&payload)
+        };
+        if let Err(e) = write() {
+            // the bytes on disk are a torn frame; the next append cuts them away
+            self.seg_dirty_from = Some(start);
+            return Err(Error::Io(e));
+        }
+        seg.bytes += 8 + payload.len() as u64;
         self.seq += 1;
         Ok(seq)
     }
@@ -654,12 +682,21 @@ fn read_state(dir: &Path) -> Result<Option<State>, Error> {
         &mut generation,
     )?;
     crate::header::hex_to_bytes(v["tree_id"].as_str().unwrap_or_default(), &mut tree_id)?;
-    let checkpoint = v["checkpoint"].as_object().and_then(|c| {
-        Some((
-            c.get("seq")?.as_u64()?,
-            c.get("file")?.as_str()?.to_string(),
-        ))
-    });
+    // a checkpoint that is present but unreadable is corruption: treating it as
+    // absent would let recovery delete the snapshot it can no longer name
+    let checkpoint = match v.get("checkpoint") {
+        None => None,
+        Some(serde_json::Value::Object(c)) => {
+            match (
+                c.get("seq").and_then(|s| s.as_u64()),
+                c.get("file").and_then(|f| f.as_str()),
+            ) {
+                (Some(seq), Some(file)) => Some((seq, file.to_string())),
+                _ => return Err(Error::BadRecord("state.json checkpoint is malformed")),
+            }
+        }
+        Some(_) => return Err(Error::BadRecord("state.json checkpoint is malformed")),
+    };
     Ok(Some(State {
         next_seq,
         generation,
@@ -773,4 +810,53 @@ fn random_generation() -> [u8; 16] {
     let h = blake3::hash(&std::process::id().to_le_bytes());
     out.copy_from_slice(&h.as_bytes()[..16]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct V(u32);
+
+    impl crate::SnapValue for V {
+        const TYPE_ID: &str = "test.v:v1";
+    }
+
+    /// A failed write leaves a torn frame on disk. The next append must cut it
+    /// away, or replay stops at the tear and refuses the good record behind it.
+    #[test]
+    fn a_torn_write_is_cut_before_the_next_append() {
+        let dir = std::env::temp_dir().join(format!("snap-torn-write-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let mut j: Journal<V> =
+            Journal::open(&dir, [1u8; 16], Some(PayloadSection::payload(16))).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), &V(1)).unwrap();
+        j.sync().unwrap();
+
+        // what a half-finished write looks like: the length and crc of a frame
+        // whose payload never arrived
+        let seg_path = j.seg_path.clone().unwrap();
+        let written = j.seg.as_ref().unwrap().bytes;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&seg_path)
+                .unwrap();
+            f.write_all(&64u32.to_le_bytes()).unwrap();
+            f.write_all(&0u32.to_le_bytes()).unwrap();
+            f.write_all(&[0u8; 20]).unwrap();
+        }
+        j.seg_dirty_from = Some(written);
+
+        j.insert("192.0.2.0/24".parse().unwrap(), &V(2)).unwrap();
+        j.sync().unwrap();
+        drop(j);
+
+        let j: Journal<V> = Journal::open(&dir, [1u8; 16], Some(PayloadSection::payload(16)))
+            .expect("the torn bytes must not survive into a reopen");
+        assert_eq!(j.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

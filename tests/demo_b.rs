@@ -700,15 +700,36 @@ fn a_malformed_checkpoint_field_is_an_error() {
         })
         .unwrap();
     }
-    // a checkpoint object missing its file: not "no checkpoint", but broken
-    std::fs::write(
-        log.join("state.json"),
-        br#"{"next_seq":2,"generation":"1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f","tree_id":"1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f","checkpoint":{"seq":1}}"#,
-    )
-    .unwrap();
+
+    // keep the journal's real identity and drop only checkpoint.file, so the
+    // reopen reaches the state parsing rather than failing on the identity
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(log.join("state.json")).unwrap()).unwrap();
+    let broken = serde_json::json!({
+        "next_seq": state["next_seq"],
+        "generation": state["generation"],
+        "tree_id": state["tree_id"],
+        "checkpoint": { "seq": state["checkpoint"]["seq"] }
+    });
+    std::fs::write(log.join("state.json"), serde_json::to_vec(&broken).unwrap()).unwrap();
+
+    let before = snapshots(&log);
+    assert_eq!(before.len(), 1, "one snapshot before the reopen");
+    let opened = Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID)));
     assert!(
-        Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).is_err(),
-        "a malformed checkpoint must not be read as an absent one"
+        opened.is_err(),
+        "a checkpoint missing its file must not read as no checkpoint"
     );
+    assert_eq!(snapshots(&log), before, "the snapshot must not be deleted");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+fn snapshots(log: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(log)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n.starts_with("snapshot-"))
+        .collect();
+    out.sort();
+    out
 }

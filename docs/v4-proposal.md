@@ -150,7 +150,10 @@ journal.len()
 
 A journal is a directory: `writer.lock`, `state.json`,
 `segment-<12-digit index>.log` and
-`snapshot-<seq>.snap`. All integers are little-endian. Segment names are the
+`snapshot-<seq>.snap`. Every integer in the header, the table and a record is little-endian. The
+`type_id` is ASCII, NUL-terminated, zero-filled to 32 bytes; a reader refuses a
+field without a terminator or with non-printable bytes. Reserved and padding
+bytes are zero. Segment names are the
 decimal index zero-padded to twelve digits, so lexicographic order is numeric
 order; a reader that sorted `segment-1.log` and `segment-10.log` as strings would
 replay them out of order and refuse the journal.
