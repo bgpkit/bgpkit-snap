@@ -46,19 +46,19 @@ fn main() {
             window,
         } => match build(&input, &out, &created_at, window.as_deref()) {
             Ok(n) => println!("wrote {out}: {n} entries"),
-            Err(e) => fail(&format!("{e:#}")),
+            Err(e) => fail(&format!("{e}")),
         },
         Cmd::Info { file } => match info(&file) {
             Ok(()) => {}
-            Err(e) => fail(&format!("{e:#}")),
+            Err(e) => fail(&format!("{e}")),
         },
         Cmd::Verify { file } => match verify(&file) {
             Ok(n) => println!("ok: {n} entries"),
-            Err(e) => fail(&format!("{e:#}")),
+            Err(e) => fail(&format!("{e}")),
         },
         Cmd::Search { file, query } => match search(&file, &query) {
             Ok(()) => {}
-            Err(e) => fail(&format!("{e:#}")),
+            Err(e) => fail(&format!("{e}")),
         },
     }
 }
@@ -68,7 +68,12 @@ fn fail(msg: &str) -> ! {
     exit(1)
 }
 
-fn build(input: &str, out: &str, created_at: &str, window: Option<&str>) -> anyhow::Result<usize> {
+fn build(
+    input: &str,
+    out: &str,
+    created_at: &str,
+    window: Option<&str>,
+) -> Result<usize, Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(input)?;
     let mut w: Writer<u32> = Writer::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -80,7 +85,7 @@ fn build(input: &str, out: &str, created_at: &str, window: Option<&str>) -> anyh
         Some(spec) => {
             let (from, to) = spec
                 .split_once(',')
-                .ok_or_else(|| anyhow::anyhow!("--window wants FROM,TO unix seconds"))?;
+                .ok_or_else(|| std::io::Error::other("--window wants FROM,TO unix seconds"))?;
             Some((from.trim().parse()?, to.trim().parse()?))
         }
         None => None,
@@ -96,7 +101,7 @@ fn build(input: &str, out: &str, created_at: &str, window: Option<&str>) -> anyh
     Ok(n)
 }
 
-fn info(file: &str) -> anyhow::Result<()> {
+fn info(file: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut raw = [0u8; HEADER_LEN];
     {
         use std::io::Read;
@@ -119,12 +124,12 @@ fn info(file: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn verify(file: &str) -> anyhow::Result<usize> {
+fn verify(file: &str) -> Result<usize, Box<dyn std::error::Error>> {
     let snap: Snapshot<u32> = Snapshot::open(file)?;
     Ok(snap.len())
 }
 
-fn search(file: &str, query: &str) -> anyhow::Result<()> {
+fn search(file: &str, query: &str) -> Result<(), Box<dyn std::error::Error>> {
     let snap: Snapshot<u32> = Snapshot::open(file)?;
     let hit = match query.parse::<IpNet>() {
         Ok(net) => snap.search_prefix(net),

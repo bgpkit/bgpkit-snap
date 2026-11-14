@@ -610,34 +610,34 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
-    /// The subtree under `prefix`, in trie order, excluding the prefix itself.
+    /// The prefix itself when it is stored, plus everything under it, in trie
+    /// order. A query for a block that is not stored returns only what is under
+    /// it, never a sibling.
     pub fn children(&self, prefix: IpNet) -> Vec<(IpNet, &T::Archived)> {
-        let mut out = Vec::new();
+        let mut out: Vec<(IpNet, &T::Archived)> = Vec::new();
         match prefix {
             IpNet::V4(p) => {
-                if let Some(map) = self.v4() {
-                    let Some((anchor, _)) = map.get_lpm(&p) else {
-                        return out;
-                    };
-                    if let Some(view) = map.view_at(&anchor) {
-                        for (k, v) in view.iter() {
-                            if k != anchor {
-                                out.push((IpNet::V4(k), v));
-                            }
+                let Some(map) = self.v4() else { return out };
+                if let Some(v) = map.get(&p) {
+                    out.push((IpNet::V4(p), v));
+                }
+                if let Some(view) = map.view_at(&p) {
+                    for (k, v) in view.iter() {
+                        if k != p {
+                            out.push((IpNet::V4(k), v));
                         }
                     }
                 }
             }
             IpNet::V6(p) => {
-                if let Some(map) = self.v6() {
-                    let Some((anchor, _)) = map.get_lpm(&p) else {
-                        return out;
-                    };
-                    if let Some(view) = map.view_at(&anchor) {
-                        for (k, v) in view.iter() {
-                            if k != anchor {
-                                out.push((IpNet::V6(k), v));
-                            }
+                let Some(map) = self.v6() else { return out };
+                if let Some(v) = map.get(&p) {
+                    out.push((IpNet::V6(p), v));
+                }
+                if let Some(view) = map.view_at(&p) {
+                    for (k, v) in view.iter() {
+                        if k != p {
+                            out.push((IpNet::V6(k), v));
                         }
                     }
                 }

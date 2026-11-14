@@ -220,3 +220,97 @@ fn arena_of(parts: &[&Vec<u8>]) -> Vec<u8> {
     }
     out
 }
+
+#[test]
+fn demo_b_journal_updates_the_live_tree_and_refuses_a_second_writer() {
+    let dir = std::env::temp_dir().join(format!("snap-demo-b-live-{}", std::process::id()));
+    let log = dir.join("journal");
+    let tree_id = [9u8; 16];
+
+    let mut j: Journal<PathRef> =
+        Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).expect("open");
+    j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 0 })
+        .expect("insert");
+    // the live tree must reflect the record immediately, before any checkpoint
+    assert_eq!(j.len(), 1, "insert has to update the tree");
+
+    // one writer per tree
+    assert!(
+        Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).is_err(),
+        "a second writer must be refused"
+    );
+
+    j.sync().expect("sync");
+    let snap_path = j
+        .checkpoint(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            window: None,
+            stream: None,
+            extras: &[],
+        })
+        .expect("checkpoint");
+    let snap: Snapshot<PathRef> = Snapshot::open(snap_path.to_str().unwrap()).expect("open");
+    assert!(
+        snap.search("10.1.2.3".parse().unwrap()).is_some(),
+        "the checkpoint must contain what was inserted"
+    );
+
+    // reopening recovers the same state
+    drop(j);
+    let reopened: Journal<PathRef> =
+        Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).expect("reopen");
+    assert_eq!(reopened.len(), 1, "recovery must restore the tree");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn children_are_limited_to_the_requested_prefix() {
+    let dir = std::env::temp_dir().join(format!("snap-children-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.snap");
+    let arena = b"x".to_vec();
+    let mut w: bgpkit_snap::Writer<PathRef> = bgpkit_snap::Writer::new();
+    for p in ["10.0.0.0/8", "10.2.0.0/16", "10.3.0.0/16", "10.4.0.0/16"] {
+        w.insert(p.parse().unwrap(), PathRef { off: 0, len: 1 });
+    }
+    let bytes = w
+        .finish(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            window: None,
+            stream: None,
+            extras: &[ExtraSection {
+                id: SECTION_ID,
+                kind: KIND_PAYLOAD,
+                required: true,
+                bytes: &arena,
+            }],
+        })
+        .unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let snap: Snapshot<PathRef> = Snapshot::open_with(path.to_str().unwrap(), &Attrs).unwrap();
+
+    let got: Vec<String> = snap
+        .children("10.2.0.0/16".parse().unwrap())
+        .iter()
+        .map(|(p, _)| p.to_string())
+        .collect();
+    assert_eq!(
+        got,
+        vec!["10.2.0.0/16"],
+        "only the prefix and what is under it"
+    );
+
+    let siblings: Vec<String> = snap
+        .children("10.0.0.0/8".parse().unwrap())
+        .iter()
+        .map(|(p, _)| p.to_string())
+        .collect();
+    assert_eq!(
+        siblings.len(),
+        4,
+        "the prefix itself plus 10.2/16 10.3/16 10.4/16"
+    );
+    assert!(siblings.contains(&"10.0.0.0/8".to_string()));
+    std::fs::remove_dir_all(&dir).ok();
+}

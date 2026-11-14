@@ -49,6 +49,8 @@ struct Segment {
 }
 
 pub struct Journal<T: Codec> {
+    /// Advisory lock, held until the journal is dropped: one writer per tree.
+    _lock: File,
     dir: PathBuf,
     tree_id: [u8; 16],
     generation: [u8; 16],
@@ -105,6 +107,7 @@ where
             .append(true)
             .open(&seg_path)?;
         let mut journal = Journal {
+            _lock: lock,
             dir: dir.clone(),
             tree_id,
             generation,
@@ -223,28 +226,13 @@ where
         Ok(())
     }
 
-    /// Append a blob to the arena and return its offset. The bytes are recorded
-    /// once; a client that wants dedup keeps its own map from content to offset.
-    pub fn append_blob(&mut self, bytes: &[u8]) -> Result<u32, Error> {
-        let off = u32::try_from(self.blob.len())
-            .map_err(|_| Error::BadRecord("payload arena exceeds 4 GiB"))?;
-        self.blob.extend_from_slice(bytes);
-        self.append(
-            KIND_INSERT,
-            IpNet::V4(
-                ipnet::Ipv4Net::new(std::net::Ipv4Addr::UNSPECIFIED, 32).expect("host route"),
-            ),
-            &[],
-            bytes,
-        )?;
-        Ok(off)
-    }
-
     pub fn insert(&mut self, prefix: IpNet, value: &T) -> Result<u64, Error> {
         let mut value = value.clone();
         value.canonicalize();
         let bytes = T::encode(&value)?;
-        self.append(KIND_INSERT, prefix, &bytes, &[])
+        let seq = self.append(KIND_INSERT, prefix, &bytes, &[])?;
+        self.apply_value(prefix, value);
+        Ok(seq)
     }
 
     pub fn insert_with_blob(
@@ -257,7 +245,20 @@ where
         value.canonicalize();
         let bytes = T::encode(&value)?;
         self.blob.extend_from_slice(blob);
-        self.append(KIND_INSERT, prefix, &bytes, blob)
+        let seq = self.append(KIND_INSERT, prefix, &bytes, blob)?;
+        self.apply_value(prefix, value);
+        Ok(seq)
+    }
+
+    fn apply_value(&mut self, prefix: IpNet, value: T) {
+        match prefix {
+            IpNet::V4(p) => {
+                self.v4.insert(p, value);
+            }
+            IpNet::V6(p) => {
+                self.v6.insert(p, value);
+            }
+        }
     }
 
     pub fn withdraw(&mut self, prefix: IpNet) -> Result<u64, Error> {

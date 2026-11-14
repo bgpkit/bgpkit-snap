@@ -66,7 +66,7 @@ cover.
 
 ```text
 content_id = blake3( "bgpkit-snap-v4\0"
-                   || header[0..152]          (created_at excluded by placement)
+                   || header[0..148]          (created_at excluded by placement)
                    || table bytes
                    || every section's bytes, ascending id )
 ```
@@ -118,28 +118,29 @@ API; the journal owns them.
 
 ## 3. Journal
 
-One owner: `Journal<T>` holds the live tree, the segment writer and the
-directory.
+One owner: `Journal<T>` holds the live tree, the blob arena, the segment writer,
+the writer lock and the directory, and it recovers on open.
 
 ```rust
-Journal::<T>::open(dir, tree_id) -> Result<Journal<T>>   // recovers internally
-journal.insert(prefix, value)
+Journal::<T>::open(dir, tree_id, Option<PayloadSection>) -> Result<Journal<T>>
+journal.insert(prefix, &value)                  // updates the tree and the log
+journal.insert_with_blob(prefix, &value, &blob) // also appends blob to the arena
 journal.withdraw(prefix)
-journal.sync()                                            // durable on return
-journal.checkpoint(&opts) -> Result<PathBuf>
-journal.snapshot() -> &Snapshot<T>                        // current view
+journal.sync()                                  // durable on return
+journal.checkpoint(&opts) -> Result<PathBuf>     // verified before pruning
+journal.len()
 ```
 
-A record is `len | crc32c | seq | recv_ts | event_ts | kind | prefix fields |
-value_len | value bytes | blob_len | blob bytes`.
+A record is `len | crc32c | seq | recv_ts | event_ts | kind | family | plen |
+flags | addr[16] | value_len | value | blob_len | blob`.
 
-The trailing blob is what makes handle values work: a `PathRef` points into a
-payload section, and the newly interned payload bytes travel in the same record,
-so replay rebuilds the section in record order and every offset reproduces
-exactly. `blob_len = 0` means "reuse an offset that already exists".
+The trailing blob is what makes handle values work: a value may point into a
+payload section, and the bytes it points at travel in the same record, so replay
+rebuilds the section in record order and every offset reproduces exactly.
 
-Checkpoint writes a normal v4 object, verifies it end to end, and only then
-prunes covered segments.
+`checkpoint` builds an ordinary object, verifies it end to end with the payload
+section the journal knows about, writes and fsyncs it, and only then is a
+segment eligible for deletion.
 
 ## 4. Acceptance
 
