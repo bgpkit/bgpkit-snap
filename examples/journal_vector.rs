@@ -19,7 +19,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::temp_dir().join("snap-journal-vector");
     std::fs::remove_dir_all(&dir).ok();
     let log = dir.join("journal");
-    let mut j: Journal<V> = Journal::open(&log, [0x11; 16], Some(PayloadSection::payload(16)))?;
+    // a fixed generation, so the bytes below are the same on every run
+    let mut j: Journal<V> = Journal::open_with(
+        &log,
+        [0x11; 16],
+        Some(PayloadSection::payload(16)),
+        Some([0x22; 16]),
+    )?;
     j.insert("10.0.0.0/8".parse()?, &V(7))?;
     j.insert_with_blob("192.0.2.0/24".parse()?, &V(9), b"payload")?;
     j.sync()?;

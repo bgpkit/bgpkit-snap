@@ -79,6 +79,18 @@ where
         tree_id: [u8; 16],
         payload: Option<PayloadSection>,
     ) -> Result<Self, Error> {
+        Self::open_with(dir, tree_id, payload, None)
+    }
+
+    /// `generation` names the stream incarnation. A caller passes `Some` only to
+    /// reproduce a fixture or to restore a known journal; otherwise it is minted
+    /// on first use and reused from then on.
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        tree_id: [u8; 16],
+        payload: Option<PayloadSection>,
+        generation: Option<[u8; 16]>,
+    ) -> Result<Self, Error> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
@@ -95,6 +107,7 @@ where
             .as_ref()
             .map(|s| s.generation)
             .or(existing_generation(&dir)?)
+            .or(generation)
             .unwrap_or_else(random_generation);
         // a new segment, never the existing ones: reopening must not truncate
         let index = segment_paths(&dir)?
@@ -177,6 +190,14 @@ where
             }
             let snap: Snapshot<T> =
                 Snapshot::from_bytes_with(&raw, &KnownPayload(self.payload.map(|p| p.id)))?;
+            match snap.header().stream() {
+                Some(s) if s.tree_id == self.tree_id && s.generation == self.generation => {}
+                _ => {
+                    return Err(Error::BadRecord(
+                        "checkpoint belongs to another tree or generation",
+                    ))
+                }
+            }
             for (p, v) in snap.v4().map(|m| m.iter()).into_iter().flatten() {
                 if let Ok(value) = rkyv::deserialize::<T, RkyvError>(v) {
                     self.v4.insert(p, value);
@@ -226,8 +247,9 @@ where
                     continue;
                 }
                 if let Some(want) = expected {
-                    if record.seq != want && record.seq != want + 1 {
-                        // one unacked record may be missing after a tear
+                    if record.seq != want {
+                        // a hole is data loss: a torn tail ends the scan instead
+                        // of leaving a gap in the middle
                         return Err(Error::SequenceGap {
                             expected: want,
                             found: record.seq,
@@ -305,6 +327,11 @@ where
         value: &T,
         blob: &[u8],
     ) -> Result<u64, Error> {
+        if self.payload.is_none() {
+            return Err(Error::BadRecord(
+                "insert_with_blob needs a payload section to carry the blob",
+            ));
+        }
         let mut value = value.clone();
         value.canonicalize();
         let bytes = T::encode(&value)?;
@@ -562,8 +589,10 @@ struct State {
 
 fn read_state(dir: &Path) -> Result<Option<State>, Error> {
     let path = dir.join("state.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Ok(None);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(Error::BadRecord("state.json cannot be read")),
     };
     let v: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| Error::BadRecord("state.json is not json"))?;

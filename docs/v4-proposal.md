@@ -171,7 +171,7 @@ and the payload. `crc32c` covers the payload only. The payload is:
 | 25 | 1 | family: 4 or 6 |
 | 26 | 1 | prefix length |
 | 27 | 1 | flags, 0 |
-| 28 | 16 | address, IPv4 in the first four bytes |
+| 28 | 16 | address; IPv4 in bytes 0..4, bytes 4..16 zero |
 | 44 | 4 | value length |
 | 48 | value length | value, the profile's archive bytes |
 | 48 + value length | 4 | blob length |
@@ -180,8 +180,20 @@ and the payload. `crc32c` covers the payload only. The payload is:
 Replay stops at the first frame whose length runs past the file or whose crc
 does not match: that is a torn tail, and the records after it are not trusted.
 A record may be skipped only because a checkpoint already covers its sequence
-number. Missing numbers below the committed `next_seq` are an error, not a
-silent gap.
+number. Any other disagreement between the expected number and the number found
+is an error: a hole in the middle of a journal is data loss, and a reader that
+skipped it would answer from a smaller tree than the writer committed. A
+segment whose crc fails therefore cannot be followed by a later segment that
+replays as if nothing were missing.
+
+A `state.json` that exists but cannot be read is an error, never an absent
+state: silently treating it as absent would reset `next_seq` and could overwrite
+a live checkpoint. The checkpoint named by the state file must carry the same
+tree id and generation as the journal it belongs to, or recovery refuses it.
+
+`insert_with_blob` requires a payload section: a blob exists to back one, and
+without it the bytes would be written to the segment and dropped by the next
+checkpoint.
 
 `state.json` is the commit record: `next_seq`, `tree_id`, `generation` and,
 once a checkpoint exists, `checkpoint: {seq, file}`. It is written atomically
@@ -196,7 +208,7 @@ Test vector, two records and a checkpoint:
 
 ```text
 header  4247504b4c4f47000400000011111111111111111111111111111111
-        a45dcf8dbf5e5788127306e4ed964efb00000000
+        2222222222222222222222222222222200000000
 record  3c000000e8faa880 0100000000000000 0000000000000000 0000000000000000
         01 04 08 00 0a000000 000000000000000000000000 04000000 07000000
         00000000
@@ -204,11 +216,13 @@ record  4300000037180cdd 0200000000000000 0000000000000000 0000000000000000
         01 04 18 00 c0000200 000000000000000000000000 04000000 09000000
         07000000 7061796c6f6164
 state   {"checkpoint":{"file":"snapshot-3.snap","seq":2},
-        "generation":"a45dcf8dbf5e5788127306e4ed964efb",
+        "generation":"22222222222222222222222222222222",
         "next_seq":3,"tree_id":"11111111111111111111111111111111"}
 ```
 
-`examples/journal_vector.rs` regenerates these bytes.
+`examples/journal_vector.rs` regenerates these bytes; it passes the generation
+explicitly (`Journal::open_with`), so the vector is the same on every run rather
+than carrying whatever the journal minted.
 
 ## 4. Acceptance
 

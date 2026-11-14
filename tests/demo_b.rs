@@ -466,3 +466,88 @@ fn a_torn_tail_costs_only_the_uncommitted_record() {
     segment.pop();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_hole_in_the_middle_is_an_error_not_a_shorter_tree() {
+    let dir = std::env::temp_dir().join(format!("snap-hole-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [5u8; 16];
+
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        for p in ["10.0.0.0/8", "192.0.2.0/24", "198.51.100.0/24"] {
+            j.insert(p.parse().unwrap(), &PathRef { off: 0, len: 0 })
+                .unwrap();
+        }
+        j.sync().unwrap();
+    }
+
+    // remove the middle record: the frame after it must not be replayed as if
+    // the sequence numbers were contiguous
+    let segment = std::fs::read_dir(&log)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.to_string_lossy().contains("segment-"))
+        .unwrap();
+    let raw = std::fs::read(&segment).unwrap();
+    let first_len = u32::from_le_bytes(raw[48..52].try_into().unwrap()) as usize;
+    let second_len = u32::from_le_bytes(raw[52 + first_len..56 + first_len].try_into().unwrap());
+    let drop = 4 + second_len as usize;
+    let mut hole = raw[..52 + first_len].to_vec();
+    hole.extend_from_slice(&raw[52 + first_len + drop..]);
+    std::fs::write(&segment, &hole).unwrap();
+
+    let opened = Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID)));
+    match opened {
+        Err(e) => assert!(format!("{e}").contains("sequence"), "got {e}"),
+        Ok(j) => panic!("a missing record must not read as {} entries", j.len()),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_blob_without_a_payload_section_is_refused() {
+    let dir = std::env::temp_dir().join(format!("snap-noblob-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let mut j: Journal<PathRef> = Journal::open(&log, [6u8; 16], None).unwrap();
+    let err = j
+        .insert_with_blob(
+            "10.0.0.0/8".parse().unwrap(),
+            &PathRef { off: 0, len: 0 },
+            b"x",
+        )
+        .unwrap_err();
+    assert!(format!("{err}").contains("payload"), "got {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_corrupt_state_file_is_not_treated_as_absent() {
+    let dir = std::env::temp_dir().join(format!("snap-state-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [8u8; 16];
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 0 })
+            .unwrap();
+        j.sync().unwrap();
+        j.checkpoint(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            window: None,
+            stream: None,
+            extras: &[],
+        })
+        .unwrap();
+    }
+    std::fs::write(log.join("state.json"), b"{not json").unwrap();
+    assert!(
+        Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).is_err(),
+        "a corrupt state file must stop recovery, not reset it"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
