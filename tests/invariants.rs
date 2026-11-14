@@ -1,6 +1,8 @@
 //! Contract checks that do not depend on any profile.
 
-use bgpkit_snap::{Entry, ExtraSection, Header, Opts, SnapValue, Snapshot, Validator, Writer};
+use bgpkit_snap::{
+    header, Entry, ExtraSection, Header, Opts, SnapValue, Snapshot, Validator, Writer,
+};
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct N(u32);
@@ -165,4 +167,94 @@ fn the_family_tag_stops_a_cross_family_read() {
 
     let err = Snapshot::<N>::from_bytes(&fixed).unwrap_err();
     assert!(format!("{err}").contains("kind"), "{err}");
+}
+
+#[test]
+fn verify_bytes_checks_the_container_without_the_value_type() {
+    let mut w: Writer<u32> = crate::Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), 1);
+    w.insert("2001:db8::/32".parse().unwrap(), 2);
+    let bytes = w.finish(&Opts::default()).unwrap();
+
+    let header = bgpkit_snap::verify_bytes(&bytes).expect("a good object verifies");
+    assert_eq!(header.section_count, 2);
+
+    let mut flipped = bytes.clone();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 0xff;
+    assert!(
+        bgpkit_snap::verify_bytes(&flipped).is_err(),
+        "a flip must fail"
+    );
+
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(
+        bgpkit_snap::verify_bytes(&trailing).is_err(),
+        "trailing bytes must fail"
+    );
+}
+
+#[test]
+fn a_writer_cannot_emit_what_the_reader_rejects() {
+    let mut w: Writer<u32> = Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), 1);
+
+    // epoch, reversed window and a half-zero stream are all refused at write
+    let cases: [Opts; 3] = [
+        Opts {
+            created_at: "1970-01-01T00:00:00Z",
+            ..Opts::default()
+        },
+        Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            window: Some((2_000, 1_000)),
+            ..Opts::default()
+        },
+        Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            stream: Some(bgpkit_snap::StreamRef {
+                tree_id: [0u8; 16],
+                generation: [7u8; 16],
+                base_seq: 0,
+            }),
+            ..Opts::default()
+        },
+    ];
+    for opts in &cases {
+        let mut writer: Writer<u32> = Writer::new();
+        writer.insert("10.0.0.0/8".parse().unwrap(), 1);
+        assert!(
+            writer.finish(opts).is_err(),
+            "finish accepted a header the reader rejects"
+        );
+    }
+}
+
+#[test]
+fn a_family_kind_at_the_wrong_id_is_refused_not_ignored() {
+    let mut w: Writer<u32> = Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), 7);
+    let bytes = w.finish(&Opts::default()).unwrap();
+
+    // the IPv4 section is at id 2; move it to 1 and fix the identity, which is
+    // what a writer that never read the table of ids would produce
+    let mut forged = bytes.clone();
+    forged[header::HEADER_LEN..header::HEADER_LEN + 2].copy_from_slice(&1u16.to_le_bytes());
+    let mut h = blake3::Hasher::new();
+    h.update(b"bgpkit-snap-v4\0");
+    h.update(&forged[..header::HASH_END]);
+    let table_end = header::HEADER_LEN + 64;
+    h.update(&forged[header::HEADER_LEN..table_end]);
+    h.update(&forged[table_end..]);
+    forged[156..188].copy_from_slice(h.finalize().as_bytes());
+    let crc = crc32c::crc32c(&forged[..188]);
+    forged[188..192].copy_from_slice(&crc.to_le_bytes());
+
+    let opened = Snapshot::<u32>::from_bytes(&forged);
+    assert!(
+        opened.is_err(),
+        "an IPv4 section at id 1 must be refused, not silently ignored"
+    );
+    assert!(bgpkit_snap::verify_bytes(&forged).is_err());
 }

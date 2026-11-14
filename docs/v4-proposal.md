@@ -116,6 +116,18 @@ pub trait Validator {
 it. `replay`, sequence numbers, generations and the writer lock are not public
 API; the journal owns them.
 
+### Section ids
+
+| id | kind | meaning |
+| --- | --- | --- |
+| 2 | `V4` | the IPv4 trie archive |
+| 3 | `V6` | the IPv6 trie archive |
+| 16 and up | caller | this profile's own sections |
+
+A section whose kind is `V4` is at id 2 and a section whose kind is `V6` is at
+id 3. A reader rejects any other pairing rather than ignoring the section,
+because ignoring it turns a disagreement into an empty answer.
+
 ## 3. Journal
 
 One owner: `Journal<T>` holds the live tree, the blob arena, the segment writer,

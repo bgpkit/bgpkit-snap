@@ -315,6 +315,9 @@ impl<T: SnapValue> Writer<T> {
 
         let mut out = Vec::with_capacity(file_len as usize);
         prefix = head.encode();
+        // a writer must not produce an object its own reader rejects: the
+        // semantic rules live in Header::parse, so run them on the bytes here
+        Header::parse(&prefix)?;
         out.extend_from_slice(&prefix);
         out.extend_from_slice(&table);
         out.extend_from_slice(&body);
@@ -345,6 +348,73 @@ impl SnapshotView<'_> {
     pub fn table(&self) -> &[u8] {
         self.table
     }
+}
+
+/// Container-level verification that needs no value type: header, layout,
+/// section table, trailing bytes and the content id. What it cannot check is
+/// that a section body is a valid archive of its declared type; a reader with
+/// the type does that on open.
+pub fn verify_bytes(raw: &[u8]) -> Result<Header, Error> {
+    let header = Header::parse(raw)?;
+    header.check_layout(raw.len())?;
+
+    let table_start = HEADER_LEN;
+    let table_end = table_start + header.section_table_len as usize;
+    let table = &raw[table_start..table_end];
+
+    let mut cursor = table_end;
+    let mut prev_id = 0u16;
+    for i in 0..header.section_count as usize {
+        let entry = Entry::parse(&table[i * ENTRY_LEN..(i + 1) * ENTRY_LEN])?;
+        if entry.id <= prev_id && i > 0 {
+            return Err(Error::SectionOrder);
+        }
+        match entry.id {
+            ID_V4 if entry.kind != KIND_V4 => return Err(Error::BadSectionKind(entry.id)),
+            ID_V6 if entry.kind != KIND_V6 => return Err(Error::BadSectionKind(entry.id)),
+            _ => {}
+        }
+        match entry.kind {
+            KIND_V4 if entry.id != ID_V4 => return Err(Error::BadSectionKind(entry.id)),
+            KIND_V6 if entry.id != ID_V6 => return Err(Error::BadSectionKind(entry.id)),
+            _ => {}
+        }
+        while !cursor.is_multiple_of(16) {
+            cursor += 1;
+        }
+        let Some(end) = cursor.checked_add(entry.len as usize) else {
+            return Err(Error::BadSectionTable("section length overflows"));
+        };
+        if end > raw.len() {
+            return Err(Error::Truncated {
+                need: end,
+                have: raw.len(),
+            });
+        }
+        cursor = end;
+        prev_id = entry.id;
+    }
+    if cursor != raw.len() {
+        return Err(Error::BadSectionTable("sections do not end the file"));
+    }
+
+    let mut h = blake3::Hasher::new();
+    h.update(b"bgpkit-snap-v4\0");
+    h.update(&raw[..header::HASH_END]);
+    h.update(table);
+    let mut cursor = table_end;
+    for i in 0..header.section_count as usize {
+        let entry = Entry::parse(&table[i * ENTRY_LEN..(i + 1) * ENTRY_LEN])?;
+        while !cursor.is_multiple_of(16) {
+            cursor += 1;
+        }
+        h.update(&raw[cursor..cursor + entry.len as usize]);
+        cursor += entry.len as usize;
+    }
+    if h.finalize().as_bytes() != &header.content_id {
+        return Err(Error::ContentId);
+    }
+    Ok(header)
 }
 
 /// Profile-side validation, run once at open before any value is handed out.
@@ -458,6 +528,13 @@ impl<T: SnapValue> Snapshot<T> {
             match entry.id {
                 ID_V4 if entry.kind != KIND_V4 => return Err(Error::BadSectionKind(entry.id)),
                 ID_V6 if entry.kind != KIND_V6 => return Err(Error::BadSectionKind(entry.id)),
+                _ => {}
+            }
+            // and the reverse: a family kind lives at its normative id, so an
+            // object cannot dodge a reader by putting it somewhere else
+            match entry.kind {
+                KIND_V4 if entry.id != ID_V4 => return Err(Error::BadSectionKind(entry.id)),
+                KIND_V6 if entry.id != ID_V6 => return Err(Error::BadSectionKind(entry.id)),
                 _ => {}
             }
         }

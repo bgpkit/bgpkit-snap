@@ -5,7 +5,7 @@
 
 use std::process::exit;
 
-use bgpkit_snap::{header::HEADER_LEN, Header, Snapshot, Writer};
+use bgpkit_snap::{header::HEADER_LEN, Header, SnapValue, Snapshot, Writer};
 use clap::{Parser, Subcommand};
 use ipnet::IpNet;
 
@@ -45,7 +45,7 @@ fn main() {
             created_at,
             window,
         } => match build(&input, &out, &created_at, window.as_deref()) {
-            Ok(n) => println!("wrote {out}: {n} entries"),
+            Ok((entries, bytes)) => println!("wrote {out}: {entries} entries, {bytes} bytes"),
             Err(e) => fail(&format!("{e}")),
         },
         Cmd::Info { file } => match info(&file) {
@@ -53,7 +53,7 @@ fn main() {
             Err(e) => fail(&format!("{e}")),
         },
         Cmd::Verify { file } => match verify(&file) {
-            Ok(n) => println!("ok: {n} entries"),
+            Ok(msg) => println!("ok: {msg}"),
             Err(e) => fail(&format!("{e}")),
         },
         Cmd::Search { file, query } => match search(&file, &query) {
@@ -73,7 +73,7 @@ fn build(
     out: &str,
     created_at: &str,
     window: Option<&str>,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(input)?;
     let mut w: Writer<u32> = Writer::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -90,15 +90,16 @@ fn build(
         }
         None => None,
     };
+    let entries = w.len();
     let bytes = w.finish(&bgpkit_snap::Opts {
         created_at,
         stream: None,
         window: parsed_window,
         extras: &[],
     })?;
-    let n = bytes.len();
+    let len = bytes.len();
     std::fs::write(out, bytes)?;
-    Ok(n)
+    Ok((entries, len))
 }
 
 fn info(file: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -124,9 +125,19 @@ fn info(file: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn verify(file: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    let snap: Snapshot<u32> = Snapshot::open(file)?;
-    Ok(snap.len())
+fn verify(file: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let raw = std::fs::read(file)?;
+    // container level: header, layout, table, content id. Needs no value type.
+    let header = bgpkit_snap::verify_bytes(&raw)?;
+    if header.type_id_str() == <u32 as SnapValue>::TYPE_ID {
+        let snap: Snapshot<u32> = Snapshot::from_bytes(&raw)?;
+        return Ok(format!("{} entries, bodies checked", snap.len()));
+    }
+    Ok(format!(
+        "container ok, {} sections, bodies not checked (type {} is not this binary's)",
+        header.section_count,
+        header.type_id_str()
+    ))
 }
 
 fn search(file: &str, query: &str) -> Result<(), Box<dyn std::error::Error>> {
