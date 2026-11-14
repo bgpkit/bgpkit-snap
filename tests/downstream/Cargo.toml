@@ -1,0 +1,10 @@
+[package]
+name = "snap-downstream"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bgpkit-snap = { path = "../.." }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "aligned"] }
+ipnet = "2"
