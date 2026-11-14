@@ -21,6 +21,7 @@ use rkyv::rancor::Error as RkyvError;
 
 const MAGIC: &[u8; 8] = b"BGPKLOG\0";
 const SEGMENT_HEADER_LEN: usize = 48;
+const SEGMENT_VERSION: u16 = 4;
 const RECORD_FIXED_LEN: usize = 56;
 
 pub const KIND_INSERT: u8 = 1;
@@ -202,7 +203,7 @@ where
         };
         let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
         header.extend_from_slice(MAGIC);
-        header.extend_from_slice(&4u16.to_le_bytes());
+        header.extend_from_slice(&SEGMENT_VERSION.to_le_bytes());
         header.extend_from_slice(&0u16.to_le_bytes());
         header.extend_from_slice(&self.tree_id);
         header.extend_from_slice(&self.generation);
@@ -287,6 +288,15 @@ where
             if raw.len() < SEGMENT_HEADER_LEN || &raw[..8] != MAGIC {
                 return Err(Error::BadRecord(
                     "segment header is unreadable: the journal is damaged",
+                ));
+            }
+            // the header's fixed fields: version, flags and the reserved word
+            if u16::from_le_bytes([raw[8], raw[9]]) != SEGMENT_VERSION
+                || u16::from_le_bytes([raw[10], raw[11]]) != 0
+                || raw[44..48].iter().any(|b| *b != 0)
+            {
+                return Err(Error::BadRecord(
+                    "segment header has fields this reader does not accept",
                 ));
             }
             if raw[12..28] != self.tree_id || raw[28..44] != self.generation {
@@ -835,6 +845,60 @@ mod tests {
 
     impl crate::SnapValue for V {
         const TYPE_ID: &str = "test.v:v1";
+    }
+
+    /// The bytes the spec fixes inside a record: the flags byte must be zero and
+    /// an IPv4 address must not carry anything behind its four octets.
+    #[test]
+    fn a_record_with_reserved_bytes_set_is_refused() {
+        let payload_base = SEGMENT_HEADER_LEN + 8; // after the frame's len and crc
+        let flags_at = payload_base + 27;
+        let addr_tail_at = payload_base + 32;
+        for (name, offset, value) in [("flags", flags_at, 1u8), ("addr tail", addr_tail_at, 1)] {
+            let dir =
+                std::env::temp_dir().join(format!("snap-rec-{offset}-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            let tree_id = [71u8; 16];
+            {
+                let mut j: Journal<V> =
+                    Journal::open(&dir, tree_id, Some(PayloadSection::payload(16))).unwrap();
+                j.insert("10.0.0.0/8".parse().unwrap(), &V(1)).unwrap();
+                j.sync().unwrap();
+            }
+            let segment = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| p.to_string_lossy().contains("segment-"))
+                .unwrap();
+            let mut raw = std::fs::read(&segment).unwrap();
+            raw[offset] = value;
+            // keep the frame crc valid, so only the field rule can reject it
+            let len = u32::from_le_bytes(
+                raw[SEGMENT_HEADER_LEN..SEGMENT_HEADER_LEN + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let payload_end = SEGMENT_HEADER_LEN + 4 + len;
+            let crc = crc32c::crc32c(&raw[payload_base..payload_end]);
+            raw[SEGMENT_HEADER_LEN + 4..payload_base].copy_from_slice(&crc.to_le_bytes());
+            std::fs::write(&segment, &raw).unwrap();
+
+            let reopened = Journal::<V>::open(&dir, tree_id, Some(PayloadSection::payload(16)));
+            match reopened {
+                Ok(j) => panic!(
+                    "a record with {name} set must be refused, got len {}",
+                    j.len()
+                ),
+                Err(e) => {
+                    let text = format!("{e}");
+                    assert!(
+                        text.contains("flags") || text.contains("address"),
+                        "{name}: unexpected error {text}"
+                    );
+                }
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// A failed write leaves a torn frame on disk. The next append must cut it

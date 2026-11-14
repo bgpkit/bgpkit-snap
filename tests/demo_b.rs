@@ -831,3 +831,34 @@ fn a_long_random_op_sequence_survives_recovery_unchanged() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_segment_header_with_unknown_fields_is_refused() {
+    for (offset, value) in [(8usize, 5u8), (10, 1), (44, 1)] {
+        let dir = std::env::temp_dir().join(format!("snap-hdr-{offset}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let log = dir.join("journal");
+        let tree_id = [61u8; 16];
+        {
+            let mut j: Journal<PathRef> =
+                Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+            j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 0 })
+                .unwrap();
+            j.sync().unwrap();
+        }
+        let segment = std::fs::read_dir(&log)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.to_string_lossy().contains("segment-"))
+            .unwrap();
+        let mut raw = std::fs::read(&segment).unwrap();
+        raw[offset] = value;
+        std::fs::write(&segment, &raw).unwrap();
+        assert!(
+            Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID)))
+                .is_err(),
+            "byte {offset} = {value} must be refused"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
