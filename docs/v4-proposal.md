@@ -34,9 +34,9 @@ input is one contiguous range `0..148` with no field-order puzzle.
 | 84 | 8 | file_len | distinguishes "ends here" from "trailing bytes appended" |
 | 92 | 4 | section_count | bounds the table |
 | 96 | 4 | section_table_len | `64 * section_count`, so a reader can range-read exactly the table and detect a mismatch |
-| 100 | 16 | window `[i64; 2]` | "is this value still valid" cannot be recovered from the data |
+| 100 | 16 | window `[i64; 2]`, unix seconds UTC | "is this value still valid" cannot be recovered from the data |
 | 116 | 32 | reserved | zero; keeps the hashed prefix 148 bytes long |
-| 148 | 8 | created_at | operational ordering; deliberately outside the hash |
+| 148 | 8 | created_at, unix seconds UTC | operational ordering; deliberately outside the hash |
 | 156 | 32 | content_id | dedup and "is this the object I asked for"; cannot hash itself |
 | 188 | 4 | crc32c over bytes `0..188` | covers the header bytes the hash cannot: `content_id` and `created_at` |
 
@@ -119,6 +119,21 @@ pub trait Validator {
 it. `replay`, sequence numbers, generations and the writer lock are not public
 API; the journal owns them.
 
+### What a family section holds
+
+The container contract above is independent of what a section's bytes mean; the
+`type_id` names the value type and, with it, the encoding of the family sections.
+For the value types this crate defines, a family section is an
+`rkyv 0.8` archive, with `little_endian`, `std`, `bytecheck` and `aligned`, of
+`prefix_trie` 0.10's `PrefixMap<Ipv4Net, T>` or `PrefixMap<Ipv6Net, T>`, where `T`
+is the profile's own archive type. The layout of that archive is rkyv's, not
+this document's.
+
+An implementation that cannot decode that layout must refuse the object and say
+so; it must not guess, and it must not treat the section as empty. Reading the
+header, the table, the identity and the journal framing needs none of this, so a
+tool that only inspects objects is unaffected.
+
 ### Section ids
 
 | id | kind | meaning |
@@ -181,7 +196,7 @@ and the payload. `crc32c` covers the payload only. The payload is:
 | 25 | 1 | family: 4 or 6 |
 | 26 | 1 | prefix length |
 | 27 | 1 | flags, 0 |
-| 28 | 16 | address; IPv4 in bytes 0..4, bytes 4..16 zero |
+| 28 | 16 | address in network order; IPv4 in bytes 0..4, bytes 4..16 zero |
 | 44 | 4 | value length |
 | 48 | value length | value, the profile's archive bytes |
 | 48 + value length | 4 | blob length |
