@@ -102,6 +102,15 @@ fn build(
     Ok((entries, len))
 }
 
+/// An epoch second as UTC, which is what a person comparing two objects wants;
+/// the file keeps the raw integer.
+fn stamp(ts: i64) -> String {
+    match chrono::DateTime::from_timestamp(ts, 0) {
+        Some(t) => t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        None => ts.to_string(),
+    }
+}
+
 fn info(file: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut raw = [0u8; HEADER_LEN];
     {
@@ -113,9 +122,9 @@ fn info(file: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("content_id {}", h.content_id_hex());
     println!("file_len   {}", h.file_len);
     println!("sections   {}", h.section_count);
-    println!("created_at {}", h.created_at);
+    println!("created_at {}", stamp(h.created_at));
     match h.window() {
-        Some((a, b)) => println!("window     {a}..{b}"),
+        Some((a, b)) => println!("window     {}..{}", stamp(a), stamp(b)),
         None => println!("window     none"),
     }
     match h.stream() {
