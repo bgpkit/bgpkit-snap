@@ -280,8 +280,14 @@ where
         for path in paths {
             let mut raw = Vec::new();
             File::open(&path)?.read_to_end(&mut raw)?;
-            if raw.len() < SEGMENT_HEADER_LEN || &raw[..8] != MAGIC {
+            if raw.is_empty() {
+                // a segment created but never written holds nothing
                 continue;
+            }
+            if raw.len() < SEGMENT_HEADER_LEN || &raw[..8] != MAGIC {
+                return Err(Error::BadRecord(
+                    "segment header is unreadable: the journal is damaged",
+                ));
             }
             if raw[12..28] != self.tree_id || raw[28..44] != self.generation {
                 return Err(Error::BadRecord("segment belongs to another journal"));
@@ -601,8 +607,16 @@ fn parse_record(payload: &[u8]) -> Result<Record, Error> {
     let kind = payload[24];
     let family = payload[25];
     let plen = payload[26];
+    if payload[27] != 0 {
+        return Err(Error::BadRecord("record flags are not zero"));
+    }
     let mut addr = [0u8; 16];
     addr.copy_from_slice(&payload[28..44]);
+    if family == 4 && addr[4..].iter().any(|b| *b != 0) {
+        return Err(Error::BadRecord(
+            "an IPv4 record carries bytes behind its address",
+        ));
+    }
     let value_len = u32::from_le_bytes(payload[44..48].try_into().expect("4")) as usize;
     if payload.len() < 48 + value_len + 4 {
         return Err(Error::BadRecord("record value is short"));

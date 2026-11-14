@@ -133,12 +133,23 @@ impl Header {
         if !type_id.contains(&0) {
             return Err(Error::BadHeader("type id is not terminated"));
         }
-        if type_id
+        let end = type_id
             .iter()
-            .take_while(|b| **b != 0)
+            .position(|b| *b == 0)
+            .unwrap_or(type_id.len());
+        if type_id[..end]
+            .iter()
             .any(|b| !b.is_ascii_graphic() || *b == b'"' || *b == b'\\')
         {
             return Err(Error::BadHeader("type id is not plain ASCII"));
+        }
+        if type_id[end..].iter().any(|b| *b != 0) {
+            return Err(Error::BadHeader(
+                "type id is not zero filled after its terminator",
+            ));
+        }
+        if raw[116..148].iter().any(|b| *b != 0) {
+            return Err(Error::BadHeader("reserved header bytes are not zero"));
         }
         let mut content_id = [0u8; 32];
         content_id.copy_from_slice(&raw[156..188]);

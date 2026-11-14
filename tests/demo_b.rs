@@ -733,3 +733,36 @@ fn snapshots(log: &std::path::Path) -> Vec<String> {
     out.sort();
     out
 }
+
+#[test]
+fn a_damaged_segment_header_is_not_an_empty_journal() {
+    let dir = std::env::temp_dir().join(format!("snap-magic-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [41u8; 16];
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        for p in ["10.0.0.0/8", "192.0.2.0/24", "198.51.100.0/24"] {
+            j.insert(p.parse().unwrap(), &PathRef { off: 0, len: 0 })
+                .unwrap();
+        }
+        j.sync().unwrap();
+    }
+    // both faults at once: the state file is gone and the segment header is junk
+    std::fs::remove_file(log.join("state.json")).unwrap();
+    let segment = std::fs::read_dir(&log)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.to_string_lossy().contains("segment-"))
+        .unwrap();
+    let mut raw = std::fs::read(&segment).unwrap();
+    raw[..8].copy_from_slice(b"NOTALOG!");
+    std::fs::write(&segment, &raw).unwrap();
+
+    assert!(
+        Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).is_err(),
+        "an unreadable segment must not read as an empty tree"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

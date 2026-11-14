@@ -332,3 +332,45 @@ fn nonzero_padding_is_refused() {
         "nonzero padding must be refused even with a matching id"
     );
 }
+
+#[test]
+fn bytes_the_document_fixes_to_zero_are_checked() {
+    let mut w: Writer<u32> = Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), 1);
+    let bytes = w.finish(&Opts::default()).unwrap();
+
+    // type_id padding after the terminator
+    let mut tail = bytes.clone();
+    let end = tail[52..84].iter().position(|b| *b == 0).unwrap() + 52;
+    tail[end + 1] = b'x';
+    rehash(&mut tail);
+    assert!(
+        bgpkit_snap::verify_bytes(&tail).is_err(),
+        "type id padding must be zero"
+    );
+
+    // reserved header block
+    let mut reserved = bytes.clone();
+    reserved[120] = 1;
+    rehash(&mut reserved);
+    assert!(bgpkit_snap::verify_bytes(&reserved).is_err());
+
+    // section entry tail
+    let mut entry = bytes.clone();
+    entry[header::HEADER_LEN + 20] = 1;
+    rehash(&mut entry);
+    assert!(bgpkit_snap::verify_bytes(&entry).is_err());
+}
+
+fn rehash(bytes: &mut [u8]) {
+    let count = u32::from_le_bytes(bytes[92..96].try_into().unwrap()) as usize;
+    let table_end = header::HEADER_LEN + count * header::ENTRY_LEN;
+    let mut h = blake3::Hasher::new();
+    h.update(b"bgpkit-snap-v4\0");
+    h.update(&bytes[..header::HASH_END]);
+    h.update(&bytes[header::HEADER_LEN..table_end]);
+    h.update(&bytes[table_end..]);
+    bytes[156..188].copy_from_slice(h.finalize().as_bytes());
+    let crc = crc32c::crc32c(&bytes[..188]);
+    bytes[188..192].copy_from_slice(&crc.to_le_bytes());
+}
