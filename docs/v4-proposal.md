@@ -55,7 +55,10 @@ the three tail fields are bookkeeping.
 
 Offsets are computed: sections are packed in ascending id order, each starting at
 the first 16-byte boundary at or after the previous end. Nothing to disagree
-about, one less field to lie.
+about, one less field to lie. The bytes skipped to reach that boundary are zero:
+a reader never interprets padding, but the content id covers it, so a writer that
+filled it with anything else would produce a different identity for the same
+content.
 
 No per-section hashes. `content_id` covers every section, so a corrupt object is
 caught at open; locating which section is damaged is not a requirement anyone has

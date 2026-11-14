@@ -141,6 +141,13 @@ where
             blob: Vec::new(),
             payload,
         };
+        if state.is_none() && !snapshot_paths(&journal.dir)?.is_empty() {
+            // the checkpoints exist but nothing says which one is current, and
+            // the segments they replaced may already be gone
+            return Err(Error::BadRecord(
+                "checkpoints exist but state.json is missing",
+            ));
+        }
         let keep = journal.recover(state)?;
         // a snapshot written just before a crash is not named by the state file,
         // so it is an orphan: recovery already came from the segments
@@ -211,13 +218,32 @@ where
                 }
             }
             for (p, v) in snap.v4().map(|m| m.iter()).into_iter().flatten() {
-                if let Ok(value) = rkyv::deserialize::<T, RkyvError>(v) {
-                    self.v4.insert(p, value);
-                }
+                let value = rkyv::deserialize::<T, RkyvError>(v)
+                    .map_err(|_| Error::BadRecord("checkpoint value does not decode"))?;
+                self.v4.insert(p, value);
             }
             for (p, v) in snap.v6().map(|m| m.iter()).into_iter().flatten() {
-                if let Ok(value) = rkyv::deserialize::<T, RkyvError>(v) {
-                    self.v6.insert(p, value);
+                let value = rkyv::deserialize::<T, RkyvError>(v)
+                    .map_err(|_| Error::BadRecord("checkpoint value does not decode"))?;
+                self.v6.insert(p, value);
+            }
+            match snap.header().stream() {
+                Some(s) if s.base_seq == base => {}
+                _ => return Err(Error::BadRecord("checkpoint base_seq disagrees with state")),
+            }
+            // a section this journal was not opened for would be dropped, and a
+            // payload section is the blob arena, so its absence is data loss
+            for entry in snap.entries() {
+                if entry.id == crate::header::ID_V4 || entry.id == crate::header::ID_V6 {
+                    continue;
+                }
+                match self.payload {
+                    Some(payload) if payload.id == entry.id => {}
+                    _ => {
+                        return Err(Error::BadRecord(
+                            "checkpoint has a section this journal was not configured for",
+                        ))
+                    }
                 }
             }
             if let Some(payload) = self.payload {

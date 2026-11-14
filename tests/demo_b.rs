@@ -592,3 +592,64 @@ fn a_snapshot_no_state_file_names_is_cleaned_up() {
     assert_eq!(after[0], "snapshot-2.snap", "the named checkpoint survives");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_checkpoint_is_not_adopted_without_its_configuration() {
+    let dir = std::env::temp_dir().join(format!("snap-cfg-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [12u8; 16];
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        j.insert_with_blob(
+            "10.0.0.0/8".parse().unwrap(),
+            &PathRef { off: 0, len: 4 },
+            b"abcd",
+        )
+        .unwrap();
+        j.sync().unwrap();
+        j.checkpoint(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            window: None,
+            stream: None,
+            extras: &[],
+        })
+        .unwrap();
+    }
+    // reopening without the payload section would silently drop the arena
+    let opened = Journal::<PathRef>::open(&log, tree_id, None);
+    assert!(
+        opened.is_err(),
+        "a checkpoint with a payload section must not be adopted without it"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn checkpoints_without_a_state_file_are_refused() {
+    let dir = std::env::temp_dir().join(format!("snap-nostate-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [13u8; 16];
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 0 })
+            .unwrap();
+        j.sync().unwrap();
+        j.checkpoint(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            window: None,
+            stream: None,
+            extras: &[],
+        })
+        .unwrap();
+    }
+    std::fs::remove_file(log.join("state.json")).unwrap();
+    assert!(
+        Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).is_err(),
+        "a checkpoint nobody names is not a state to recover from"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
