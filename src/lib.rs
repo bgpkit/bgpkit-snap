@@ -242,6 +242,11 @@ impl<T: SnapValue> Writer<T> {
             if extra.id < header::FIRST_PROFILE_ID {
                 return Err(Error::BadHeader("extra section id is below 16"));
             }
+            // the family kinds live at ids 2 and 3 and nowhere else, so an extra
+            // claiming one would build an object the reader refuses
+            if extra.kind == KIND_V4 || extra.kind == KIND_V6 {
+                return Err(Error::BadHeader("extra section uses a family kind"));
+            }
             if sections.iter().any(|(e, _)| e.id == extra.id) {
                 return Err(Error::BadHeader("duplicate section id"));
             }

@@ -258,3 +258,23 @@ fn a_family_kind_at_the_wrong_id_is_refused_not_ignored() {
     );
     assert!(bgpkit_snap::verify_bytes(&forged).is_err());
 }
+
+#[test]
+fn an_extra_section_cannot_claim_a_family_kind() {
+    let mut w: Writer<u32> = Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), 1);
+    let arena = [0u8; 8];
+    let err = w
+        .finish(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            extras: &[ExtraSection {
+                id: 16,
+                kind: header::KIND_V4,
+                required: false,
+                bytes: &arena,
+            }],
+            ..Opts::default()
+        })
+        .unwrap_err();
+    assert!(format!("{err}").contains("family"), "got {err}");
+}

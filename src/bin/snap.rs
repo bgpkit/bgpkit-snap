@@ -76,10 +76,10 @@ fn build(
 ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(input)?;
     let mut w: Writer<u32> = Writer::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let v: serde_json::Value = serde_json::from_str(line)?;
-        let prefix: IpNet = v["prefix"].as_str().unwrap_or_default().parse()?;
-        w.insert(prefix, v["value"].as_u64().unwrap_or(0) as u32);
+    for (i, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+        let (prefix, value) = parse_line(line)
+            .map_err(|e| std::io::Error::other(format!("{}, line {}", e, i + 1)))?;
+        w.insert(prefix, value);
     }
     let parsed_window = match window {
         Some(spec) => {
@@ -169,5 +169,35 @@ trait FromArchived {
 impl FromArchived for u32 {
     fn from_archived(v: &<u32 as rkyv::Archive>::Archived) -> u32 {
         v.to_native()
+    }
+}
+
+/// One input line. A value that is missing, not an unsigned integer, or wider
+/// than the value type is an error: writing 0 instead would invent data.
+fn parse_line(line: &str) -> Result<(IpNet, u32), String> {
+    let v: serde_json::Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    let prefix: IpNet = v["prefix"]
+        .as_str()
+        .ok_or("missing \"prefix\"")?
+        .parse()
+        .map_err(|e: ipnet::AddrParseError| e.to_string())?;
+    let raw = v["value"]
+        .as_u64()
+        .ok_or("\"value\" must be an unsigned integer")?;
+    let value = u32::try_from(raw).map_err(|_| format!("\"value\" {raw} does not fit in u32"))?;
+    Ok((prefix, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_line;
+
+    #[test]
+    fn a_value_is_never_silently_truncated_or_invented() {
+        assert!(parse_line(r#"{"prefix":"10.0.0.0/8","value":1}"#).is_ok());
+        assert!(parse_line(r#"{"prefix":"10.0.0.0/8","value":4294967296}"#).is_err());
+        assert!(parse_line(r#"{"prefix":"10.0.0.0/8"}"#).is_err());
+        assert!(parse_line(r#"{"prefix":"10.0.0.0/8","value":"1"}"#).is_err());
+        assert!(parse_line(r#"{"prefix":"nonsense","value":1}"#).is_err());
     }
 }
