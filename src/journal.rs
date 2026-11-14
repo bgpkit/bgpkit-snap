@@ -141,7 +141,19 @@ where
             blob: Vec::new(),
             payload,
         };
-        journal.recover(state)?;
+        let keep = journal.recover(state)?;
+        // a snapshot written just before a crash is not named by the state file,
+        // so it is an orphan: recovery already came from the segments
+        for path in snapshot_paths(&journal.dir)? {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if Some(&name) != keep.as_ref() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
         Ok(journal)
     }
 
@@ -177,7 +189,7 @@ where
     /// Recover the tree: the committed checkpoint first, then the records after
     /// it. A checkpoint that has been written and fsynced is the state, so a
     /// lost or truncated segment after it costs only the records on top.
-    fn recover(&mut self, state: Option<State>) -> Result<(), Error> {
+    fn recover(&mut self, state: Option<State>) -> Result<Option<String>, Error> {
         if let Some((base, file)) = state.as_ref().and_then(|s| s.checkpoint.clone()) {
             let path = self.dir.join(&file);
             let raw = std::fs::read(&path)
@@ -274,7 +286,7 @@ where
             self.seq = self.seq.max(committed);
         }
         self.stream.base_seq = self.base_seq;
-        Ok(())
+        Ok(state.and_then(|s| s.checkpoint).map(|(_, file)| file))
     }
 
     fn apply(&mut self, record: &Record) -> Result<(), Error> {
@@ -669,6 +681,21 @@ fn segment_max_seq(path: &Path) -> Result<Option<u64>, Error> {
         off += 4 + len;
     }
     Ok(max)
+}
+
+fn snapshot_paths(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("snapshot-") && n.ends_with(".snap"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(out)
 }
 
 fn segment_paths(dir: &Path) -> Result<Vec<PathBuf>, Error> {

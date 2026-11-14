@@ -551,3 +551,44 @@ fn a_corrupt_state_file_is_not_treated_as_absent() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_snapshot_no_state_file_names_is_cleaned_up() {
+    let dir = std::env::temp_dir().join(format!("snap-orphan-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [9u8; 16];
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 0 })
+            .unwrap();
+        j.sync().unwrap();
+        j.checkpoint(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            window: None,
+            stream: None,
+            extras: &[],
+        })
+        .unwrap();
+    }
+    // a snapshot that no state file names, as a crash just before the rename
+    std::fs::write(log.join("snapshot-99.snap"), b"orphan").unwrap();
+    let kept = std::fs::read_dir(&log)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n.starts_with("snapshot-"))
+        .count();
+    assert_eq!(kept, 2, "one named plus one orphan before the reopen");
+
+    let _j: Journal<PathRef> =
+        Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+    let after: Vec<String> = std::fs::read_dir(&log)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n.starts_with("snapshot-"))
+        .collect();
+    assert_eq!(after.len(), 1, "the orphan is gone: {after:?}");
+    assert_eq!(after[0], "snapshot-2.snap", "the named checkpoint survives");
+    std::fs::remove_dir_all(&dir).ok();
+}
