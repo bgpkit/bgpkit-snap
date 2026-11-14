@@ -28,56 +28,74 @@ one, which is what makes the file safe to share and cheap to verify.
 ## Quick start
 
 ```rust
-use bgpkit_snap::{Snapshot, Writer};
+use bgpkit_snap::{Opts, SnapValue, Snapshot, Writer};
 
-// build
-let mut w = Writer::<u32>::new();
-w.insert("10.0.0.0/8".parse()?, 1);
-w.insert("2001:db8::/32".parse()?, 2);
-let bytes = w.finish("2026-11-13T00:00:00Z", "my-source")?;
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct RoaSet(Vec<u32>);
+
+impl SnapValue for RoaSet {
+    const TYPE_ID: &str = "example.roa-set:v1";
+    fn canonicalize(&mut self) { self.0.sort_unstable(); }
+}
+
+// build, then write the bytes yourself
+let mut w: Writer<RoaSet> = Writer::new();
+w.insert("10.0.0.0/8".parse()?, RoaSet(vec![64512]));
+let bytes = w.finish(&Opts {
+    created_at: "2026-11-14T00:00:00Z",
+    window: None,
+    stream: None,
+    extras: &[],
+})?;
 std::fs::write("example.snap", &bytes)?;
 
-// read
-let snap: Snapshot<u32> = Snapshot::open("example.snap")?;
-assert_eq!(snap.search("10.1.2.3/32".parse()?).map(|(p, _)| p.to_string()), Some("10.0.0.0/8".into()));
-println!("{} prefixes, id {}", snap.len(), snap.content_id());
+// read: one open verifies the whole object
+let snap: Snapshot<RoaSet> = Snapshot::open("example.snap")?;
+let (prefix, value) = snap.search("10.1.2.3".parse()?).ok_or("not covered")?;
+println!("{prefix} -> {} origins, id {}", value.0.len(), snap.content_id());
 ```
+
+`examples/quickstart.rs` is this code, compiled by `cargo build --examples`, so
+the README cannot drift from the API.
 
 A reader identifies an object from its first 192 bytes, without touching the
 body:
 
 ```rust
-let header = bgpkit_snap::Header::parse(&std::fs::read("example.snap")?[..192])?;
-println!("{} prefixes, type {}, stream {:?}", header.count_v4, header.type_id, header.base_seq);
+let raw = std::fs::read("example.snap")?;
+let header = bgpkit_snap::Header::parse(&raw[..192])?;
+println!("{} sections, type {}", header.section_count, header.type_id_str());
 ```
 
-The CLI does the same from a shell (install it with `cargo install bgpkit-snap --features cli`):
+The CLI does the same from a shell (install it with
+`cargo install bgpkit-snap --features cli`):
 
 ```sh
-snap build --input prefixes.jsonl --out example.snap --created-at 2026-11-13T00:00:00Z --source my-source
+snap build prefixes.jsonl --out example.snap --created-at 2026-11-14T00:00:00Z
 snap info example.snap      # reads 192 bytes only
 snap verify example.snap    # full integrity check
-snap search example.snap 10.1.2.3/32
+snap search example.snap 10.1.2.3
 ```
 
 ## The format
 
-The normative contract is [`docs/format.md`](docs/format.md). Short version:
+The normative contract is [`docs/v4-proposal.md`](docs/v4-proposal.md). Short
+version:
 
 ```text
-header (192 B)   magic, version, tree_id, generation, content_id, type_id,
-                 base_seq, sizes, counts, families, event window, crc32c
-sections         META (canonical JSON), TRIE_V4, TRIE_V6, 16-byte aligned
-footer           section table with per-section blake3, then body hash
+header (192 B)   magic, version, flags, tree_id, generation, base_seq,
+                 type_id, file_len, section_count, table_len, window,
+                 created_at, content_id, crc32c
+table  (64 B per section)  id, kind, required, len; offsets are computed
+sections         packed in ascending id order, 16-byte aligned
 ```
 
-- `content_id` hashes the data projection and every non-META section. Provenance
-  is deliberately outside it: the same prefixes from two paths get one id, so
-  object storage deduplicates them.
-- The header is a projection of META and a reader rejects any disagreement, so a
-  spliced header cannot describe another object.
-- A stream object carries `tree_id`, `generation`, and `base_seq`; that triple,
-  not the content id, identifies a live state.
+- `content_id` hashes `header[0..148]`, the table and every section. `created_at`,
+  `content_id` and the crc sit after that range, so the hash input is contiguous.
+- There is no metadata section and no footer: the header is the claim, and
+  checked rkyv access is the proof.
+- A section the reader does not know and that the writer marked required is
+  refused, by id, unless the caller registers a `Validator` for it.
 
 ## Journal
 
