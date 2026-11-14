@@ -38,10 +38,11 @@ input is one contiguous range `0..148` with no field-order puzzle.
 | 116 | 32 | reserved | zero; keeps the hashed prefix 148 bytes long |
 | 148 | 8 | created_at | operational ordering; deliberately outside the hash |
 | 156 | 32 | content_id | dedup and "is this the object I asked for"; cannot hash itself |
-| 188 | 4 | crc32c | covers the header bytes the hash cannot: `content_id` and `created_at` |
+| 188 | 4 | crc32c over bytes `0..188` | covers the header bytes the hash cannot: `content_id` and `created_at` |
 
 `HASH_END` = 148. Everything before it is a claim about the data and is hashed;
-the three tail fields are bookkeeping.
+the three tail fields are bookkeeping. The header crc is computed over
+`header[0..188]`, that is every byte before the crc field itself.
 
 ### Section table entry, 64 B
 
@@ -147,8 +148,12 @@ journal.len()
 
 ### Journal bytes
 
-A journal is a directory: `writer.lock`, `state.json`, `segment-<n>.log` and
-`snapshot-<seq>.snap`. All integers are little-endian.
+A journal is a directory: `writer.lock`, `state.json`,
+`segment-<12-digit index>.log` and
+`snapshot-<seq>.snap`. All integers are little-endian. Segment names are the
+decimal index zero-padded to twelve digits, so lexicographic order is numeric
+order; a reader that sorted `segment-1.log` and `segment-10.log` as strings would
+replay them out of order and refuse the journal.
 
 A segment starts with a 48-byte header:
 

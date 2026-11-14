@@ -679,3 +679,36 @@ fn a_journal_holding_blobs_cannot_reopen_without_its_payload_section() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_malformed_checkpoint_field_is_an_error() {
+    let dir = std::env::temp_dir().join(format!("snap-badcp-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [31u8; 16];
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 0 })
+            .unwrap();
+        j.sync().unwrap();
+        j.checkpoint(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            window: None,
+            stream: None,
+            extras: &[],
+        })
+        .unwrap();
+    }
+    // a checkpoint object missing its file: not "no checkpoint", but broken
+    std::fs::write(
+        log.join("state.json"),
+        br#"{"next_seq":2,"generation":"1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f","tree_id":"1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f","checkpoint":{"seq":1}}"#,
+    )
+    .unwrap();
+    assert!(
+        Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).is_err(),
+        "a malformed checkpoint must not be read as an absent one"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

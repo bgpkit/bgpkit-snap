@@ -378,8 +378,10 @@ where
         let mut value = value.clone();
         value.canonicalize();
         let bytes = T::encode(&value)?;
-        self.blob.extend_from_slice(blob);
         let seq = self.append(KIND_INSERT, prefix, &bytes, blob)?;
+        // only now: a failed append must not leave the arena ahead of the log,
+        // or the offsets recorded earlier would point past what replay rebuilds
+        self.blob.extend_from_slice(blob);
         self.apply_value(prefix, value);
         Ok(seq)
     }
