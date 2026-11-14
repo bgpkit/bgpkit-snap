@@ -766,3 +766,68 @@ fn a_damaged_segment_header_is_not_an_empty_journal() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_long_random_op_sequence_survives_recovery_unchanged() {
+    let dir = std::env::temp_dir().join(format!("snap-random-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [51u8; 16];
+
+    // a deterministic generator keeps the test reproducible without a dependency
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    let mut expected: std::collections::BTreeMap<String, u32> = Default::default();
+    let opts = Opts {
+        created_at: "2026-11-14T00:00:00Z",
+        window: None,
+        stream: None,
+        extras: &[],
+    };
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        for _ in 0..400 {
+            let r = next();
+            let prefix = format!("10.{}.{}.0/24", (r >> 8) % 4, (r >> 16) % 4);
+            if r % 3 == 0 {
+                j.withdraw(prefix.parse().unwrap()).unwrap();
+                expected.remove(&prefix);
+            } else {
+                let off = (r % 32) as u32;
+                j.insert(prefix.parse().unwrap(), &PathRef { off, len: 4 })
+                    .unwrap();
+                expected.insert(prefix, off);
+            }
+            if r % 17 == 0 {
+                j.sync().unwrap();
+            }
+        }
+        j.sync().unwrap();
+        j.checkpoint(&opts).unwrap();
+    }
+
+    // recover from disk, checkpoint again, and compare every value
+    let mut j: Journal<PathRef> =
+        Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+    assert_eq!(
+        j.len(),
+        expected.len(),
+        "the recovered tree has a different size"
+    );
+    let path = j.checkpoint(&opts).unwrap();
+    let snap: Snapshot<PathRef> = Snapshot::open(path.to_str().unwrap()).unwrap();
+    for (prefix, off) in &expected {
+        let (_, value) = snap
+            .search_prefix(prefix.parse().unwrap())
+            .unwrap_or_else(|| panic!("recovery lost {prefix}"));
+        assert_eq!(value.off, *off, "wrong value for {prefix}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
