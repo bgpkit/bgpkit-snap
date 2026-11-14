@@ -382,6 +382,9 @@ pub fn verify_bytes(raw: &[u8]) -> Result<Header, Error> {
             _ => {}
         }
         while !cursor.is_multiple_of(16) {
+            if raw[cursor] != 0 {
+                return Err(Error::BadSectionTable("padding is not zero"));
+            }
             cursor += 1;
         }
         let Some(end) = cursor.checked_add(entry.len as usize) else {
@@ -504,6 +507,9 @@ impl<T: SnapValue> Snapshot<T> {
             // every section starts at the next 16-byte boundary at or after the
             // previous end, so the offset is computed and never stored
             while !cursor.is_multiple_of(16) {
+                if raw[cursor] != 0 {
+                    return Err(Error::BadSectionTable("padding is not zero"));
+                }
                 cursor += 1;
             }
             let len = entry.len as usize;

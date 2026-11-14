@@ -278,3 +278,57 @@ fn an_extra_section_cannot_claim_a_family_kind() {
         .unwrap_err();
     assert!(format!("{err}").contains("family"), "got {err}");
 }
+
+#[test]
+fn nonzero_padding_is_refused() {
+    let mut w: Writer<u32> = Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), 1);
+    let arena = [0u8; 5]; // 5 bytes, so the next section needs 11 bytes of padding
+    let bytes = w
+        .finish(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            extras: &[ExtraSection {
+                id: 16,
+                kind: bgpkit_snap::KIND_PAYLOAD,
+                required: false,
+                bytes: &arena,
+            }],
+            ..Opts::default()
+        })
+        .unwrap();
+
+    let count = u32::from_le_bytes(bytes[92..96].try_into().unwrap()) as usize;
+    let mut off = header::HEADER_LEN + count * header::ENTRY_LEN;
+    let mut pad = None;
+    for i in 0..count {
+        let aligned = (off + 15) & !15;
+        if aligned > off {
+            pad = Some(off);
+            break;
+        }
+        let pos = header::HEADER_LEN + i * header::ENTRY_LEN + 8;
+        let len = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
+        off = aligned + len;
+    }
+    let pad = pad.expect("this object has padding");
+
+    // flipping padding without touching the content id must fail, and so must a
+    // recomputed id: the spec says those bytes are zero
+    let mut flipped = bytes.clone();
+    flipped[pad] = 1;
+    assert!(Snapshot::<u32>::from_bytes(&flipped).is_err());
+
+    let mut forged = flipped.clone();
+    let mut h = blake3::Hasher::new();
+    h.update(b"bgpkit-snap-v4\0");
+    h.update(&forged[..header::HASH_END]);
+    h.update(&forged[header::HEADER_LEN..header::HEADER_LEN + count * header::ENTRY_LEN]);
+    h.update(&forged[header::HEADER_LEN + count * header::ENTRY_LEN..]);
+    forged[156..188].copy_from_slice(h.finalize().as_bytes());
+    let crc = crc32c::crc32c(&forged[..188]);
+    forged[188..192].copy_from_slice(&crc.to_le_bytes());
+    assert!(
+        bgpkit_snap::verify_bytes(&forged).is_err(),
+        "nonzero padding must be refused even with a matching id"
+    );
+}
