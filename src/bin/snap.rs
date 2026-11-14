@@ -1,11 +1,16 @@
-use std::io::Write;
+//! The `snap` CLI: build, info, verify, search.
+//!
+//! `info` reads the 192-byte header and nothing else, which is the point of the
+//! fixed header: identification is one small read.
 
-use bgpkit_snap::{Snapshot, Writer};
+use std::process::exit;
+
+use bgpkit_snap::{header::HEADER_LEN, Header, Snapshot, Writer};
 use clap::{Parser, Subcommand};
 use ipnet::IpNet;
 
 #[derive(Parser)]
-#[command(name = "snap", about = "bgpkit-snap PoC CLI")]
+#[command(name = "snap", version, about = "bgpkit-snap object tool")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -13,118 +18,131 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Build a .snap from a JSON lines file of {"prefix": "...", "value": n}
+    /// Build an object from a JSON lines file of {"prefix": .., "value": n}
     Build {
-        #[arg(short, long)]
         input: String,
         #[arg(short, long)]
         out: String,
-        #[arg(long, default_value = "generated")]
-        source: String,
-        /// Fixed RFC 3339 timestamp, for reproducible bytes
+        #[arg(long, default_value = "2026-01-01T00:00:00Z")]
+        created_at: String,
         #[arg(long)]
-        created_at: Option<String>,
+        window: Option<String>,
     },
-    /// Print META as JSON
+    /// Print what the 192-byte header says
     Info { file: String },
-    /// Re-open and run every check the reader performs
+    /// Verify the whole object
     Verify { file: String },
-    /// Longest-prefix match for a prefix
-    Search { file: String, prefix: String },
+    /// Longest-prefix match for an address or prefix
+    Search { file: String, query: String },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Build {
             input,
             out,
-            source,
             created_at,
-        } => {
-            let mut w: Writer<u32> = Writer::new();
-            let text = std::fs::read_to_string(&input)?;
-            let mut n = 0usize;
-            for (lineno, line) in text.lines().enumerate() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let v: serde_json::Value =
-                    serde_json::from_str(line).map_err(|e| format!("line {}: {e}", lineno + 1))?;
-                let p: IpNet = v["prefix"]
-                    .as_str()
-                    .ok_or("missing prefix")?
-                    .parse()
-                    .map_err(|e| format!("line {}: {e}", lineno + 1))?;
-                let value = v["value"].as_u64().ok_or("missing value")? as u32;
-                w.insert(p, value);
-                n += 1;
-            }
-            let created = created_at.unwrap_or_else(|| {
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-            });
-            let distinct = w.len();
-            let bytes = w.finish(&created, &source)?;
-            std::fs::write(&out, &bytes)?;
-            println!(
-                "built {} ({} input rows, {} distinct entries, {} bytes)",
-                out,
-                n,
-                distinct,
-                bytes.len()
-            );
+            window,
+        } => match build(&input, &out, &created_at, window.as_deref()) {
+            Ok(n) => println!("wrote {out}: {n} entries"),
+            Err(e) => fail(&format!("{e:#}")),
+        },
+        Cmd::Info { file } => match info(&file) {
+            Ok(()) => {}
+            Err(e) => fail(&format!("{e:#}")),
+        },
+        Cmd::Verify { file } => match verify(&file) {
+            Ok(n) => println!("ok: {n} entries"),
+            Err(e) => fail(&format!("{e:#}")),
+        },
+        Cmd::Search { file, query } => match search(&file, &query) {
+            Ok(()) => {}
+            Err(e) => fail(&format!("{e:#}")),
+        },
+    }
+}
+
+fn fail(msg: &str) -> ! {
+    eprintln!("snap: {msg}");
+    exit(1)
+}
+
+fn build(input: &str, out: &str, created_at: &str, window: Option<&str>) -> anyhow::Result<usize> {
+    let text = std::fs::read_to_string(input)?;
+    let mut w: Writer<u32> = Writer::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line)?;
+        let prefix: IpNet = v["prefix"].as_str().unwrap_or_default().parse()?;
+        w.insert(prefix, v["value"].as_u64().unwrap_or(0) as u32);
+    }
+    let parsed_window = match window {
+        Some(spec) => {
+            let (from, to) = spec
+                .split_once(',')
+                .ok_or_else(|| anyhow::anyhow!("--window wants FROM,TO unix seconds"))?;
+            Some((from.trim().parse()?, to.trim().parse()?))
         }
-        Cmd::Info { file } => {
-            // identification costs one 192-byte read, never the body
-            let mut raw = [0u8; bgpkit_snap::header::HEADER_LEN];
-            {
-                use std::io::Read;
-                let mut f = std::fs::File::open(&file)?;
-                f.read_exact(&mut raw)?;
-            }
-            let h = bgpkit_snap::Header::parse(&raw)?;
-            let families = h.families;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "content_id": h.content_id_hex(),
-                    "counts": {"v4": h.count_v4, "v6": h.count_v6},
-                    "families": families,
-                    "type_id": h.type_id,
-                    "file_len": h.file_len,
-                    "created_at": h.created_at,
-                    "event_window": [h.first_event_ts, h.last_event_ts],
-                    "stream": h.flags & bgpkit_snap::header::FLAG_HAS_STREAM != 0,
-                    // this answer comes from the header alone, so it is a claim
-                    "verified": false,
-                }))?
-            );
-        }
-        Cmd::Verify { file } => {
-            let s: Snapshot<u32> = Snapshot::open(&file)?;
-            let mut h = std::io::stdout();
-            writeln!(h, "magic ok, major ok, footer ok")?;
-            writeln!(h, "section hashes ok, body hash ok, content_id ok")?;
-            writeln!(
-                h,
-                "counts ok (v4 {} v6 {}), probes ok",
-                s.v4().map(|m| m.len()).unwrap_or(0),
-                s.v6().map(|m| m.len()).unwrap_or(0)
-            )?;
-            writeln!(h, "content_id {}", s.content_id())?;
-        }
-        Cmd::Search { file, prefix } => {
-            let s: Snapshot<u32> = Snapshot::open(&file)?;
-            let q: IpNet = prefix.parse()?;
-            match s.search(q) {
-                Some((p, v)) => println!("{p} -> {}", v.to_native()),
-                None => {
-                    println!("no match");
-                    std::process::exit(2);
-                }
-            }
-        }
+        None => None,
+    };
+    let bytes = w.finish(&bgpkit_snap::Opts {
+        created_at,
+        stream: None,
+        window: parsed_window,
+        extras: &[],
+    })?;
+    let n = bytes.len();
+    std::fs::write(out, bytes)?;
+    Ok(n)
+}
+
+fn info(file: &str) -> anyhow::Result<()> {
+    let mut raw = [0u8; HEADER_LEN];
+    {
+        use std::io::Read;
+        std::fs::File::open(file)?.read_exact(&mut raw)?;
+    }
+    let h = Header::parse(&raw)?;
+    println!("type_id    {}", h.type_id_str());
+    println!("content_id {}", h.content_id_hex());
+    println!("file_len   {}", h.file_len);
+    println!("sections   {}", h.section_count);
+    println!("created_at {}", h.created_at);
+    match h.window() {
+        Some((a, b)) => println!("window     {a}..{b}"),
+        None => println!("window     none"),
+    }
+    match h.stream() {
+        Some(s) => println!("stream     tree {:?} seq {}", &s.tree_id[..4], s.base_seq),
+        None => println!("stream     none"),
     }
     Ok(())
+}
+
+fn verify(file: &str) -> anyhow::Result<usize> {
+    let snap: Snapshot<u32> = Snapshot::open(file)?;
+    Ok(snap.len())
+}
+
+fn search(file: &str, query: &str) -> anyhow::Result<()> {
+    let snap: Snapshot<u32> = Snapshot::open(file)?;
+    let hit = match query.parse::<IpNet>() {
+        Ok(net) => snap.search_prefix(net),
+        Err(_) => snap.search(query.parse()?),
+    };
+    match hit {
+        Some((prefix, value)) => println!("{prefix} -> {}", u32::from_archived(value)),
+        None => println!("no match"),
+    }
+    Ok(())
+}
+
+trait FromArchived {
+    fn from_archived(v: &<u32 as rkyv::Archive>::Archived) -> u32;
+}
+
+impl FromArchived for u32 {
+    fn from_archived(v: &<u32 as rkyv::Archive>::Archived) -> u32 {
+        v.to_native()
+    }
 }

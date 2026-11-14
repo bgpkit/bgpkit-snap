@@ -1,39 +1,444 @@
-//! The append-only journal and the mutable tree that feeds it.
+//! The journal: one owner of the live tree, the blob arena and the segments.
 //!
-//! A journal turns a mutable tree into a snapshot without losing updates. It is
-//! not an audit log: segments below the checkpoint's `base_seq` are deleted.
+//! A record is
+//! `len | crc32c | seq | recv_ts | event_ts | kind | family | plen | flags |
+//!  addr[16] | value_len | value | blob_len | blob`.
 //!
-//! Record layout (little endian), see the format document section 9:
-//! `len u32 | crc32c u32 | seq u64 | recv_ts i64 | event_ts i64 | kind u8 |
-//! family u8 | prefix_len u8 | flags u8 | addr [16] | value_len u32 | value`.
-//! `len` counts the bytes after itself, so a record is `4 + len` bytes, and the
-//! CRC covers the bytes after the CRC field, never itself.
+//! The trailing blob is what makes handle values work: a value may point into a
+//! payload section, and the bytes it points at travel in the same record, so a
+//! replay rebuilds the section in record order and every offset reproduces.
 
-use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use ipnet::IpNet;
-use prefix_trie::{AsView, PrefixMap, TrieView};
+use prefix_trie::PrefixMap;
 
-use crate::{Error, RkyvError, Snapshot, Writer, ID_V4, ID_V6, MAJOR, MINOR};
+use crate::header::KIND_PAYLOAD;
+use crate::{Codec, Error, ExtraSection, Opts, Snapshot, Writer};
 
-/// Segment magic. Deliberately different from the snapshot magic so a mixed-up
-/// file is rejected rather than parsed.
-pub const JOURNAL_MAGIC: &[u8; 8] = b"BGPKLOG\0";
-/// Segment header: magic 8 + version 2 + minor 2 + tree_id 16 + generation 16 +
-/// pad 4. The generation makes sequence numbers unique across journal
-/// incarnations, so a stale snapshot cannot be replayed against a new journal.
-pub const SEGMENT_HEADER_LEN: usize = 48;
-/// Fixed record bytes after the length field, with an empty value.
-pub const RECORD_FIXED_LEN: usize = 52;
+const MAGIC: &[u8; 8] = b"BGPKLOG\0";
+const SEGMENT_HEADER_LEN: usize = 48;
+const RECORD_FIXED_LEN: usize = 56;
 
 pub const KIND_INSERT: u8 = 1;
 pub const KIND_WITHDRAW: u8 = 2;
-pub const KIND_CONTROL: u8 = 3;
 
-pub use crate::Codec;
+/// Where the journal's blob arena lands in a snapshot.
+#[derive(Debug, Clone, Copy)]
+pub struct PayloadSection {
+    pub id: u16,
+    pub kind: [u8; 4],
+    pub required: bool,
+}
+
+impl PayloadSection {
+    pub fn payload(id: u16) -> Self {
+        Self {
+            id,
+            kind: KIND_PAYLOAD,
+            required: true,
+        }
+    }
+}
+
+struct Segment {
+    file: BufWriter<File>,
+    bytes: u64,
+}
+
+pub struct Journal<T: Codec> {
+    dir: PathBuf,
+    tree_id: [u8; 16],
+    generation: [u8; 16],
+    stream: crate::StreamRef,
+    seg: Segment,
+    seq: u64,
+    base_seq: u64,
+    v4: PrefixMap<ipnet::Ipv4Net, T>,
+    v6: PrefixMap<ipnet::Ipv6Net, T>,
+    blob: Vec<u8>,
+    payload: Option<PayloadSection>,
+}
+
+impl<T: Codec> Journal<T>
+where
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<
+        rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
+    >,
+{
+    /// Open a journal, recovering the tree from the last checkpoint plus the
+    /// segments. The generation is reused when a journal already exists.
+    pub fn open(
+        dir: impl AsRef<Path>,
+        tree_id: [u8; 16],
+        payload: Option<PayloadSection>,
+    ) -> Result<Self, Error> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("writer.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .map_err(|_| Error::BadRecord("another writer holds this journal"))?;
+
+        let generation = existing_generation(&dir)?.unwrap_or_else(random_generation);
+        // a new segment, never the existing ones: reopening must not truncate
+        let index = segment_paths(&dir)?
+            .iter()
+            .filter_map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("segment-"))
+                    .and_then(|n| n.strip_suffix(".log"))
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .max()
+            .map_or(1, |m| m + 1);
+        let seg_path = dir.join(format!("segment-{index:012}.log"));
+        let seg_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&seg_path)?;
+        let mut journal = Journal {
+            dir: dir.clone(),
+            tree_id,
+            generation,
+            stream: crate::StreamRef {
+                tree_id,
+                generation,
+                base_seq: 0,
+            },
+            seg: Segment {
+                file: BufWriter::new(seg_file),
+                bytes: 0,
+            },
+            seq: 1,
+            base_seq: 0,
+            v4: PrefixMap::new(),
+            v6: PrefixMap::new(),
+            blob: Vec::new(),
+            payload,
+        };
+        journal.recover()?;
+        journal.write_segment_header()?;
+        Ok(journal)
+    }
+
+    fn write_segment_header(&mut self) -> Result<(), Error> {
+        let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
+        header.extend_from_slice(MAGIC);
+        header.extend_from_slice(&4u16.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&self.tree_id);
+        header.extend_from_slice(&self.generation);
+        header.extend_from_slice(&[0u8; 4]);
+        self.seg.file.write_all(&header)?;
+        self.seg.bytes = SEGMENT_HEADER_LEN as u64;
+        Ok(())
+    }
+
+    /// Replay every segment on disk into the tree and the arena.
+    fn recover(&mut self) -> Result<(), Error> {
+        let mut paths = segment_paths(&self.dir)?;
+        paths.sort();
+        let mut expected: Option<u64> = Some(1);
+        for path in paths {
+            let mut raw = Vec::new();
+            File::open(&path)?.read_to_end(&mut raw)?;
+            if raw.len() < SEGMENT_HEADER_LEN || &raw[..8] != MAGIC {
+                continue;
+            }
+            if raw[12..28] != self.tree_id || raw[28..44] != self.generation {
+                return Err(Error::BadRecord("segment belongs to another journal"));
+            }
+            let mut off = SEGMENT_HEADER_LEN;
+            while off + 8 <= raw.len() {
+                let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("4")) as usize;
+                if len < RECORD_FIXED_LEN || off + 4 + len > raw.len() {
+                    break;
+                }
+                let crc = u32::from_le_bytes(raw[off + 4..off + 8].try_into().expect("4"));
+                let payload = &raw[off + 8..off + 4 + len];
+                if crc32c::crc32c(payload) != crc {
+                    break;
+                }
+                off += 4 + len;
+                let record = parse_record(payload)?;
+                if let Some(want) = expected {
+                    if record.seq != want && record.seq != want + 1 {
+                        // one unacked record may be missing after a tear
+                        return Err(Error::SequenceGap {
+                            expected: want,
+                            found: record.seq,
+                        });
+                    }
+                }
+                expected = Some(record.seq + 1);
+                self.apply(&record)?;
+                self.seq = record.seq + 1;
+            }
+        }
+        self.base_seq = self.seq.saturating_sub(1);
+        self.stream.base_seq = self.base_seq;
+        Ok(())
+    }
+
+    fn apply(&mut self, record: &Record) -> Result<(), Error> {
+        match record.kind {
+            KIND_INSERT => {
+                let value = T::decode(&record.value)?;
+                match record.prefix {
+                    IpNet::V4(p) => {
+                        self.v4.insert(p, value);
+                    }
+                    IpNet::V6(p) => {
+                        self.v6.insert(p, value);
+                    }
+                }
+            }
+            KIND_WITHDRAW => match record.prefix {
+                IpNet::V4(p) => {
+                    self.v4.remove(&p);
+                }
+                IpNet::V6(p) => {
+                    self.v6.remove(&p);
+                }
+            },
+            other => {
+                return Err(Error::BadRecord(if other == 0 {
+                    "no kind"
+                } else {
+                    "unknown kind"
+                }))
+            }
+        }
+        if !record.blob.is_empty() {
+            self.blob.extend_from_slice(&record.blob);
+        }
+        Ok(())
+    }
+
+    /// Append a blob to the arena and return its offset. The bytes are recorded
+    /// once; a client that wants dedup keeps its own map from content to offset.
+    pub fn append_blob(&mut self, bytes: &[u8]) -> Result<u32, Error> {
+        let off = u32::try_from(self.blob.len())
+            .map_err(|_| Error::BadRecord("payload arena exceeds 4 GiB"))?;
+        self.blob.extend_from_slice(bytes);
+        self.append(
+            KIND_INSERT,
+            IpNet::V4(
+                ipnet::Ipv4Net::new(std::net::Ipv4Addr::UNSPECIFIED, 32).expect("host route"),
+            ),
+            &[],
+            bytes,
+        )?;
+        Ok(off)
+    }
+
+    pub fn insert(&mut self, prefix: IpNet, value: &T) -> Result<u64, Error> {
+        let mut value = value.clone();
+        value.canonicalize();
+        let bytes = T::encode(&value)?;
+        self.append(KIND_INSERT, prefix, &bytes, &[])
+    }
+
+    pub fn insert_with_blob(
+        &mut self,
+        prefix: IpNet,
+        value: &T,
+        blob: &[u8],
+    ) -> Result<u64, Error> {
+        let mut value = value.clone();
+        value.canonicalize();
+        let bytes = T::encode(&value)?;
+        self.blob.extend_from_slice(blob);
+        self.append(KIND_INSERT, prefix, &bytes, blob)
+    }
+
+    pub fn withdraw(&mut self, prefix: IpNet) -> Result<u64, Error> {
+        match prefix {
+            IpNet::V4(p) => {
+                self.v4.remove(&p);
+            }
+            IpNet::V6(p) => {
+                self.v6.remove(&p);
+            }
+        }
+        self.append(KIND_WITHDRAW, prefix, &[], &[])
+    }
+
+    fn append(&mut self, kind: u8, prefix: IpNet, value: &[u8], blob: &[u8]) -> Result<u64, Error> {
+        let seq = self.seq;
+        let (family, plen, addr) = prefix_fields(prefix);
+        let mut payload = Vec::with_capacity(RECORD_FIXED_LEN + value.len() + blob.len());
+        payload.extend_from_slice(&seq.to_le_bytes());
+        payload.extend_from_slice(&0i64.to_le_bytes()); // recv_ts
+        payload.extend_from_slice(&0i64.to_le_bytes()); // event_ts
+        payload.push(kind);
+        payload.push(family);
+        payload.push(plen);
+        payload.push(0);
+        payload.extend_from_slice(&addr);
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(value);
+        payload.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        payload.extend_from_slice(blob);
+
+        let len = (payload.len() + 4) as u32;
+        let crc = crc32c::crc32c(&payload);
+        self.seg.file.write_all(&len.to_le_bytes())?;
+        self.seg.file.write_all(&crc.to_le_bytes())?;
+        self.seg.file.write_all(&payload)?;
+        self.seg.bytes += 4 + payload.len() as u64;
+        self.seq += 1;
+        Ok(seq)
+    }
+
+    /// A record is durable once this returns.
+    pub fn sync(&mut self) -> Result<(), Error> {
+        self.seg.file.flush()?;
+        self.seg.file.get_ref().sync_all()?;
+        let state = serde_json::json!({
+            "next_seq": self.seq,
+            "generation": crate::header::hex32(&pad32(&self.generation)),
+            "tree_id": crate::header::hex32(&pad32(&self.tree_id)),
+        });
+        let tmp = self.dir.join(".state.json.tmp");
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(
+                serde_json::to_vec(&state)
+                    .map_err(|_| Error::BadRecord("state"))?
+                    .as_slice(),
+            )?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, self.dir.join("state.json"))?;
+        File::open(&self.dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Write and verify a snapshot of the current state, then drop covered
+    /// segments. The object is verified end to end before anything is deleted.
+    pub fn checkpoint(&mut self, opts: &Opts<'_>) -> Result<PathBuf, Error> {
+        let mut writer = Writer::<T>::new();
+        for (p, v) in self.v4.iter() {
+            writer.insert(IpNet::V4(p), v.clone());
+        }
+        for (p, v) in self.v6.iter() {
+            writer.insert(IpNet::V6(p), v.clone());
+        }
+        let mut extras: Vec<ExtraSection<'_>> = Vec::new();
+        if let (Some(payload), true) = (self.payload, !self.blob.is_empty()) {
+            extras.push(ExtraSection {
+                id: payload.id,
+                kind: payload.kind,
+                required: payload.required,
+                bytes: &self.blob,
+            });
+        }
+        let stream = crate::StreamRef {
+            tree_id: self.tree_id,
+            generation: self.generation,
+            base_seq: self.seq.saturating_sub(1),
+        };
+        let opts = Opts {
+            created_at: opts.created_at,
+            stream: Some(stream),
+            window: opts.window,
+            extras: &extras,
+        };
+        let bytes = writer.finish(&opts)?;
+
+        // verify before pruning: a bad object must not take the history with it.
+        // The journal knows which section it just wrote, so it is its own
+        // validator for that id and nothing else.
+        struct KnownPayload(Option<u16>);
+        impl crate::Validator for KnownPayload {
+            fn knows(&self, entry: &crate::Entry) -> bool {
+                Some(entry.id) == self.0
+            }
+        }
+        let snap: Snapshot<T> =
+            Snapshot::from_bytes_with(&bytes, &KnownPayload(self.payload.map(|p| p.id)))?;
+        let name = format!("snapshot-{}.snap", self.seq);
+        let path = self.dir.join(&name);
+        let tmp = self.dir.join(format!(".{name}.tmp"));
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        File::open(&self.dir)?.sync_all()?;
+        println!(
+            "checkpoint {} entries, id {}",
+            snap.len(),
+            snap.content_id()
+        );
+        Ok(path)
+    }
+
+    pub fn blob_len(&self) -> usize {
+        self.blob.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+struct Record {
+    seq: u64,
+    kind: u8,
+    prefix: IpNet,
+    value: Vec<u8>,
+    blob: Vec<u8>,
+}
+
+fn parse_record(payload: &[u8]) -> Result<Record, Error> {
+    if payload.len() < 48 {
+        return Err(Error::BadRecord("record is short"));
+    }
+    let seq = u64::from_le_bytes(payload[0..8].try_into().expect("8"));
+    let kind = payload[24];
+    let family = payload[25];
+    let plen = payload[26];
+    let mut addr = [0u8; 16];
+    addr.copy_from_slice(&payload[28..44]);
+    let value_len = u32::from_le_bytes(payload[44..48].try_into().expect("4")) as usize;
+    if payload.len() < 48 + value_len + 4 {
+        return Err(Error::BadRecord("record value is short"));
+    }
+    let value = payload[48..48 + value_len].to_vec();
+    let blob_len = u32::from_le_bytes(
+        payload[48 + value_len..52 + value_len]
+            .try_into()
+            .expect("4"),
+    ) as usize;
+    if payload.len() < 52 + value_len + blob_len {
+        return Err(Error::BadRecord("record blob is short"));
+    }
+    let blob = payload[52 + value_len..52 + value_len + blob_len].to_vec();
+    let prefix = prefix_from_fields(family, plen, &addr)
+        .ok_or(Error::BadRecord("record prefix is unusable"))?;
+    Ok(Record {
+        seq,
+        kind,
+        prefix,
+        value,
+        blob,
+    })
+}
 
 fn prefix_fields(prefix: IpNet) -> (u8, u8, [u8; 16]) {
     let mut addr = [0u8; 16];
@@ -61,541 +466,8 @@ fn prefix_from_fields(family: u8, len: u8, addr: &[u8; 16]) -> Option<IpNet> {
     }
 }
 
-/// One decoded record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Record {
-    pub seq: u64,
-    pub recv_ts: i64,
-    pub event_ts: i64,
-    pub kind: u8,
-    pub prefix: IpNet,
-    pub value: Vec<u8>,
-}
-
-/// The append side. One writer per tree.
-pub struct Journal {
-    dir: PathBuf,
-    /// Advisory lock, held until this journal is dropped: one writer per tree.
-    _lock: File,
-    tree_id: [u8; 16],
-    generation: [u8; 16],
-    seg_path: PathBuf,
-    seg: BufWriter<File>,
-    seg_bytes: u64,
-    seq: u64,
-    records: u64,
-}
-
-impl Journal {
-    /// Open (or create) a journal directory and start a new segment.
-    ///
-    /// The sequence continues from `state.json` when it exists, otherwise from
-    /// the checkpoint plus the highest record on disk. Segment file names are a
-    /// creation counter, not a sequence: decoupling them is what lets a reopen
-    /// always write a fresh segment without ever reusing a number.
-    pub fn open(dir: impl AsRef<Path>, tree_id: [u8; 16]) -> Result<Self, Error> {
-        let generation = None;
-        Self::open_with(dir, tree_id, generation)
-    }
-
-    fn open_with(
-        dir: impl AsRef<Path>,
-        tree_id: [u8; 16],
-        generation: Option<[u8; 16]>,
-    ) -> Result<Self, Error> {
-        let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
-        // one writer per tree: an advisory lock held for the process lifetime
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join("writer.lock"))?;
-        lock.try_lock_exclusive()
-            .map_err(|_| Error::BadMeta("another writer holds this journal".into()))?;
-        std::fs::write(dir.join("writer.pid"), std::process::id().to_string())?;
-
-        let state = read_state(&dir)?;
-        let generation = match generation {
-            Some(g) => g,
-            None => state
-                .as_ref()
-                .map(|s| s.generation)
-                .or(Self::existing_generation(&dir)?)
-                .unwrap_or_else(random_generation),
-        };
-        let base = match state.as_ref() {
-            Some(s) => s.next_seq,
-            None => {
-                let checkpoint = read_checkpoint(&dir)?.map_or(0, |c| c.base_seq);
-                Self::scan_max_seq(&dir)?.map_or(checkpoint + 1, |m| (m + 1).max(checkpoint + 1))
-            }
-        };
-        let counter = Self::next_segment_counter(&dir)?;
-        let seg_path = dir.join(format!("segment-{counter:012}.log"));
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&seg_path)?;
-        let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
-        header.extend_from_slice(JOURNAL_MAGIC);
-        header.extend_from_slice(&MAJOR.to_le_bytes());
-        header.extend_from_slice(&MINOR.to_le_bytes());
-        header.extend_from_slice(&tree_id);
-        header.extend_from_slice(&generation);
-        header.extend_from_slice(&[0u8; 4]);
-        file.write_all(&header)?;
-        file.sync_all()?;
-        // the directory entry of a brand new segment must be durable before a
-        // record in it is acked
-        File::open(&dir)?.sync_all()?;
-        Ok(Self {
-            dir,
-            _lock: lock,
-            tree_id,
-            generation,
-            seg_path,
-            seg: BufWriter::new(file),
-            seg_bytes: SEGMENT_HEADER_LEN as u64,
-            seq: base,
-            records: 0,
-        })
-    }
-
-    /// Highest valid record sequence on disk.
-    fn scan_max_seq(dir: &Path) -> Result<Option<u64>, Error> {
-        let mut max = None;
-        for path in segment_paths(dir)? {
-            if let Some(last) = last_record_seq(&path)? {
-                max = Some(max.map_or(last, |m: u64| m.max(last)));
-            }
-        }
-        Ok(max)
-    }
-
-    /// Next segment file number: one past the highest already present.
-    fn next_segment_counter(dir: &Path) -> Result<u64, Error> {
-        let mut max = 0u64;
-        for path in segment_paths(dir)? {
-            if let Some(n) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix("segment-"))
-                .and_then(|n| n.strip_suffix(".log"))
-                .and_then(|n| n.parse::<u64>().ok())
-            {
-                max = max.max(n);
-            }
-        }
-        Ok(max + 1)
-    }
-
-    /// The generation recorded in the first segment on disk, if any.
-    fn existing_generation(dir: &Path) -> Result<Option<[u8; 16]>, Error> {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Ok(None);
-        };
-        let mut names: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("segment-") && n.ends_with(".log"))
-            })
-            .collect();
-        names.sort();
-        for path in names {
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            if bytes.len() >= SEGMENT_HEADER_LEN && &bytes[..8] == JOURNAL_MAGIC {
-                let mut generation = [0u8; 16];
-                generation.copy_from_slice(&bytes[28..44]);
-                return Ok(Some(generation));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Start a new incarnation in `dir`, minting a fresh generation before the
-    /// segment header is written. A restored backup or a deliberate fork must
-    /// use this, otherwise two divergent states can claim the same coordinates.
-    pub fn open_new_incarnation(dir: impl AsRef<Path>, tree_id: [u8; 16]) -> Result<Self, Error> {
-        Self::open_with(dir, tree_id, Some(random_generation()))
-    }
-
-    /// The incarnation this writer belongs to.
-    pub fn generation(&self) -> [u8; 16] {
-        self.generation
-    }
-
-    pub fn seq(&self) -> u64 {
-        self.seq
-    }
-
-    pub fn records(&self) -> u64 {
-        self.records
-    }
-
-    pub fn segment_bytes(&self) -> u64 {
-        self.seg_bytes
-    }
-
-    /// Append one record. Returns the assigned sequence number.
-    fn append(
-        &mut self,
-        kind: u8,
-        prefix: IpNet,
-        value: &[u8],
-        recv_ts: i64,
-        event_ts: i64,
-    ) -> Result<u64, Error> {
-        let seq = self.seq;
-        let (family, prefix_len, addr) = prefix_fields(prefix);
-        let mut payload = Vec::with_capacity(RECORD_FIXED_LEN + value.len());
-        payload.extend_from_slice(&seq.to_le_bytes());
-        payload.extend_from_slice(&recv_ts.to_le_bytes());
-        payload.extend_from_slice(&event_ts.to_le_bytes());
-        payload.push(kind);
-        payload.push(family);
-        payload.push(prefix_len);
-        payload.push(0);
-        payload.extend_from_slice(&addr);
-        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        payload.extend_from_slice(value);
-
-        let len = (payload.len() + 4) as u32;
-        let crc = crc32c::crc32c(&payload);
-        let mut framed = Vec::with_capacity(4 + payload.len());
-        framed.extend_from_slice(&len.to_le_bytes());
-        framed.extend_from_slice(&crc.to_le_bytes());
-        framed.extend_from_slice(&payload);
-        self.seg.write_all(&framed)?;
-        self.seg_bytes += framed.len() as u64;
-        self.seq += 1;
-        self.records += 1;
-        Ok(seq)
-    }
-
-    /// Append an insert. The value is stored in its archived form.
-    pub fn insert<V: Codec>(
-        &mut self,
-        prefix: IpNet,
-        value: &V,
-        event_ts: i64,
-    ) -> Result<u64, Error> {
-        let mut value = value.clone();
-        value.canonicalize();
-        let bytes = V::encode(&value)?;
-        self.append(KIND_INSERT, prefix, &bytes, now_ts(), event_ts)
-    }
-
-    /// Append a withdraw. Withdrawals carry no value.
-    pub fn withdraw(&mut self, prefix: IpNet, event_ts: i64) -> Result<u64, Error> {
-        self.append(KIND_WITHDRAW, prefix, &[], now_ts(), event_ts)
-    }
-
-    /// A record is durable once this returns.
-    pub fn sync(&mut self) -> Result<(), Error> {
-        self.seg.flush()?;
-        self.seg.get_ref().sync_all()?;
-        // persist the sequence the next record will use, so a reopen cannot
-        // reissue a number even when the last record is torn
-        write_state(
-            &self.dir,
-            WriterState {
-                next_seq: self.seq,
-                generation: self.generation,
-            },
-        )?;
-        Ok(())
-    }
-
-    /// Write the tree as a snapshot, then drop the segments the snapshot covers.
-    ///
-    /// The previous snapshot and its segments survive until the new snapshot is
-    /// on disk, so a crash mid-checkpoint replays cleanly against the old base.
-    pub fn checkpoint<V>(
-        &mut self,
-        tree: &Tree<V>,
-        dir: impl AsRef<Path>,
-        created_at: &str,
-        source: &str,
-    ) -> Result<String, Error>
-    where
-        V: Codec,
-        V::Archived:
-            for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
-    {
-        let bytes = tree.to_writer().finish_with(
-            created_at,
-            source,
-            crate::HeaderInputs {
-                stream: Some(crate::StreamRef {
-                    tree_id: self.tree_id,
-                    generation: self.generation,
-                    base_seq: self.seq.saturating_sub(1),
-                }),
-                first_event_ts: 0,
-                last_event_ts: 0,
-            },
-        )?;
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)?;
-        let name = format!("snapshot-{}.snap", self.seq);
-        let final_path = dir.join(&name);
-        let tmp_path = dir.join(format!(".{name}.tmp"));
-        {
-            let mut f = File::create(&tmp_path)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-        }
-        // the bytes must be a valid object before anything is deleted: a
-        // truncated body would otherwise take the only other copy with it
-        crate::Snapshot::<V>::from_bytes(&bytes)?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        File::open(dir)?.sync_all()?;
-        // and the file that landed on disk must be readable end to end
-        crate::Snapshot::<V>::open(
-            final_path
-                .to_str()
-                .ok_or_else(|| Error::BadMeta("snapshot path is not valid UTF-8".into()))?,
-        )?;
-
-        let checkpoint = serde_json::json!({
-            "snapshot_file": name,
-            // the snapshot reflects records up to and including self.seq - 1;
-            // replay applies `seq > base_seq`, so storing self.seq would drop the
-            // first record appended after this checkpoint.
-            "base_seq": self.seq.saturating_sub(1),
-            "tree_id": hex(&self.tree_id),
-            "generation": hex(&self.generation),
-        });
-        let cp_path = dir.join("checkpoint.json");
-        let cp_tmp = dir.join(".checkpoint.json.tmp");
-        {
-            let mut f = File::create(&cp_tmp)?;
-            f.write_all(
-                &serde_json::to_vec_pretty(&checkpoint)
-                    .map_err(|e| Error::BadMeta(e.to_string()))?,
-            )?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&cp_tmp, &cp_path)?;
-        File::open(dir)?.sync_all()?;
-
-        // the snapshot must be readable before anything is deleted; a corrupt
-        // rename would otherwise destroy the only other copy of the history
-        verify_checkpoint_binding(dir)?;
-        self.prune_segments()?;
-        Ok(name)
-    }
-
-    /// Delete segments whose records are all covered by the checkpoint.
-    fn prune_segments(&mut self) -> Result<(), Error> {
-        let covered = self.seq.saturating_sub(1);
-        for entry in std::fs::read_dir(&self.dir)? {
-            let path = entry?.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !name.starts_with("segment-") || !name.ends_with(".log") {
-                continue;
-            }
-            // keep the segment currently being appended to
-            if path == self.seg_path {
-                continue;
-            }
-            let Some(last) = last_record_seq(&path)? else {
-                continue;
-            };
-            if last <= covered {
-                std::fs::remove_file(&path)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// A mutable tree. Values are owned; a snapshot is a point-in-time projection.
-pub struct Tree<V> {
-    v4: PrefixMap<ipnet::Ipv4Net, V>,
-    v6: PrefixMap<ipnet::Ipv6Net, V>,
-}
-
-impl<V: Codec> Default for Tree<V> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<V: Codec> Tree<V> {
-    pub fn new() -> Self {
-        Self {
-            v4: PrefixMap::new(),
-            v6: PrefixMap::new(),
-        }
-    }
-
-    /// Load every entry of a snapshot into owned memory. This is the cost of
-    /// mutating a snapshot: there is no in-place edit path.
-    pub fn open(snapshot: &Snapshot<V>) -> Result<Self, Error>
-    where
-        V::Archived:
-            for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
-    {
-        let mut tree = Self::new();
-        if let Some(map) = snapshot.v4() {
-            for (p, v) in map.view().iter() {
-                tree.v4.insert(p, V::materialize(v)?);
-            }
-        }
-        if let Some(map) = snapshot.v6() {
-            for (p, v) in map.view().iter() {
-                tree.v6.insert(p, V::materialize(v)?);
-            }
-        }
-        Ok(tree)
-    }
-
-    pub fn insert(&mut self, prefix: IpNet, value: V) -> Option<V> {
-        match prefix {
-            IpNet::V4(p) => self.v4.insert(p, value),
-            IpNet::V6(p) => self.v6.insert(p, value),
-        }
-    }
-
-    pub fn withdraw(&mut self, prefix: IpNet) -> Option<V> {
-        match prefix {
-            IpNet::V4(p) => self.v4.remove(&p),
-            IpNet::V6(p) => self.v6.remove(&p),
-        }
-    }
-
-    pub fn get(&self, prefix: IpNet) -> Option<(IpNet, &V)> {
-        match prefix {
-            IpNet::V4(p) => self.v4.get_spm(&p).map(|(k, v)| (IpNet::V4(k), v)),
-            IpNet::V6(p) => self.v6.get_spm(&p).map(|(k, v)| (IpNet::V6(k), v)),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.v4.len() + self.v6.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Visit every entry in prefix order, each family separately.
-    pub fn for_each(&self, mut f: impl FnMut(IpNet, &V)) {
-        for (p, v) in self.v4.view().iter() {
-            f(IpNet::V4(p), v);
-        }
-        for (p, v) in self.v6.view().iter() {
-            f(IpNet::V6(p), v);
-        }
-    }
-
-    pub fn to_writer(&self) -> Writer<V> {
-        let mut w = Writer::new();
-        for (p, v) in self.v4.view().iter() {
-            w.insert(IpNet::V4(p), v.clone());
-        }
-        for (p, v) in self.v6.view().iter() {
-            w.insert(IpNet::V6(p), v.clone());
-        }
-        w
-    }
-}
-
-/// What a replay did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReplayStats {
-    pub applied: u64,
-    pub skipped: u64,
-    pub torn_bytes: u64,
-}
-
-/// The checkpoint a journal directory refers to.
-#[derive(Debug, Clone)]
-pub struct Checkpoint {
-    pub snapshot_file: String,
-    pub base_seq: u64,
-    pub generation: [u8; 16],
-    pub tree_id: [u8; 16],
-}
-
-/// Read `checkpoint.json`, if the directory has one.
-pub fn read_checkpoint(dir: impl AsRef<Path>) -> Result<Option<Checkpoint>, Error> {
-    let path = dir.as_ref().join("checkpoint.json");
-    let Ok(raw) = std::fs::read(&path) else {
-        return Ok(None);
-    };
-    let v: serde_json::Value =
-        serde_json::from_slice(&raw).map_err(|e| Error::BadMeta(e.to_string()))?;
-    let snapshot_file = v["snapshot_file"]
-        .as_str()
-        .ok_or_else(|| Error::BadMeta("checkpoint.json: snapshot_file".into()))?
-        .to_string();
-    let base_seq = v["base_seq"]
-        .as_u64()
-        .ok_or_else(|| Error::BadMeta("checkpoint.json: base_seq".into()))?;
-    let tree_id = v["tree_id"]
-        .as_str()
-        .and_then(parse_hex16)
-        .ok_or_else(|| Error::BadMeta("checkpoint.json: tree_id".into()))?;
-    let generation = v["generation"]
-        .as_str()
-        .and_then(parse_hex16)
-        .ok_or_else(|| Error::BadMeta("checkpoint.json: generation".into()))?;
-    Ok(Some(Checkpoint {
-        snapshot_file,
-        base_seq,
-        generation,
-        tree_id,
-    }))
-}
-
-/// Check that `checkpoint.json` describes the snapshot it names.
-///
-/// Reads only the snapshot's 192-byte header, so it needs no value type: the
-/// tree id, generation and base sequence must match the checkpoint exactly, or
-/// replay would start from the wrong base.
-pub fn verify_checkpoint_binding(dir: impl AsRef<Path>) -> Result<Checkpoint, Error> {
-    let dir = dir.as_ref();
-    let cp = read_checkpoint(dir)?.ok_or_else(|| Error::BadMeta("no checkpoint.json".into()))?;
-    let path = dir.join(&cp.snapshot_file);
-    let mut raw = [0u8; crate::header::HEADER_LEN];
-    {
-        let mut f = File::open(&path)?;
-        f.read_exact(&mut raw)?;
-    }
-    let header = crate::Header::parse(&raw)?;
-    if header.tree_id != cp.tree_id
-        || header.generation != cp.generation
-        || header.base_seq != cp.base_seq
-    {
-        return Err(Error::BadMeta(
-            "checkpoint.json does not describe the snapshot it names".into(),
-        ));
-    }
-    Ok(cp)
-}
-
-/// Replay every record with `seq > base_seq` into `tree`.
-///
-/// A torn tail (short final record, bad length, or CRC mismatch) stops the scan
-/// without failing: the valid prefix is applied and the byte count is reported.
-pub fn replay<V: Codec>(
-    tree: &mut Tree<V>,
-    dir: impl AsRef<Path>,
-    base_seq: u64,
-    tree_id: [u8; 16],
-    generation: [u8; 16],
-) -> Result<ReplayStats, Error> {
-    let dir = dir.as_ref();
-    let mut segments: Vec<PathBuf> = Vec::new();
+fn segment_paths(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path
@@ -603,281 +475,40 @@ pub fn replay<V: Codec>(
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("segment-") && n.ends_with(".log"))
         {
-            segments.push(path);
+            out.push(path);
         }
     }
-    segments.sort();
-
-    let mut stats = ReplayStats {
-        applied: 0,
-        skipped: 0,
-        torn_bytes: 0,
-    };
-    let mut next_expected: Option<u64> = Some(base_seq + 1);
-    let mut after_torn = false;
-    for path in segments {
-        let mut raw = Vec::new();
-        File::open(&path)?.read_to_end(&mut raw)?;
-        if raw.len() < SEGMENT_HEADER_LEN || &raw[..8] != JOURNAL_MAGIC {
-            return Err(Error::BadMagic);
-        }
-        if raw[12..28] != tree_id {
-            return Err(Error::TypeMismatch {
-                expected: "journal tree_id",
-                found: hex(&raw[12..28]),
-            });
-        }
-        if raw[28..44] != generation {
-            return Err(Error::TypeMismatch {
-                expected: "journal generation",
-                found: hex(&raw[28..44]),
-            });
-        }
-        let mut off = SEGMENT_HEADER_LEN;
-        while off + 4 <= raw.len() {
-            let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("4 bytes")) as usize;
-            if len < RECORD_FIXED_LEN || off + 4 + len > raw.len() {
-                stats.torn_bytes += (raw.len() - off) as u64;
-                after_torn = true;
-                break;
-            }
-            let crc = u32::from_le_bytes(raw[off + 4..off + 8].try_into().expect("4 bytes"));
-            let payload = &raw[off + 8..off + 4 + len];
-            if crc32c::crc32c(payload) != crc {
-                stats.torn_bytes += (raw.len() - off) as u64;
-                after_torn = true;
-                break;
-            }
-            let record = parse_payload(payload)?;
-            off += 4 + len;
-            if record.seq <= base_seq {
-                stats.skipped += 1;
-                continue;
-            }
-            if let Some(expected) = next_expected {
-                if record.seq != expected && !(after_torn && record.seq > expected) {
-                    return Err(Error::BadMeta(format!(
-                        "journal sequence gap: expected {expected}, found {}",
-                        record.seq
-                    )));
-                }
-            }
-            next_expected = Some(record.seq + 1);
-            after_torn = false;
-            match record.kind {
-                KIND_INSERT => {
-                    tree.insert(record.prefix, V::decode(&record.value)?);
-                }
-                KIND_WITHDRAW => {
-                    tree.withdraw(record.prefix);
-                }
-                KIND_CONTROL => {}
-                other => {
-                    return Err(Error::BadMeta(format!(
-                        "journal record has unknown kind {other}"
-                    )))
-                }
-            }
-            stats.applied += 1;
-        }
-        if off < raw.len() && !after_torn {
-            stats.torn_bytes += (raw.len() - off) as u64;
-            after_torn = true;
-        }
-    }
-    Ok(stats)
+    Ok(out)
 }
 
-fn parse_payload(payload: &[u8]) -> Result<Record, Error> {
-    if payload.len() < 48 {
-        return Err(Error::Truncated {
-            need: 48,
-            have: payload.len(),
-        });
-    }
-    let seq = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
-    let recv_ts = i64::from_le_bytes(payload[8..16].try_into().expect("8 bytes"));
-    let event_ts = i64::from_le_bytes(payload[16..24].try_into().expect("8 bytes"));
-    let kind = payload[24];
-    let family = payload[25];
-    let prefix_len = payload[26];
-    let mut addr = [0u8; 16];
-    addr.copy_from_slice(&payload[28..44]);
-    let value_len = u32::from_le_bytes(payload[44..48].try_into().expect("4 bytes")) as usize;
-    if payload.len() < 48 + value_len {
-        return Err(Error::Truncated {
-            need: 48 + value_len,
-            have: payload.len(),
-        });
-    }
-    let prefix = prefix_from_fields(family, prefix_len, &addr).ok_or(Error::BadSectionTable(
-        "journal record has an unusable prefix",
-    ))?;
-    Ok(Record {
-        seq,
-        recv_ts,
-        event_ts,
-        kind,
-        prefix,
-        value: payload[48..48 + value_len].to_vec(),
-    })
-}
-
-fn now_ts() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Highest valid record sequence in a segment.
-fn last_record_seq(path: &Path) -> Result<Option<u64>, Error> {
-    let raw = std::fs::read(path)?;
-    if raw.len() < SEGMENT_HEADER_LEN {
-        return Ok(None);
-    }
-    let mut off = SEGMENT_HEADER_LEN;
-    let mut last = None;
-    while off + 8 <= raw.len() {
-        let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("4 bytes")) as usize;
-        // a zero or short length would slice backwards; it is a torn tail
-        if len < RECORD_FIXED_LEN || off + 4 + len > raw.len() {
-            break;
-        }
-        let payload = &raw[off + 8..off + 4 + len];
-        last = Some(u64::from_le_bytes(
-            payload[0..8].try_into().expect("8 bytes"),
-        ));
-        off += 4 + len;
-    }
-    Ok(last)
-}
-
-/// 16 bytes from the OS RNG. A deterministic hash is not an incarnation id:
-/// two journals opened in the same second would share coordinates.
-fn random_generation() -> [u8; 16] {
-    let mut generation = [0u8; 16];
-    if let Ok(mut f) = File::open("/dev/urandom") {
-        if f.read_exact(&mut generation).is_ok() {
-            return generation;
-        }
-    }
-    let mut h = blake3::Hasher::new();
-    h.update(b"snap-journal-generation\0");
-    h.update(&now_ts().to_le_bytes());
-    h.update(&std::process::id().to_le_bytes());
-    h.update(
-        &std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-            .to_le_bytes(),
-    );
-    generation.copy_from_slice(&h.finalize().as_bytes()[..16]);
-    generation
-}
-
-/// Durable writer state: everything a reopen needs without trusting file names.
-#[derive(Debug, Clone, Copy)]
-struct WriterState {
-    next_seq: u64,
-    generation: [u8; 16],
-}
-
-fn read_state(dir: &Path) -> Result<Option<WriterState>, Error> {
-    let Ok(raw) = std::fs::read(dir.join("state.json")) else {
-        return Ok(None);
-    };
-    let v: serde_json::Value =
-        serde_json::from_slice(&raw).map_err(|e| Error::BadMeta(e.to_string()))?;
-    let Some(next_seq) = v["next_seq"].as_u64() else {
-        return Ok(None);
-    };
-    let Some(generation) = v["generation"].as_str().and_then(parse_hex16) else {
-        return Ok(None);
-    };
-    Ok(Some(WriterState {
-        next_seq,
-        generation,
-    }))
-}
-
-fn write_state(dir: &Path, state: WriterState) -> Result<(), Error> {
-    let tmp = dir.join(".state.json.tmp");
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(
-            serde_json::to_vec(&serde_json::json!({
-                "next_seq": state.next_seq,
-                "generation": hex(&state.generation),
-            }))
-            .map_err(|e| Error::BadMeta(e.to_string()))?
-            .as_slice(),
-        )?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, dir.join("state.json"))?;
-    File::open(dir)?.sync_all()?;
-    Ok(())
-}
-
-/// Segments in creation order.
-fn segment_paths(dir: &Path) -> Result<Vec<PathBuf>, Error> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("segment-") && n.ends_with(".log"))
-        })
-        .collect();
+fn existing_generation(dir: &Path) -> Result<Option<[u8; 16]>, Error> {
+    let mut paths = segment_paths(dir)?;
     paths.sort();
-    Ok(paths)
-}
-
-fn parse_hex16(s: &str) -> Option<[u8; 16]> {
-    let bytes = s.as_bytes();
-    if bytes.len() != 32 || !bytes.iter().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = (bytes[i * 2] as char).to_digit(16)? as u8;
-        let lo = (bytes[i * 2 + 1] as char).to_digit(16)? as u8;
-        *byte = hi << 4 | lo;
-    }
-    Some(out)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-/// Section ids are re-exported so callers can assert a journal round trip did
-/// not change which families the snapshot carries.
-pub const FAMILY_IDS: [u16; 2] = [ID_V4, ID_V6];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prefix_fields_round_trip() {
-        for p in ["1.2.3.0/24", "2001:db8::/32"] {
-            let prefix: IpNet = p.parse().expect("valid prefix");
-            let (family, len, addr) = prefix_fields(prefix);
-            assert_eq!(prefix_from_fields(family, len, &addr), Some(prefix));
+    for path in paths {
+        let raw = std::fs::read(&path)?;
+        if raw.len() >= SEGMENT_HEADER_LEN && &raw[..8] == MAGIC {
+            let mut generation = [0u8; 16];
+            generation.copy_from_slice(&raw[28..44]);
+            return Ok(Some(generation));
         }
     }
+    Ok(None)
+}
 
-    #[test]
-    fn value_encoding_round_trip() {
-        let bytes = u32::encode(&42u32).expect("encode");
-        let back: u32 = u32::decode(&bytes).expect("decode");
-        assert_eq!(back, 42);
+fn random_generation() -> [u8; 16] {
+    let mut out = [0u8; 16];
+    if let Ok(mut f) = File::open("/dev/urandom") {
+        if f.read_exact(&mut out).is_ok() {
+            return out;
+        }
     }
+    let h = blake3::hash(&std::process::id().to_le_bytes());
+    out.copy_from_slice(&h.as_bytes()[..16]);
+    out
+}
+
+fn pad32(bytes: &[u8; 16]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(bytes);
+    out
 }

@@ -9,6 +9,7 @@ readme = "README.md"
 description = "Versioned, memory-mappable container for prefix tries, with an append-only journal"
 keywords = ["bgp", "prefix", "trie", "snapshot", "mmap"]
 categories = ["network-programming", "data-structures", "filesystem"]
+exclude = ["tests/downstream"]
 
 [features]
 default = []
@@ -30,11 +31,6 @@ clap = { version = "4", features = ["derive"], optional = true }
 [[bin]]
 name = "snap"
 path = "src/bin/snap.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "gen-fixture"
-path = "src/bin/gen_fixture.rs"
 required-features = ["cli"]
 
 [profile.release]
