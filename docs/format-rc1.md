@@ -1,3 +1,7 @@
+> Archived. This is the layout that shipped with 1.0.0-rc.1 (META section, JSON
+> metadata, per-section hashes). It is kept only so a reader can tell what
+> changed. The current contract is [`format.md`](format.md).
+
 Status: 1.0-rc1. The layout below is frozen for the release candidate; see section 11 for the limitations that remain before 1.0 final.
 
 # snap format 1.0
