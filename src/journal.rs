@@ -299,6 +299,11 @@ where
                 self.seq = record.seq + 1;
             }
         }
+        if self.payload.is_none() && !self.blob.is_empty() {
+            return Err(Error::BadRecord(
+                "journal holds blobs but was opened without a payload section",
+            ));
+        }
         if let Some(committed) = state.as_ref().map(|s| s.next_seq) {
             // a record the state file committed to must be on disk; only the
             // last unacknowledged one may be missing after a tear
@@ -391,6 +396,9 @@ where
     }
 
     pub fn withdraw(&mut self, prefix: IpNet) -> Result<u64, Error> {
+        // log first: if the append fails, the tree must still hold what the
+        // previous record promised, or a later checkpoint would drop it
+        let seq = self.append(KIND_WITHDRAW, prefix, &[], &[])?;
         match prefix {
             IpNet::V4(p) => {
                 self.v4.remove(&p);
@@ -399,7 +407,7 @@ where
                 self.v6.remove(&p);
             }
         }
-        self.append(KIND_WITHDRAW, prefix, &[], &[])
+        Ok(seq)
     }
 
     fn append(&mut self, kind: u8, prefix: IpNet, value: &[u8], blob: &[u8]) -> Result<u64, Error> {

@@ -653,3 +653,29 @@ fn checkpoints_without_a_state_file_are_refused() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_journal_holding_blobs_cannot_reopen_without_its_payload_section() {
+    let dir = std::env::temp_dir().join(format!("snap-blobnone-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [21u8; 16];
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        j.insert_with_blob(
+            "10.0.0.0/8".parse().unwrap(),
+            &PathRef { off: 0, len: 4 },
+            b"abcd",
+        )
+        .unwrap();
+        j.sync().unwrap();
+        // no checkpoint yet: the arena lives only in the segments
+    }
+    let opened = Journal::<PathRef>::open(&log, tree_id, None);
+    assert!(
+        opened.is_err(),
+        "reopening without the payload section would drop the arena at the next checkpoint"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

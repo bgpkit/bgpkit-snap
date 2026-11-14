@@ -55,10 +55,9 @@ the three tail fields are bookkeeping.
 
 Offsets are computed: sections are packed in ascending id order, each starting at
 the first 16-byte boundary at or after the previous end. Nothing to disagree
-about, one less field to lie. The bytes skipped to reach that boundary are zero:
-a reader never interprets padding, but the content id covers it, so a writer that
-filled it with anything else would produce a different identity for the same
-content.
+about, one less field to lie. The bytes skipped to reach that boundary are zero,
+and a reader refuses an object where they are not, because two writers must agree
+on what they emit even though the padding is outside the content id.
 
 No per-section hashes. `content_id` covers every section, so a corrupt object is
 caught at open; locating which section is damaged is not a requirement anyone has
