@@ -143,16 +143,72 @@ journal.checkpoint(&opts) -> Result<PathBuf>     // verified before pruning
 journal.len()
 ```
 
-A record is `len | crc32c | seq | recv_ts | event_ts | kind | family | plen |
-flags | addr[16] | value_len | value | blob_len | blob`.
+### Journal bytes
 
-The trailing blob is what makes handle values work: a value may point into a
-payload section, and the bytes it points at travel in the same record, so replay
-rebuilds the section in record order and every offset reproduces exactly.
+A journal is a directory: `writer.lock`, `state.json`, `segment-<n>.log` and
+`snapshot-<seq>.snap`. All integers are little-endian.
 
-`checkpoint` builds an ordinary object, verifies it end to end with the payload
-section the journal knows about, writes and fsyncs it, and only then is a
-segment eligible for deletion.
+A segment starts with a 48-byte header:
+
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 8 | magic `BGPKLOG\0` |
+| 8 | 2 | version, 4 |
+| 10 | 2 | flags, 0 |
+| 12 | 16 | tree id |
+| 28 | 16 | generation |
+| 44 | 4 | reserved, zero |
+
+A record is framed `len u32 | crc32c u32 | payload`. `len` counts the crc field
+and the payload. `crc32c` covers the payload only. The payload is:
+
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 8 | sequence number |
+| 8 | 8 | receive time, unix seconds |
+| 16 | 8 | event time, unix seconds |
+| 24 | 1 | kind: 1 insert, 2 withdraw |
+| 25 | 1 | family: 4 or 6 |
+| 26 | 1 | prefix length |
+| 27 | 1 | flags, 0 |
+| 28 | 16 | address, IPv4 in the first four bytes |
+| 44 | 4 | value length |
+| 48 | value length | value, the profile's archive bytes |
+| 48 + value length | 4 | blob length |
+| 52 + value length | blob length | blob |
+
+Replay stops at the first frame whose length runs past the file or whose crc
+does not match: that is a torn tail, and the records after it are not trusted.
+A record may be skipped only because a checkpoint already covers its sequence
+number. Missing numbers below the committed `next_seq` are an error, not a
+silent gap.
+
+`state.json` is the commit record: `next_seq`, `tree_id`, `generation` and,
+once a checkpoint exists, `checkpoint: {seq, file}`. It is written atomically
+after an fsync of the segment or the snapshot, so a checkpoint can only be
+named by a state file that survived.
+
+Recovery order: load the named checkpoint, replay records above its sequence
+number, refuse to hand out a number at or below `next_seq`, and prune a segment
+only when every record in it is covered by a checkpoint.
+
+Test vector, two records and a checkpoint:
+
+```text
+header  4247504b4c4f47000400000011111111111111111111111111111111
+        a45dcf8dbf5e5788127306e4ed964efb00000000
+record  3c000000e8faa880 0100000000000000 0000000000000000 0000000000000000
+        01 04 08 00 0a000000 000000000000000000000000 04000000 07000000
+        00000000
+record  4300000037180cdd 0200000000000000 0000000000000000 0000000000000000
+        01 04 18 00 c0000200 000000000000000000000000 04000000 09000000
+        07000000 7061796c6f6164
+state   {"checkpoint":{"file":"snapshot-3.snap","seq":2},
+        "generation":"a45dcf8dbf5e5788127306e4ed964efb",
+        "next_seq":3,"tree_id":"11111111111111111111111111111111"}
+```
+
+`examples/journal_vector.rs` regenerates these bytes.
 
 ## 4. Acceptance
 

@@ -17,6 +17,7 @@ use prefix_trie::PrefixMap;
 
 use crate::header::KIND_PAYLOAD;
 use crate::{Codec, Error, ExtraSection, Opts, Snapshot, Writer};
+use rkyv::rancor::Error as RkyvError;
 
 const MAGIC: &[u8; 8] = b"BGPKLOG\0";
 const SEGMENT_HEADER_LEN: usize = 48;
@@ -56,6 +57,7 @@ pub struct Journal<T: Codec> {
     generation: [u8; 16],
     stream: crate::StreamRef,
     seg: Segment,
+    seg_path: PathBuf,
     seq: u64,
     base_seq: u64,
     v4: PrefixMap<ipnet::Ipv4Net, T>,
@@ -66,9 +68,8 @@ pub struct Journal<T: Codec> {
 
 impl<T: Codec> Journal<T>
 where
-    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<
-        rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
-    >,
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
+        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
 {
     /// Open a journal, recovering the tree from the last checkpoint plus the
     /// segments. The generation is reused when a journal already exists.
@@ -88,7 +89,12 @@ where
         fs2::FileExt::try_lock_exclusive(&lock)
             .map_err(|_| Error::BadRecord("another writer holds this journal"))?;
 
-        let generation = existing_generation(&dir)?.unwrap_or_else(random_generation);
+        let state = read_state(&dir)?;
+        let generation = state
+            .as_ref()
+            .map(|s| s.generation)
+            .or(existing_generation(&dir)?)
+            .unwrap_or_else(random_generation);
         // a new segment, never the existing ones: reopening must not truncate
         let index = segment_paths(&dir)?
             .iter()
@@ -120,6 +126,7 @@ where
                 file: BufWriter::new(seg_file),
                 bytes: 0,
             },
+            seg_path: seg_path.clone(),
             seq: 1,
             base_seq: 0,
             v4: PrefixMap::new(),
@@ -127,7 +134,7 @@ where
             blob: Vec::new(),
             payload,
         };
-        journal.recover()?;
+        journal.recover(state)?;
         journal.write_segment_header()?;
         Ok(journal)
     }
@@ -145,11 +152,44 @@ where
         Ok(())
     }
 
-    /// Replay every segment on disk into the tree and the arena.
-    fn recover(&mut self) -> Result<(), Error> {
+    /// Recover the tree: the committed checkpoint first, then the records after
+    /// it. A checkpoint that has been written and fsynced is the state, so a
+    /// lost or truncated segment after it costs only the records on top.
+    fn recover(&mut self, state: Option<State>) -> Result<(), Error> {
+        if let Some((base, file)) = state.as_ref().and_then(|s| s.checkpoint.clone()) {
+            let path = self.dir.join(&file);
+            let raw = std::fs::read(&path)
+                .map_err(|_| Error::BadRecord("checkpoint named by state.json is missing"))?;
+            struct KnownPayload(Option<u16>);
+            impl crate::Validator for KnownPayload {
+                fn knows(&self, entry: &crate::Entry) -> bool {
+                    Some(entry.id) == self.0
+                }
+            }
+            let snap: Snapshot<T> =
+                Snapshot::from_bytes_with(&raw, &KnownPayload(self.payload.map(|p| p.id)))?;
+            for (p, v) in snap.v4().map(|m| m.iter()).into_iter().flatten() {
+                if let Ok(value) = rkyv::deserialize::<T, RkyvError>(v) {
+                    self.v4.insert(p, value);
+                }
+            }
+            for (p, v) in snap.v6().map(|m| m.iter()).into_iter().flatten() {
+                if let Ok(value) = rkyv::deserialize::<T, RkyvError>(v) {
+                    self.v6.insert(p, value);
+                }
+            }
+            if let Some(payload) = self.payload {
+                if let Some(bytes) = snap.section_bytes(payload.id) {
+                    self.blob = bytes.to_vec();
+                }
+            }
+            self.base_seq = base;
+            self.seq = base + 1;
+        }
+
         let mut paths = segment_paths(&self.dir)?;
         paths.sort();
-        let mut expected: Option<u64> = Some(1);
+        let mut expected: Option<u64> = Some(self.base_seq + 1);
         for path in paths {
             let mut raw = Vec::new();
             File::open(&path)?.read_to_end(&mut raw)?;
@@ -172,6 +212,10 @@ where
                 }
                 off += 4 + len;
                 let record = parse_record(payload)?;
+                if record.seq <= self.base_seq {
+                    // covered by the checkpoint this journal recovered from
+                    continue;
+                }
                 if let Some(want) = expected {
                     if record.seq != want && record.seq != want + 1 {
                         // one unacked record may be missing after a tear
@@ -186,7 +230,18 @@ where
                 self.seq = record.seq + 1;
             }
         }
-        self.base_seq = self.seq.saturating_sub(1);
+        if let Some(committed) = state.as_ref().map(|s| s.next_seq) {
+            // a record the state file committed to must be on disk; only the
+            // last unacknowledged one may be missing after a tear
+            let last = self.seq.saturating_sub(1);
+            if committed > self.base_seq + 1 && last < committed - 1 {
+                return Err(Error::SequenceGap {
+                    expected: last + 1,
+                    found: committed,
+                });
+            }
+            self.seq = self.seq.max(committed);
+        }
         self.stream.base_seq = self.base_seq;
         Ok(())
     }
@@ -304,23 +359,13 @@ where
     pub fn sync(&mut self) -> Result<(), Error> {
         self.seg.file.flush()?;
         self.seg.file.get_ref().sync_all()?;
-        let state = serde_json::json!({
-            "next_seq": self.seq,
-            "generation": crate::header::hex32(&pad32(&self.generation)),
-            "tree_id": crate::header::hex32(&pad32(&self.tree_id)),
-        });
-        let tmp = self.dir.join(".state.json.tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(
-                serde_json::to_vec(&state)
-                    .map_err(|_| Error::BadRecord("state"))?
-                    .as_slice(),
-            )?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, self.dir.join("state.json"))?;
-        File::open(&self.dir)?.sync_all()?;
+        let state = State {
+            next_seq: self.seq,
+            generation: self.generation,
+            tree_id: self.tree_id,
+            checkpoint: read_state(&self.dir)?.and_then(|s| s.checkpoint),
+        };
+        write_state(&self.dir, &state)?;
         Ok(())
     }
 
@@ -367,6 +412,9 @@ where
         }
         let snap: Snapshot<T> =
             Snapshot::from_bytes_with(&bytes, &KnownPayload(self.payload.map(|p| p.id)))?;
+        if snap.len() != self.len() {
+            return Err(Error::BadRecord("checkpoint does not hold the live tree"));
+        }
         let name = format!("snapshot-{}.snap", self.seq);
         let path = self.dir.join(&name);
         let tmp = self.dir.join(format!(".{name}.tmp"));
@@ -377,11 +425,32 @@ where
         }
         std::fs::rename(&tmp, &path)?;
         File::open(&self.dir)?.sync_all()?;
-        println!(
-            "checkpoint {} entries, id {}",
-            snap.len(),
-            snap.content_id()
-        );
+
+        // commit the checkpoint: from here on, recovery starts from this object
+        let covered = self.seq.saturating_sub(1);
+        write_state(
+            &self.dir,
+            &State {
+                next_seq: self.seq,
+                generation: self.generation,
+                tree_id: self.tree_id,
+                checkpoint: Some((covered, name.clone())),
+            },
+        )?;
+        self.base_seq = covered;
+        self.stream.base_seq = covered;
+
+        // only now may a fully covered segment go; the open segment never does
+        for segment in segment_paths(&self.dir)? {
+            if segment == self.seg_path {
+                continue;
+            }
+            if let Some(max) = segment_max_seq(&segment)? {
+                if max <= covered {
+                    std::fs::remove_file(&segment)?;
+                }
+            }
+        }
         Ok(path)
     }
 
@@ -467,6 +536,97 @@ fn prefix_from_fields(family: u8, len: u8, addr: &[u8; 16]) -> Option<IpNet> {
     }
 }
 
+/// The durable commit record: what the journal promises survives a crash.
+struct State {
+    next_seq: u64,
+    generation: [u8; 16],
+    tree_id: [u8; 16],
+    /// `(base_seq, file name)` of the newest verified checkpoint.
+    checkpoint: Option<(u64, String)>,
+}
+
+fn read_state(dir: &Path) -> Result<Option<State>, Error> {
+    let path = dir.join("state.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(None);
+    };
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| Error::BadRecord("state.json is not json"))?;
+    let next_seq = v["next_seq"]
+        .as_u64()
+        .ok_or(Error::BadRecord("state.json has no next_seq"))?;
+    let mut generation = [0u8; 16];
+    let mut tree_id = [0u8; 16];
+    crate::header::hex_to_bytes(
+        v["generation"].as_str().unwrap_or_default(),
+        &mut generation,
+    )?;
+    crate::header::hex_to_bytes(v["tree_id"].as_str().unwrap_or_default(), &mut tree_id)?;
+    let checkpoint = v["checkpoint"].as_object().and_then(|c| {
+        Some((
+            c.get("seq")?.as_u64()?,
+            c.get("file")?.as_str()?.to_string(),
+        ))
+    });
+    Ok(Some(State {
+        next_seq,
+        generation,
+        tree_id,
+        checkpoint,
+    }))
+}
+
+fn write_state(dir: &Path, state: &State) -> Result<(), Error> {
+    let mut v = serde_json::json!({
+        "next_seq": state.next_seq,
+        "generation": crate::header::hex16(&state.generation),
+        "tree_id": crate::header::hex16(&state.tree_id),
+    });
+    if let Some((seq, file)) = &state.checkpoint {
+        v["checkpoint"] = serde_json::json!({ "seq": seq, "file": file });
+    }
+    let tmp = dir.join(".state.json.tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(
+            serde_json::to_vec(&v)
+                .map_err(|_| Error::BadRecord("state"))?
+                .as_slice(),
+        )?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join("state.json"))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// The highest sequence number in a segment, or `None` when it holds no intact
+/// record. Used to decide whether a checkpoint fully covers it.
+fn segment_max_seq(path: &Path) -> Result<Option<u64>, Error> {
+    let raw = std::fs::read(path)?;
+    if raw.len() < SEGMENT_HEADER_LEN || &raw[..8] != MAGIC {
+        return Ok(None);
+    }
+    let mut off = SEGMENT_HEADER_LEN;
+    let mut max: Option<u64> = None;
+    while off + 8 <= raw.len() {
+        let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("4")) as usize;
+        if len < RECORD_FIXED_LEN || off + 4 + len > raw.len() {
+            break;
+        }
+        let crc = u32::from_le_bytes(raw[off + 4..off + 8].try_into().expect("4"));
+        let payload = &raw[off + 8..off + 4 + len];
+        if crc32c::crc32c(payload) != crc {
+            break;
+        }
+        if let Ok(record) = parse_record(payload) {
+            max = Some(max.map_or(record.seq, |m: u64| m.max(record.seq)));
+        }
+        off += 4 + len;
+    }
+    Ok(max)
+}
+
 fn segment_paths(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -505,11 +665,5 @@ fn random_generation() -> [u8; 16] {
     }
     let h = blake3::hash(&std::process::id().to_le_bytes());
     out.copy_from_slice(&h.as_bytes()[..16]);
-    out
-}
-
-fn pad32(bytes: &[u8; 16]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out[..16].copy_from_slice(bytes);
     out
 }

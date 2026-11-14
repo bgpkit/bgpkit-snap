@@ -314,3 +314,76 @@ fn children_are_limited_to_the_requested_prefix() {
     assert!(siblings.contains(&"10.0.0.0/8".to_string()));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn recovery_keeps_a_committed_checkpoint_when_a_segment_is_lost() {
+    let dir = std::env::temp_dir().join(format!("snap-recover-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [3u8; 16];
+
+    let seq = {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).expect("open");
+        let seq = j
+            .insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 0 })
+            .expect("insert");
+        j.sync().expect("sync");
+        j.checkpoint(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            window: None,
+            stream: None,
+            extras: &[],
+        })
+        .expect("checkpoint");
+        seq
+    };
+
+    // simulate the post-checkpoint segment being lost: the checkpoint is the
+    // state, and the next sequence number must not be handed out twice
+    for entry in std::fs::read_dir(&log).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("segment-"))
+        {
+            std::fs::write(&path, b"").unwrap();
+        }
+    }
+
+    let mut j: Journal<PathRef> =
+        Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).expect("reopen");
+    assert_eq!(j.len(), 1, "the checkpoint must be the recovered state");
+    let next = j
+        .insert("192.0.2.0/24".parse().unwrap(), &PathRef { off: 0, len: 0 })
+        .expect("insert after recovery");
+    assert!(next > seq, "sequence {next} reused {seq}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_empty_tree_can_be_checkpointed() {
+    let dir = std::env::temp_dir().join(format!("snap-empty-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let mut j: Journal<PathRef> = Journal::open(&log, [4u8; 16], None).expect("open");
+    j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 0 })
+        .unwrap();
+    j.withdraw("10.0.0.0/8".parse().unwrap()).unwrap();
+    assert!(j.is_empty());
+
+    let path = j
+        .checkpoint(&Opts {
+            created_at: "2026-11-14T00:00:00Z",
+            window: None,
+            stream: None,
+            extras: &[],
+        })
+        .expect("an empty tree is a legal object");
+    let snap: Snapshot<PathRef> = Snapshot::open(path.to_str().unwrap()).expect("open");
+    assert_eq!(snap.len(), 0);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

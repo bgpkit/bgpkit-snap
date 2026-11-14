@@ -219,9 +219,6 @@ impl Header {
         if table_end > self.file_len {
             return Err(Error::BadHeader("table runs past the file"));
         }
-        if self.section_count == 0 {
-            return Err(Error::BadHeader("object has no sections"));
-        }
         Ok(())
     }
 }
@@ -274,6 +271,33 @@ impl Entry {
 
 pub fn hex32(bytes: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Decode a 32-character hex string into 16 bytes, for callers that persist
+/// identities as text.
+pub fn hex_to_bytes(s: &str, out: &mut [u8; 16]) -> Result<(), crate::Error> {
+    if s.len() != 32 || !s.is_ascii() {
+        return Err(crate::Error::BadHeader("hex identity has the wrong length"));
+    }
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = (s.as_bytes()[i * 2] as char)
+            .to_digit(16)
+            .ok_or(crate::Error::BadHeader("hex identity is not hex"))?;
+        let lo = (s.as_bytes()[i * 2 + 1] as char)
+            .to_digit(16)
+            .ok_or(crate::Error::BadHeader("hex identity is not hex"))?;
+        *byte = ((hi << 4) | lo) as u8;
+    }
+    Ok(())
+}
+
+/// A 16-byte identity as 32 hex characters, the form `state.json` keeps.
+pub fn hex16(bytes: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
     }

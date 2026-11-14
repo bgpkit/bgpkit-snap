@@ -260,9 +260,6 @@ impl<T: SnapValue> Writer<T> {
                 extra.bytes,
             ));
         }
-        if sections.is_empty() {
-            return Err(Error::BadHeader("object has no sections"));
-        }
         sections.sort_by_key(|(e, _)| e.id);
 
         let table_len = sections.len() * ENTRY_LEN;
