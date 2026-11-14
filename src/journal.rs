@@ -56,8 +56,9 @@ pub struct Journal<T: Codec> {
     tree_id: [u8; 16],
     generation: [u8; 16],
     stream: crate::StreamRef,
-    seg: Segment,
-    seg_path: PathBuf,
+    seg: Option<Segment>,
+    seg_path: Option<PathBuf>,
+    seg_index: u64,
     seq: u64,
     base_seq: u64,
     v4: PrefixMap<ipnet::Ipv4Net, T>,
@@ -107,11 +108,6 @@ where
             })
             .max()
             .map_or(1, |m| m + 1);
-        let seg_path = dir.join(format!("segment-{index:012}.log"));
-        let seg_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&seg_path)?;
         let mut journal = Journal {
             _lock: lock,
             dir: dir.clone(),
@@ -122,11 +118,9 @@ where
                 generation,
                 base_seq: 0,
             },
-            seg: Segment {
-                file: BufWriter::new(seg_file),
-                bytes: 0,
-            },
-            seg_path: seg_path.clone(),
+            seg: None,
+            seg_path: None,
+            seg_index: index,
             seq: 1,
             base_seq: 0,
             v4: PrefixMap::new(),
@@ -135,11 +129,26 @@ where
             payload,
         };
         journal.recover(state)?;
-        journal.write_segment_header()?;
         Ok(journal)
     }
 
+    /// Create this session's segment. Called on the first append, so a journal
+    /// that is opened and closed without writes leaves no empty file.
+    fn open_segment(&mut self) -> Result<(), Error> {
+        let path = self.dir.join(format!("segment-{:012}.log", self.seg_index));
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        self.seg = Some(Segment {
+            file: BufWriter::new(file),
+            bytes: 0,
+        });
+        self.seg_path = Some(path);
+        self.write_segment_header()
+    }
+
     fn write_segment_header(&mut self) -> Result<(), Error> {
+        let Some(seg) = self.seg.as_mut() else {
+            return Ok(());
+        };
         let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
         header.extend_from_slice(MAGIC);
         header.extend_from_slice(&4u16.to_le_bytes());
@@ -147,8 +156,8 @@ where
         header.extend_from_slice(&self.tree_id);
         header.extend_from_slice(&self.generation);
         header.extend_from_slice(&[0u8; 4]);
-        self.seg.file.write_all(&header)?;
-        self.seg.bytes = SEGMENT_HEADER_LEN as u64;
+        seg.file.write_all(&header)?;
+        seg.bytes = SEGMENT_HEADER_LEN as u64;
         Ok(())
     }
 
@@ -345,20 +354,26 @@ where
         payload.extend_from_slice(&(blob.len() as u32).to_le_bytes());
         payload.extend_from_slice(blob);
 
+        if self.seg.is_none() {
+            self.open_segment()?;
+        }
         let len = (payload.len() + 4) as u32;
         let crc = crc32c::crc32c(&payload);
-        self.seg.file.write_all(&len.to_le_bytes())?;
-        self.seg.file.write_all(&crc.to_le_bytes())?;
-        self.seg.file.write_all(&payload)?;
-        self.seg.bytes += 4 + payload.len() as u64;
+        let seg = self.seg.as_mut().expect("segment just opened");
+        seg.file.write_all(&len.to_le_bytes())?;
+        seg.file.write_all(&crc.to_le_bytes())?;
+        seg.file.write_all(&payload)?;
+        seg.bytes += 4 + payload.len() as u64;
         self.seq += 1;
         Ok(seq)
     }
 
     /// A record is durable once this returns.
     pub fn sync(&mut self) -> Result<(), Error> {
-        self.seg.file.flush()?;
-        self.seg.file.get_ref().sync_all()?;
+        if let Some(seg) = self.seg.as_mut() {
+            seg.file.flush()?;
+            seg.file.get_ref().sync_all()?;
+        }
         let state = State {
             next_seq: self.seq,
             generation: self.generation,
@@ -442,7 +457,7 @@ where
 
         // only now may a fully covered segment go; the open segment never does
         for segment in segment_paths(&self.dir)? {
-            if segment == self.seg_path {
+            if Some(&segment) == self.seg_path.as_ref() {
                 continue;
             }
             if let Some(max) = segment_max_seq(&segment)? {

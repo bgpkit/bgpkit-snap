@@ -387,3 +387,82 @@ fn an_empty_tree_can_be_checkpointed() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_torn_tail_costs_only_the_uncommitted_record() {
+    let dir = std::env::temp_dir().join(format!("snap-torn-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [7u8; 16];
+
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).expect("open");
+        for p in ["10.0.0.0/8", "192.0.2.0/24", "198.51.100.0/24"] {
+            j.insert(p.parse().unwrap(), &PathRef { off: 0, len: 0 })
+                .unwrap();
+        }
+        j.sync().expect("sync");
+    }
+
+    // a half-written record: length and crc written, payload cut short
+    let mut segment = std::fs::read_dir(&log)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.to_string_lossy().contains("segment-"))
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap();
+        f.write_all(&64u32.to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&[0u8; 20]).unwrap();
+    }
+
+    let j: Journal<PathRef> =
+        Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).expect("reopen");
+    assert_eq!(j.len(), 3, "the three committed records must survive");
+
+    // a checkpoint after a torn tail must cover what is left, and then the
+    // segment it covers is the one that may go
+    drop(j);
+    let mut j: Journal<PathRef> =
+        Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).expect("reopen");
+    j.checkpoint(&Opts {
+        created_at: "2026-11-14T00:00:00Z",
+        window: None,
+        stream: None,
+        extras: &[],
+    })
+    .expect("checkpoint over a torn tail");
+    let leftovers: Vec<String> = std::fs::read_dir(&log)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("segment-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "every covered segment is gone: {leftovers:?}"
+    );
+
+    // the next record starts a new segment at the next number
+    j.insert(
+        "203.0.113.0/24".parse().unwrap(),
+        &PathRef { off: 0, len: 0 },
+    )
+    .unwrap();
+    j.sync().unwrap();
+    let after: Vec<String> = std::fs::read_dir(&log)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("segment-"))
+        .collect();
+    assert_eq!(after.len(), 1, "one segment for the new record: {after:?}");
+    segment.pop();
+    std::fs::remove_dir_all(&dir).ok();
+}
