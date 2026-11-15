@@ -11,7 +11,9 @@ tries and their sections, not of the file: `created_at` and the rest of the
 provenance in the header are deliberately outside it. A journal turns a live, mutable tree into the
 next snapshot without losing updates.
 
-Status: **1.0.0-rc.3**. The layout is frozen for release candidates; see
+Status: **unreleased**, tracks `main`. The published `1.0.0-rc.3` predates the owned
+view, `TreeId`, `to_snapshot` and the journal durability fix; do not pair it with this
+page. The layout is frozen for release candidates; see
 [Scope](#scope-and-what-this-is-not) and [Known limitations](#known-limitations)
 before depending on it.
 
@@ -106,7 +108,7 @@ println!("{} sections, type {}", header.section_count, header.type_id_str());
 ```
 
 The CLI does the same from a shell (install it with
-`cargo install bgpkit-snap --version 1.0.0-rc.4 --features cli`). It builds and searches `snap.u32:v1`
+`cargo install --git https://github.com/bgpkit/bgpkit-snap --features cli`). It builds and searches `snap.u32:v1`
 objects only, from a JSONL file of `{"prefix": "10.0.0.0/8", "value": 7}` lines:
 
 ```sh

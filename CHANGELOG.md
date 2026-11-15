@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+The release that makes the surface small enough to describe without a table of
+near-duplicates, and the one that makes the journal's durability claim true.
+
+API
+
+- `snap.owned()` answers every value-returning query with `T`; `search_owned` and
+  `get_exact_owned` are gone, because a pair of owned methods covered two queries out
+  of five and left the rest to the caller's own `rkyv` call.
+- `TreeId` with `TreeId::from_name("...")` (the first 16 bytes of its BLAKE3 hash).
+  `Journal::open`, `open_with` and `repair` take `impl Into<TreeId>`, so a plain
+  `[u8; 16]` still works and no example has to invent sixteen bytes.
+- `Journal::to_snapshot(&opts)` and `Journal::to_bytes(&opts)`: the object a
+  checkpoint would write, opened or as bytes, without touching the disk. This is how
+  a journal user reaches `children`, `cover` and `iter` without a second copy of the
+  query surface on the journal.
+- `Writer::insert_many` stops at the first refused prefix. `Writer` deliberately does
+  not implement `Extend`, which cannot report that.
+- five queries removed because they were compositions of the others: `lpm_prefix`,
+  `spm_prefix`, `get_key_value`, `cover_keys`, `cover_values`.
+- `Error::BadArchive(u16)` separates "this section's body is not an archive of your
+  type" from `BadSectionKind`, which is about the four-byte kind tag.
+
+Journal
+
+- rotation flushes and fsyncs the outgoing segment before dropping it, and keeps the
+  segment if that fails. Previously `sync()` returned Ok while the records in a
+  rotated segment had never reached stable storage.
+- the torn-tail cut runs before rotation, so a recovery offset recorded against the
+  old segment is not applied to the new one.
+- `checkpoint` refuses a required `extras` section it cannot reopen, and recovery
+  ignores a caller's optional sidecar instead of refusing the checkpoint that
+  carried it.
+
+Verification
+
+- tests: reopen after a checkpoint with a sidecar, a required sidecar refused, host
+  bits refused on the blob and withdraw paths, a journal crossing the 64 MiB segment
+  boundary reopening with both records, `TreeId` stability and tree mismatch,
+  `to_snapshot`/`to_bytes` without a file, and `insert_many` stopping.
+
 ## 1.0.0-rc.3
 
 The first release where the API is what a developer guide can describe without

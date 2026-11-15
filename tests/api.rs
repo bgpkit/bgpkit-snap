@@ -53,21 +53,20 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
     assert!(snap.contains_key("192.0.2.0/24".parse().unwrap()));
     assert!(!snap.contains_key("192.0.2.128/25".parse().unwrap()));
     assert_eq!(
-        snap.get_key_value("2001:db8::/32".parse().unwrap())
+        snap.lpm("2001:db8:1::/48".parse().unwrap())
             .map(|(p, v)| (p.to_string(), v.0.to_native())),
-        Some(("2001:db8::/32".to_string(), 5))
+        Some(("2001:db8:1::/48".to_string(), 6))
     );
 
-    // longest and shortest covering prefix
+    // longest and least specific covering prefix, key and value together
     assert_eq!(
-        snap.lpm_prefix("10.1.2.128/25".parse().unwrap())
-            .map(|p| p.to_string()),
+        snap.lpm("10.1.2.128/25".parse().unwrap())
+            .map(|(p, _)| p.to_string()),
         Some("10.1.2.0/24".to_string())
     );
-    // spm is the least specific prefix that contains the query
     assert_eq!(
-        snap.spm_prefix("10.1.2.0/24".parse().unwrap())
-            .map(|p| p.to_string()),
+        snap.spm("10.1.2.0/24".parse().unwrap())
+            .map(|(p, _)| p.to_string()),
         Some("10.0.0.0/8".to_string())
     );
 
@@ -101,22 +100,8 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
         .collect();
     assert!(cover.contains(&"10.1.0.0/16".to_string()), "{cover:?}");
 
-    // values, cover keys and values, and the address counts
+    // values, and the address counts
     assert_eq!(snap.values().count(), 6);
-    let cover_keys: Vec<String> = snap
-        .cover_keys("10.1.2.0/24".parse().unwrap())
-        .into_iter()
-        .map(|p| p.to_string())
-        .collect();
-    assert!(
-        cover_keys.contains(&"10.1.0.0/16".to_string()),
-        "{cover_keys:?}"
-    );
-    assert_eq!(
-        snap.cover_values("10.1.2.0/24".parse().unwrap()).len(),
-        snap.cover("10.1.2.0/24".parse().unwrap()).len(),
-        "cover_values and cover agree on how many prefixes cover the query"
-    );
     // the /8 plus the disjoint /24: entries are summed with overlaps counted once
     let (v4, v6) = snap.address_counts();
     assert_eq!(v4, Some(16_777_472), "one /8 plus one /24");
@@ -124,16 +109,25 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
     let empty = Snapshot::<V>::from_bytes(&build_empty()).unwrap();
     assert_eq!(empty.address_counts(), (None, None));
 
-    // owned values, for a caller that does not want to depend on rkyv directly
-    let owned = snap.get_exact_owned("10.1.2.0/24".parse().unwrap());
-    assert_eq!(owned.map(|v| v.0), Some(3));
-    let hit = snap
-        .search_owned(std::net::IpAddr::V4("10.1.2.9".parse().unwrap()))
+    // owned values: the same queries, without naming the archived type
+    let owned = snap.owned();
+    assert_eq!(
+        owned.get_exact("10.1.2.0/24".parse().unwrap()).map(|v| v.0),
+        Some(3)
+    );
+    let hit = owned
+        .search(std::net::IpAddr::V4("10.1.2.9".parse().unwrap()))
         .expect("10.1.2.9 is inside the tree");
     assert_eq!(
         (hit.0.to_string(), hit.1 .0),
         ("10.1.2.0/24".to_string(), 3)
     );
+    // and it covers the queries the old *_owned pair did not
+    // the covering entries of 10.1.2.0/24 are the /8, the /16 and itself
+    assert_eq!(owned.cover("10.1.2.0/24".parse().unwrap()).len(), 3);
+    assert_eq!(owned.children("10.0.0.0/8".parse().unwrap()).len(), 3);
+    assert_eq!(owned.iter().count(), 6);
+    assert_eq!(owned.len(), 6);
 
     std::fs::remove_dir_all(&dir).ok();
 }

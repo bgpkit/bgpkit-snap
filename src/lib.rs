@@ -63,6 +63,8 @@ pub enum Error {
     BadSectionId(u16),
     /// A prefix the caller supplied has host bits set.
     BadPrefix(String),
+    /// A section's body is not a valid archive of the type this reader asked for.
+    BadArchive(u16),
     BadValue,
     // journal
     BadRecord(&'static str),
@@ -100,6 +102,9 @@ impl fmt::Display for Error {
             Error::BadOpts(what) => write!(f, "bad writer option: {what}"),
             Error::BadSectionId(id) => write!(f, "section id {id} cannot be used here"),
             Error::BadPrefix(p) => write!(f, "prefix {p} has host bits set"),
+            Error::BadArchive(id) => {
+                write!(f, "section {id} is not an archive of this value type")
+            }
             Error::BadValue => write!(f, "value could not be decoded"),
             Error::BadRecord(why) => write!(f, "bad journal record: {why}"),
             Error::SequenceGap { expected, found } => {
@@ -180,6 +185,50 @@ where
 /// One section the caller supplies next to the tries: an arena, a sidecar, any
 /// bytes the profile owns. `id` is 16 or higher, `kind` is a four-byte tag, and
 /// `required` makes a reader that does not implement the id refuse the object.
+/// The identity of the tree a journal writes.
+///
+/// A journal refuses a checkpoint that belongs to another tree, so the id is what
+/// stops two feeds from writing into one directory. `from_name` exists because
+/// hand-writing sixteen bytes is the kind of detail a caller gets wrong silently.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TreeId([u8; 16]);
+
+impl TreeId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// A stable id for a human name: the first 16 bytes of its BLAKE3 hash.
+    ///
+    /// The same name always gives the same id, so a service that starts with
+    /// `TreeId::from_name("wayback-roas")` reopens its own journal and a typo in
+    /// the name gives a different journal instead of silently adopting this one.
+    pub fn from_name(name: &str) -> Self {
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&blake3::hash(name.as_bytes()).as_bytes()[..16]);
+        Self(out)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl From<[u8; 16]> for TreeId {
+    fn from(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Display for TreeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ExtraSection<'a> {
     pub id: u16,
@@ -252,6 +301,20 @@ impl<T: SnapValue> Writer<T> {
             IpNet::V6(p) => {
                 self.v6.insert(p, value);
             }
+        }
+        Ok(())
+    }
+
+    /// Insert many entries, stopping at the first prefix that is refused.
+    ///
+    /// `Writer` deliberately does not implement `Extend`: a set that silently
+    /// drops the entries it could not store is worse than a loop that stops.
+    pub fn insert_many(
+        &mut self,
+        entries: impl IntoIterator<Item = (IpNet, T)>,
+    ) -> Result<(), Error> {
+        for (prefix, value) in entries {
+            self.insert(prefix, value)?;
         }
         Ok(())
     }
@@ -413,6 +476,87 @@ impl<T: SnapValue> Writer<T> {
             let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
         }
         Ok(bytes.len() as u64)
+    }
+}
+
+// ---------------------------------------------------------------- owned view
+
+/// The same queries `Snapshot` answers, returning values you own.
+///
+/// `snap.lpm(..)` hands back `&T::Archived`, which is the point of the format but
+/// forces every caller to name the archived type. `snap.owned()` answers the same
+/// questions with `T`. Both views exist for every value-returning query, which is
+/// what a pair of `*_owned` methods got wrong: they covered two queries out of five.
+pub struct Owned<'a, T: SnapValue> {
+    snap: &'a Snapshot<T>,
+}
+
+impl<T: SnapValue> Snapshot<T> {
+    /// Every value-returning query, with the value deserialized.
+    pub fn owned(&self) -> Owned<'_, T> {
+        Owned { snap: self }
+    }
+}
+
+impl<T: SnapValue> Owned<'_, T>
+where
+    T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
+{
+    /// A value that is present but cannot be decoded reads as absent. The archives
+    /// were byte-checked when the object was opened, so this cannot happen to a
+    /// value a writer stored.
+    fn decode(value: &T::Archived) -> Option<T> {
+        rkyv::deserialize::<T, RkyvError>(value).ok()
+    }
+
+    pub fn len(&self) -> usize {
+        self.snap.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.snap.is_empty()
+    }
+
+    /// The entry stored exactly at `prefix`.
+    pub fn get_exact(&self, prefix: IpNet) -> Option<T> {
+        Self::decode(self.snap.get_exact(prefix)?)
+    }
+
+    /// The most specific stored entry covering `addr`.
+    pub fn search(&self, addr: std::net::IpAddr) -> Option<(IpNet, T)> {
+        let (prefix, value) = self.snap.search(addr)?;
+        Some((prefix, Self::decode(value)?))
+    }
+
+    /// The most specific stored entry covering `prefix`.
+    pub fn lpm(&self, prefix: IpNet) -> Option<(IpNet, T)> {
+        let (prefix, value) = self.snap.lpm(prefix)?;
+        Some((prefix, Self::decode(value)?))
+    }
+
+    /// Every stored entry covering `prefix`, most specific first.
+    pub fn cover(&self, prefix: IpNet) -> Vec<(IpNet, T)> {
+        self.snap
+            .cover(prefix)
+            .into_iter()
+            .filter_map(|(p, v)| Some((p, Self::decode(v)?)))
+            .collect()
+    }
+
+    /// `prefix` itself when stored, plus every stored entry under it.
+    pub fn children(&self, prefix: IpNet) -> Vec<(IpNet, T)> {
+        self.snap
+            .children(prefix)
+            .into_iter()
+            .filter_map(|(p, v)| Some((p, Self::decode(v)?)))
+            .collect()
+    }
+
+    /// The whole object, IPv4 then IPv6.
+    pub fn iter(&self) -> impl Iterator<Item = (IpNet, T)> + '_ {
+        self.snap
+            .iter()
+            .filter_map(|(p, v)| Some((p, Self::decode(v)?)))
     }
 }
 
@@ -736,11 +880,11 @@ impl<T: SnapValue> Snapshot<T> {
             match entry.id {
                 ID_V4 => {
                     rkyv::access::<ArchivedPrefixMap<Ipv4Net, T>, RkyvError>(slice)
-                        .map_err(|_| Error::BadSectionKind(ID_V4))?;
+                        .map_err(|_| Error::BadArchive(ID_V4))?;
                 }
                 ID_V6 => {
                     rkyv::access::<ArchivedPrefixMap<Ipv6Net, T>, RkyvError>(slice)
-                        .map_err(|_| Error::BadSectionKind(ID_V6))?;
+                        .map_err(|_| Error::BadArchive(ID_V6))?;
                 }
                 _ => {}
             }
@@ -816,21 +960,6 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
-    /// The stored prefix and its value, when `prefix` is stored as given.
-    pub fn get_key_value(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
-        match prefix {
-            IpNet::V4(p) => self
-                .v4()
-                .and_then(|m| m.get_key_value(&p))
-                .map(|(k, v)| (IpNet::V4(k), v)),
-            IpNet::V6(p) => self
-                .v6()
-                .and_then(|m| m.get_key_value(&p))
-                .map(|(k, v)| (IpNet::V6(k), v)),
-        }
-    }
-
-    /// Whether `prefix` is stored as given.
     pub fn contains_key(&self, prefix: IpNet) -> bool {
         match prefix {
             IpNet::V4(p) => self.v4().is_some_and(|m| m.contains_key(&p)),
@@ -838,13 +967,6 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
-    /// The key of the longest prefix that covers `prefix`.
-    pub fn lpm_prefix(&self, prefix: IpNet) -> Option<IpNet> {
-        self.lpm(prefix).map(|(p, _)| p)
-    }
-
-    /// Least specific prefix that covers `prefix`, and its value. This is
-    /// prefix_trie's `get_spm`: the shortest stored prefix containing the query.
     pub fn spm(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
         match prefix {
             IpNet::V4(p) => self
@@ -858,12 +980,6 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
-    /// The key of the least specific stored prefix that covers `prefix`.
-    pub fn spm_prefix(&self, prefix: IpNet) -> Option<IpNet> {
-        self.spm(prefix).map(|(p, _)| p)
-    }
-
-    /// Whether some stored prefix covers `prefix`.
     pub fn is_covered(&self, prefix: IpNet) -> bool {
         match prefix {
             IpNet::V4(p) => self.v4().is_some_and(|m| m.is_covered(&p)),
@@ -878,31 +994,6 @@ impl<T: SnapValue> Snapshot<T> {
             IpNet::V4(p) => self.v4().is_some_and(|m| m.is_covered_in_aggregate(&p)),
             IpNet::V6(p) => self.v6().is_some_and(|m| m.is_covered_in_aggregate(&p)),
         }
-    }
-
-    /// The value stored exactly at `prefix`, deserialized.
-    ///
-    /// A caller that only reads a scalar should not have to depend on the
-    /// archive library to get it out.
-    /// Note: a value that is present but cannot be deserialized reads as `None`,
-    /// the same as an absent prefix. Use `get_exact` when that distinction
-    /// matters.
-    pub fn get_exact_owned(&self, prefix: IpNet) -> Option<T>
-    where
-        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
-    {
-        let value = self.get_exact(prefix)?;
-        rkyv::deserialize::<T, RkyvError>(value).ok()
-    }
-
-    /// Longest-prefix match for an address, with the value deserialized.
-    pub fn search_owned(&self, addr: std::net::IpAddr) -> Option<(IpNet, T)>
-    where
-        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
-    {
-        let (prefix, value) = self.search(addr)?;
-        let value = rkyv::deserialize::<T, RkyvError>(value).ok()?;
-        Some((prefix, value))
     }
 
     /// Every entry, IPv4 first then IPv6, in trie order.
@@ -959,26 +1050,6 @@ impl<T: SnapValue> Snapshot<T> {
         Box::new(v4.chain(v6))
     }
 
-    /// The keys of the prefixes that cover `prefix`.
-    pub fn cover_keys(&self, prefix: IpNet) -> Vec<IpNet> {
-        match prefix {
-            IpNet::V4(p) => self
-                .v4()
-                .map(|m| m.cover_keys(&p).map(IpNet::V4).collect())
-                .unwrap_or_default(),
-            IpNet::V6(p) => self
-                .v6()
-                .map(|m| m.cover_keys(&p).map(IpNet::V6).collect())
-                .unwrap_or_default(),
-        }
-    }
-
-    /// The values of the prefixes that cover `prefix`.
-    pub fn cover_values(&self, prefix: IpNet) -> Vec<&T::Archived> {
-        self.cover(prefix).into_iter().map(|(_, v)| v).collect()
-    }
-
-    /// How many addresses each family's entries cover, when the trie tracks it.
     pub fn address_counts(&self) -> (Option<u128>, Option<u128>) {
         let v4 = self.v4().and_then(|m| m.address_count()).map(u128::from);
         let v6 = self.v6().and_then(|m| m.address_count());

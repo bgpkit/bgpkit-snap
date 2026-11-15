@@ -102,9 +102,10 @@ where
     /// segments. The generation is reused when a journal already exists.
     pub fn open(
         dir: impl AsRef<Path>,
-        tree_id: [u8; 16],
+        tree_id: impl Into<crate::TreeId>,
         payload: Option<PayloadSection>,
     ) -> Result<Self, Error> {
+        let tree_id = *tree_id.into().as_bytes();
         Self::open_with(dir, tree_id, payload, None)
     }
 
@@ -113,10 +114,11 @@ where
     /// on first use and reused from then on.
     pub fn open_with(
         dir: impl AsRef<Path>,
-        tree_id: [u8; 16],
+        tree_id: impl Into<crate::TreeId>,
         payload: Option<PayloadSection>,
         generation: Option<[u8; 16]>,
     ) -> Result<Self, Error> {
+        let tree_id = *tree_id.into().as_bytes();
         let dir = dir.as_ref().to_path_buf();
         // reject here what a checkpoint would reject later, after data was written
         if tree_id == [0u8; 16] {
@@ -644,9 +646,10 @@ where
     /// and not covered by it is gone.
     pub fn repair(
         dir: impl AsRef<Path>,
-        tree_id: [u8; 16],
+        tree_id: impl Into<crate::TreeId>,
         payload: Option<PayloadSection>,
     ) -> Result<Self, Error> {
+        let tree_id = *tree_id.into().as_bytes();
         let dir = dir.as_ref().to_path_buf();
         // take the writer lock first: writing state before it would overwrite a
         // live writer's commit record on the way to reporting Locked
@@ -727,16 +730,62 @@ where
 
     /// Write and verify a snapshot of the current state, then drop covered
     /// segments. The object is verified end to end before anything is deleted.
-    pub fn checkpoint(&mut self, opts: &Opts<'_>) -> Result<PathBuf, Error> {
+    /// The object this journal would checkpoint, as bytes, without writing or
+    /// pruning anything.
+    ///
+    /// `Snapshot::from_bytes` on the result gives every query the journal itself
+    /// does not answer (`children`, `iter`, `cover`), which is why the journal
+    /// does not grow a second copy of that surface.
+    pub fn to_bytes(&self, opts: &Opts<'_>) -> Result<Vec<u8>, Error> {
+        Self::build_object(
+            &self.v4,
+            &self.v6,
+            self.payload,
+            &self.blob,
+            self.tree_id,
+            self.generation,
+            self.seq.saturating_sub(1),
+            opts,
+        )
+    }
+
+    /// The object as a `Snapshot`, without writing or pruning anything.
+    ///
+    /// The journal can open its own object because it knows the payload section it
+    /// wrote; a plain `Snapshot::from_bytes` cannot, since that section is required.
+    /// This is how a caller reaches `children`, `cover` and `iter`, which the
+    /// journal does not answer itself.
+    pub fn to_snapshot(&self, opts: &Opts<'_>) -> Result<Snapshot<T>, Error> {
+        struct KnownPayload(Option<u16>);
+        impl crate::Validator for KnownPayload {
+            fn knows(&self, entry: &crate::Entry) -> bool {
+                Some(entry.id) == self.0
+            }
+        }
+        let bytes = self.to_bytes(opts)?;
+        Snapshot::from_bytes_with(&bytes, &KnownPayload(self.payload.map(|p| p.id)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_object(
+        v4: &PrefixMap<ipnet::Ipv4Net, T>,
+        v6: &PrefixMap<ipnet::Ipv6Net, T>,
+        payload: Option<PayloadSection>,
+        blob: &[u8],
+        tree_id: [u8; 16],
+        generation: [u8; 16],
+        base_seq: u64,
+        opts: &Opts<'_>,
+    ) -> Result<Vec<u8>, Error> {
         let mut writer = Writer::<T>::new();
         // the journal's own keys are canonical, so these cannot fail; a failure
         // here would mean the in-memory tree holds a prefix it could not have
-        for (p, v) in self.v4.iter() {
+        for (p, v) in v4.iter() {
             writer
                 .insert(IpNet::V4(p), v.clone())
                 .map_err(|_| Error::BadPrefix(p.to_string()))?;
         }
-        for (p, v) in self.v6.iter() {
+        for (p, v) in v6.iter() {
             writer
                 .insert(IpNet::V6(p), v.clone())
                 .map_err(|_| Error::BadPrefix(p.to_string()))?;
@@ -753,7 +802,7 @@ where
             }
         }
         let mut extras: Vec<ExtraSection<'_>> = opts.extras.to_vec();
-        if let Some(payload) = self.payload {
+        if let Some(payload) = payload {
             if extras.iter().any(|e| e.id == payload.id) {
                 return Err(Error::BadSectionId(payload.id));
             }
@@ -761,13 +810,13 @@ where
                 id: payload.id,
                 kind: payload.kind,
                 required: payload.required,
-                bytes: &self.blob,
+                bytes: blob,
             });
         }
         let stream = crate::StreamRef {
-            tree_id: self.tree_id,
-            generation: self.generation,
-            base_seq: self.seq.saturating_sub(1),
+            tree_id,
+            generation,
+            base_seq,
         };
         let opts = Opts {
             created_at: opts.created_at,
@@ -776,6 +825,12 @@ where
             extras: &extras,
         };
         let bytes = writer.finish(&opts)?;
+
+        Ok(bytes)
+    }
+
+    pub fn checkpoint(&mut self, opts: &Opts<'_>) -> Result<PathBuf, Error> {
+        let bytes = self.to_bytes(opts)?;
 
         // verify before pruning: a bad object must not take the history with it.
         // The journal knows which section it just wrote, so it is its own

@@ -105,6 +105,7 @@ pub struct ExtraSection<'a> { pub id: u16, pub kind: [u8;4], pub required: bool,
 
 Writer::<T>::new()
 Writer::insert(prefix, value) -> Result<()>  // replaces an existing value; Err on host bits
+Writer::insert_many(entries) -> Result<()>  // stops at the first refused prefix
 Writer::len()
 Writer::finish(&Opts) -> Result<Vec<u8>>    // caller writes the file
 Writer::finish_to(path, &Opts) -> Result<u64>
@@ -115,9 +116,8 @@ Snapshot::<T>::from_bytes(&[u8])            // and from_bytes_with
 
 // longest-prefix lookups
 Snapshot::search(ip: IpAddr) -> Option<(IpNet, &T::Archived)>
-Snapshot::search_owned(ip: IpAddr) -> Option<(IpNet, T)>   // deserialized
 Snapshot::get_exact(prefix) -> Option<&T::Archived>
-Snapshot::get_exact_owned(prefix) -> Option<T>   // a decode failure reads as None
+Snapshot::owned() -> Owned<T>                    // the same queries, returning T
 
 // the prefix_trie read API, with IpNet keys and no family match in the caller
 Snapshot::get_key_value(prefix) -> Option<(IpNet, &T::Archived)>
@@ -182,7 +182,9 @@ One owner: `Journal<T>` holds the live tree, the blob arena, the segment writer,
 the writer lock and the directory, and it recovers on open.
 
 ```rust
-Journal::<T>::open(dir, tree_id, Option<PayloadSection>) -> Result<Journal<T>>
+Journal::<T>::open(dir, TreeId, Option<PayloadSection>) -> Result<Journal<T>>
+Journal::<T>::to_snapshot(&Opts) -> Result<Snapshot<T>>   // every query, no file
+Journal::<T>::to_bytes(&Opts) -> Result<Vec<u8>>          // the same object, unwritten
 journal.insert(prefix, &value)                  // updates the tree and the log
 journal.insert_with_blob(prefix, blob, |off| value) // value is built from the arena offset
 journal.withdraw(prefix) / withdraw_at(prefix, Times)
