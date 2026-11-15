@@ -442,3 +442,50 @@ fn a_journal_checkpoint_carries_its_arena_and_nothing_else() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_crafted_object_cannot_walk_off_the_end_of_its_padding() {
+    use bgpkit_snap::header::{Entry, Header, ENTRY_LEN, HEADER_LEN};
+    use bgpkit_snap::ID_V4;
+
+    // two sections, the last one ending one byte past the header and table, so the
+    // alignment walk would index the byte after the file. This used to panic.
+    let mut bytes = Vec::new();
+    let mut type_id = [0u8; 32];
+    type_id[.."snap.u64:v1".len()].copy_from_slice(b"snap.u64:v1");
+    let header = Header {
+        flags: 0,
+        tree_id: [0u8; 16],
+        generation: [0u8; 16],
+        base_seq: 0,
+        type_id,
+        file_len: (HEADER_LEN + 2 * ENTRY_LEN + 1) as u64,
+        section_count: 2,
+        section_table_len: (2 * ENTRY_LEN) as u32,
+        window: [0, 0],
+        created_at: 1_700_000_000,
+        content_id: [7u8; 32],
+    };
+    bytes.extend_from_slice(&header.encode());
+    let first = Entry {
+        id: ID_V4,
+        kind: *b"V4\0\0",
+        required: true,
+        len: 1,
+    };
+    let second = Entry {
+        id: 3,
+        kind: *b"V6\0\0",
+        required: true,
+        len: 0,
+    };
+    bytes.extend_from_slice(&first.encode());
+    bytes.extend_from_slice(&second.encode());
+    bytes.push(0);
+
+    assert!(
+        bgpkit_snap::verify_bytes(&bytes).is_err(),
+        "a crafted layout must be refused, not walked past"
+    );
+    assert!(Snapshot::<u64>::from_bytes(&bytes).is_err());
+}

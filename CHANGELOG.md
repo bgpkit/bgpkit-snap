@@ -54,6 +54,20 @@ Journal
 - a checkpoint that cannot be read reports the file system's error rather than
   "missing" for every `io::Error`, and rotation and `sync` keep errno on a failed
   flush.
+- `state.json` records the value type and payload configuration, so reopening a
+  directory with another type or another payload id is refused instead of
+  reinterpreting the same bytes; `Error::ConfigMismatch` names that case.
+- `repair` refuses a directory that still has a readable `state.json`, because
+  rewriting `next_seq` there hides the sequence gap `open` reports.
+- every checkpoint writes a new file name (`snapshot-<seq>-<n>.snap`), so a checkpoint
+  with no new records cannot replace an object that is already committed.
+- the padding walk in `verify_bytes` and `Snapshot::from_bytes` bounds-checks, so a
+  crafted object is refused instead of panicking.
+- a checkpoint decodes every value before it commits, because recovery decodes them on
+  open; an object holding an undecodable value would be unopenable for good.
+- recovery compares a payload section's `required` flag as well as its id and kind.
+- `SnapshotView::sections` is `&[SectionRef]` with named fields instead of a tuple; the
+  library returns `Error` where it used to `expect`.
 
 Verification
 

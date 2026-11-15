@@ -117,7 +117,7 @@ Snapshot::<T>::from_bytes(&[u8])            // and from_bytes_with
 // longest-prefix lookups
 Snapshot::search(ip: IpAddr) -> Option<(IpNet, &T::Archived)>
 Snapshot::get_exact(prefix) -> Option<&T::Archived>
-Snapshot::owned() -> Owned<T>                    // the same queries, returning T
+Snapshot::owned() -> Owned<T>                    // the same queries, returning Result<T>
 
 // the prefix_trie read API, with IpNet keys and no family match in the caller
 Snapshot::contains_key(prefix) -> bool
@@ -185,7 +185,7 @@ Journal::<T>::open(dir, TreeId) -> Result<Journal<T>>
 Journal::<T>::open_with_payload(dir, TreeId, PayloadSection) -> Result<Journal<T>>
 Journal::<T>::to_snapshot(&Opts) -> Result<Snapshot<T>>   // every query, no file
 Journal::<T>::to_bytes(&Opts) -> Result<Vec<u8>>          // the same object, unwritten
-journal.insert(prefix, &value)                  // updates the tree and the log
+journal.insert(prefix, value)                   // updates the tree and the log
 journal.insert_with_blob(prefix, blob, |off| value) // value is built from the arena offset
 journal.withdraw(prefix) / withdraw_at(prefix, Times)
 journal.sync()                                  // durable on return

@@ -618,7 +618,10 @@ fn a_snapshot_no_state_file_names_is_cleaned_up() {
         .filter(|n| n.starts_with("snapshot-"))
         .collect();
     assert_eq!(after.len(), 1, "the orphan is gone: {after:?}");
-    assert_eq!(after[0], "snapshot-2.snap", "the named checkpoint survives");
+    assert!(
+        after[0].starts_with("snapshot-2-"),
+        "the named checkpoint survives: {after:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -85,6 +85,9 @@ pub struct Journal<T: Codec> {
     /// The committed checkpoint: `(base_seq, file)`. Held in memory so a `sync`
     /// after a lost `state.json` cannot silently drop it.
     checkpoint: Option<(u64, String)>,
+    /// How many checkpoints this process has written, so two of them at the same
+    /// sequence number do not share a file name.
+    checkpoints: u64,
     seq: u64,
     base_seq: u64,
     v4: PrefixMap<ipnet::Ipv4Net, T>,
@@ -153,6 +156,30 @@ where
         fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Error::Locked)?;
 
         let state = read_state(&dir)?;
+        // the directory records what wrote it; a reopen with another value type or
+        // another payload would reinterpret the same bytes without a word
+        if let Some(state) = state.as_ref() {
+            if let Some(type_id) = state.type_id.as_deref() {
+                if type_id != T::TYPE_ID {
+                    return Err(Error::ConfigMismatch(format!(
+                        "this journal was written as {type_id}, not {}",
+                        T::TYPE_ID
+                    )));
+                }
+            }
+            let configured = payload.map(|p| (p.id, p.kind, p.required));
+            if let Some(written) = state.payload {
+                if Some(written) != configured {
+                    return Err(Error::ConfigMismatch(format!(
+                        "this journal was written with payload section {} (kind {}, required {}); \
+                         open it with that configuration",
+                        written.0,
+                        String::from_utf8_lossy(&written.1),
+                        written.2
+                    )));
+                }
+            }
+        }
         let generation = state
             .as_ref()
             .map(|s| s.generation)
@@ -186,6 +213,7 @@ where
             seg_index: index,
             seg_dirty_from: None,
             checkpoint: None,
+            checkpoints: 0,
             seq: 1,
             base_seq: 0,
             v4: PrefixMap::new(),
@@ -253,6 +281,15 @@ where
         self.seg_path = None;
         self.seg_index += 1;
         self.open_segment()
+    }
+
+    /// What this journal writes, recorded in `state.json` so another configuration
+    /// cannot adopt the directory.
+    fn config(&self) -> (String, Option<(u16, [u8; 4], bool)>) {
+        (
+            T::TYPE_ID.to_string(),
+            self.payload.map(|p| (p.id, p.kind, p.required)),
+        )
     }
 
     fn open_segment(&mut self) -> Result<(), Error> {
@@ -340,14 +377,13 @@ where
             let snap: Snapshot<T> =
                 match Snapshot::from_bytes_with(&raw, &KnownPayload(self.payload.map(|p| p.id))) {
                     Ok(snap) => snap,
-                    // a payload-bearing checkpoint opened without its payload is the
-                    // configuration mistake that costs the arena, so name it as such
-                    Err(Error::UnknownRequiredSection(_)) if self.payload.is_none() => {
-                        return Err(Error::BadRecord(
-                            "checkpoint carries a payload section this journal was not opened \
-                         with; reopen it with that PayloadSection, or the arena the handles \
-                         point into is gone",
-                        ));
+                    // a checkpoint opened under another payload configuration is the
+                    // mistake that costs the arena, so name it in the journal's terms
+                    Err(Error::UnknownRequiredSection(id)) => {
+                        return Err(Error::ConfigMismatch(format!(
+                            "checkpoint carries payload section {id}, which this journal was \
+                             not opened with; reopen it with that PayloadSection"
+                        )));
                     }
                     Err(e) => return Err(e),
                 };
@@ -381,9 +417,9 @@ where
                 if entry.id == crate::header::ID_V4 || entry.id == crate::header::ID_V6 {
                     continue;
                 }
-                let is_payload = self
-                    .payload
-                    .is_some_and(|p| p.id == entry.id && p.kind == entry.kind);
+                let is_payload = self.payload.is_some_and(|p| {
+                    p.id == entry.id && p.kind == entry.kind && p.required == entry.required
+                });
                 if !is_payload {
                     return Err(Error::BadRecord(
                         "checkpoint carries a section this journal was not opened with; \
@@ -438,11 +474,11 @@ where
             }
             let mut off = SEGMENT_HEADER_LEN;
             while off + 8 <= raw.len() {
-                let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("4")) as usize;
+                let len = u32::from_le_bytes(four(&raw[off..off + 4])?) as usize;
                 if len < RECORD_FIXED_LEN || off + 4 + len > raw.len() {
                     break;
                 }
-                let crc = u32::from_le_bytes(raw[off + 4..off + 8].try_into().expect("4"));
+                let crc = u32::from_le_bytes(four(&raw[off + 4..off + 8])?);
                 let payload = &raw[off + 8..off + 4 + len];
                 if crc32c::crc32c(payload) != crc {
                     break;
@@ -535,7 +571,7 @@ where
         if prefix.addr() != prefix.network() {
             return Err(Error::BadPrefix(prefix.to_string()));
         }
-        let mut value = value.clone();
+        let mut value = value;
         value.canonicalize();
         let bytes = T::encode(&value)?;
         let seq = self.append(KIND_INSERT, prefix, &bytes, &[], times)?;
@@ -660,10 +696,17 @@ where
         {
             self.rotate_segment()?;
         }
-        let start = self.seg.as_ref().expect("segment just opened").bytes;
+        let start = self
+            .seg
+            .as_ref()
+            .ok_or(Error::BadRecord("no open segment after opening one"))?
+            .bytes;
         let len = (payload.len() + 4) as u32;
         let crc = crc32c::crc32c(&payload);
-        let seg = self.seg.as_mut().expect("segment just opened");
+        let seg = self
+            .seg
+            .as_mut()
+            .ok_or(Error::BadRecord("no open segment after opening one"))?;
         let mut write = || -> std::io::Result<()> {
             seg.file.write_all(&len.to_le_bytes())?;
             seg.file.write_all(&crc.to_le_bytes())?;
@@ -703,13 +746,26 @@ where
             .open(dir.join("writer.lock"))?;
         fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Error::Locked)?;
 
+        // repair is for a lost state file. If one is there and readable, opening is
+        // the only correct move: repair would rewrite next_seq and hide the gap that
+        // open reports.
+        if std::fs::read(dir.join("state.json")).is_ok() {
+            return Err(Error::BadOpts(
+                "state.json exists; open the journal instead of repairing it",
+            ));
+        }
+
         let mut candidates: Vec<(u64, String)> = snapshot_paths(&dir)?
             .into_iter()
             .filter_map(|p| {
                 let name = p.file_name()?.to_str()?.to_string();
+                // `snapshot-<seq>-<n>.snap`; the seq is what state.json names, the
+                // second number only keeps two checkpoints at one seq apart
                 let seq = name
                     .strip_prefix("snapshot-")?
                     .strip_suffix(".snap")?
+                    .split('-')
+                    .next()?
                     .parse()
                     .ok()?;
                 Some((seq, name))
@@ -719,8 +775,12 @@ where
         let Some((_, file)) = candidates.last() else {
             return Err(Error::BadOpts("there is no checkpoint to repair from"));
         };
-        let raw = std::fs::read(dir.join(file))
-            .map_err(|_| Error::BadRecord("the newest checkpoint cannot be read"))?;
+        let raw = std::fs::read(dir.join(file)).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                Error::BadRecord("the newest checkpoint named on disk is gone")
+            }
+            _ => Error::Io(e),
+        })?;
 
         struct KnownPayload(Option<u16>);
         impl crate::Validator for KnownPayload {
@@ -744,6 +804,8 @@ where
                 generation,
                 tree_id,
                 checkpoint: Some((base, file.clone())),
+                type_id: Some(T::TYPE_ID.to_string()),
+                payload: payload.map(|p| (p.id, p.kind, p.required)),
             },
         )?;
         drop(lock);
@@ -765,11 +827,14 @@ where
                 return Err(Error::Io(e));
             }
         }
+        let (type_id, payload) = self.config();
         let state = State {
             next_seq: self.seq,
             generation: self.generation,
             tree_id: self.tree_id,
             checkpoint: self.checkpoint.clone(),
+            type_id: Some(type_id),
+            payload,
         };
         write_state(&self.dir, &state)?;
         Ok(())
@@ -920,7 +985,16 @@ where
         if snap.len() != self.len() {
             return Err(Error::BadRecord("checkpoint does not hold the live tree"));
         }
-        let name = format!("snapshot-{}.snap", self.seq);
+        // recovery decodes every value, so a value that cannot be decoded here would
+        // be a checkpoint nobody can open: fail before the commit, not after it
+        for (_, value) in snap.v4().map(|m| m.iter()).into_iter().flatten() {
+            rkyv::deserialize::<T, RkyvError>(value).map_err(|_| Error::BadValue)?;
+        }
+        for (_, value) in snap.v6().map(|m| m.iter()).into_iter().flatten() {
+            rkyv::deserialize::<T, RkyvError>(value).map_err(|_| Error::BadValue)?;
+        }
+        self.checkpoints += 1;
+        let name = format!("snapshot-{}-{}.snap", self.seq, self.checkpoints);
         let path = self.dir.join(&name);
         let tmp = self.dir.join(format!(".{name}.tmp"));
         {
@@ -943,10 +1017,14 @@ where
                 generation: self.generation,
                 tree_id: self.tree_id,
                 checkpoint: Some((covered, name.clone())),
+                type_id: Some(T::TYPE_ID.to_string()),
+                payload: self.payload.map(|p| (p.id, p.kind, p.required)),
             },
         )?;
         self.checkpoint = Some((covered, name.clone()));
-        self.publish_current(&name)?;
+        // published after the commit, so a failure here leaves a correct journal and
+        // a stale link; the next checkpoint republishes
+        let _ = self.publish_current(&name);
 
         // An older snapshot is dead weight once a newer one is committed. This is
         // reclamation, not correctness, so it never fails a checkpoint that is
@@ -966,14 +1044,17 @@ where
         self.base_seq = covered;
         self.stream.base_seq = covered;
 
-        // only now may a fully covered segment go; the open segment never does
-        for segment in segment_paths(&self.dir)? {
-            if Some(&segment) == self.seg_path.as_ref() {
-                continue;
-            }
-            if let Some(max) = segment_max_seq(&segment)? {
-                if max <= covered {
-                    std::fs::remove_file(&segment)?;
+        // only now may a fully covered segment go, and only while the open segment is
+        // left alone. Reclamation cannot fail a checkpoint that is already committed.
+        if let Ok(segments) = segment_paths(&self.dir) {
+            for segment in segments {
+                if Some(&segment) == self.seg_path.as_ref() {
+                    continue;
+                }
+                if let Ok(Some(max)) = segment_max_seq(&segment) {
+                    if max <= covered {
+                        let _ = std::fs::remove_file(&segment);
+                    }
                 }
             }
         }
@@ -1036,7 +1117,14 @@ fn parse_record(payload: &[u8]) -> Result<Record, Error> {
     if payload.len() < 48 {
         return Err(Error::BadRecord("record is short"));
     }
-    let seq = u64::from_le_bytes(payload[0..8].try_into().expect("8"));
+    let seq = u64::from_le_bytes(
+        payload
+            .get(0..8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .ok_or(Error::BadRecord(
+                "record is shorter than its sequence number",
+            ))?,
+    );
     let kind = payload[24];
     let family = payload[25];
     let plen = payload[26];
@@ -1050,16 +1138,12 @@ fn parse_record(payload: &[u8]) -> Result<Record, Error> {
             "an IPv4 record carries bytes behind its address",
         ));
     }
-    let value_len = u32::from_le_bytes(payload[44..48].try_into().expect("4")) as usize;
+    let value_len = u32::from_le_bytes(four(&payload[44..48])?) as usize;
     if payload.len() < 48 + value_len + 4 {
         return Err(Error::BadRecord("record value is short"));
     }
     let value = payload[48..48 + value_len].to_vec();
-    let blob_len = u32::from_le_bytes(
-        payload[48 + value_len..52 + value_len]
-            .try_into()
-            .expect("4"),
-    ) as usize;
+    let blob_len = u32::from_le_bytes(four(&payload[48 + value_len..52 + value_len])?) as usize;
     if payload.len() < 52 + value_len + blob_len {
         return Err(Error::BadRecord("record blob is short"));
     }
@@ -1073,6 +1157,12 @@ fn parse_record(payload: &[u8]) -> Result<Record, Error> {
         value,
         blob,
     })
+}
+
+/// Four bytes, or an error. Every caller has already checked the length; this turns
+/// an impossible one into a refusal instead of a panic.
+fn four(bytes: &[u8]) -> Result<[u8; 4], Error> {
+    <[u8; 4]>::try_from(bytes).map_err(|_| Error::BadRecord("record field is short"))
 }
 
 fn prefix_fields(prefix: IpNet) -> (u8, u8, [u8; 16]) {
@@ -1101,13 +1191,17 @@ fn prefix_from_fields(family: u8, len: u8, addr: &[u8; 16]) -> Option<IpNet> {
     }
 }
 
-/// The durable commit record: what the journal promises survives a crash.
+/// The durable commit record: what the journal promises survives a crash, plus what
+/// the directory was written as, so a reopen with another value type or payload is
+/// refused instead of silently reinterpreted.
 struct State {
     next_seq: u64,
     generation: [u8; 16],
     tree_id: [u8; 16],
     /// `(base_seq, file name)` of the newest verified checkpoint.
     checkpoint: Option<(u64, String)>,
+    type_id: Option<String>,
+    payload: Option<(u16, [u8; 4], bool)>,
 }
 
 fn read_state(dir: &Path) -> Result<Option<State>, Error> {
@@ -1144,11 +1238,30 @@ fn read_state(dir: &Path) -> Result<Option<State>, Error> {
         }
         Some(_) => return Err(Error::BadRecord("state.json checkpoint is malformed")),
     };
+    let type_id = v["type_id"].as_str().map(str::to_string);
+    let payload = match v.get("payload") {
+        None => None,
+        Some(serde_json::Value::Object(p)) => {
+            let id = p.get("id").and_then(|x| x.as_u64()).map(|x| x as u16);
+            let required = p.get("required").and_then(|x| x.as_bool());
+            let kind = p
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .and_then(|s| <[u8; 4]>::try_from(s.as_bytes()).ok());
+            match (id, kind, required) {
+                (Some(id), Some(kind), Some(required)) => Some((id, kind, required)),
+                _ => return Err(Error::BadRecord("state.json payload is malformed")),
+            }
+        }
+        Some(_) => return Err(Error::BadRecord("state.json payload is malformed")),
+    };
     Ok(Some(State {
         next_seq,
         generation,
         tree_id,
         checkpoint,
+        type_id,
+        payload,
     }))
 }
 
@@ -1160,6 +1273,16 @@ fn write_state(dir: &Path, state: &State) -> Result<(), Error> {
     });
     if let Some((seq, file)) = &state.checkpoint {
         v["checkpoint"] = serde_json::json!({ "seq": seq, "file": file });
+    }
+    if let Some(type_id) = &state.type_id {
+        v["type_id"] = serde_json::json!(type_id);
+    }
+    if let Some((id, kind, required)) = &state.payload {
+        v["payload"] = serde_json::json!({
+            "id": id,
+            "kind": String::from_utf8_lossy(kind),
+            "required": required,
+        });
     }
     let tmp = dir.join(".state.json.tmp");
     {
@@ -1186,11 +1309,11 @@ fn segment_max_seq(path: &Path) -> Result<Option<u64>, Error> {
     let mut off = SEGMENT_HEADER_LEN;
     let mut max: Option<u64> = None;
     while off + 8 <= raw.len() {
-        let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("4")) as usize;
+        let len = u32::from_le_bytes(four(&raw[off..off + 4])?) as usize;
         if len < RECORD_FIXED_LEN || off + 4 + len > raw.len() {
             break;
         }
-        let crc = u32::from_le_bytes(raw[off + 4..off + 8].try_into().expect("4"));
+        let crc = u32::from_le_bytes(four(&raw[off + 4..off + 8])?);
         let payload = &raw[off + 8..off + 4 + len];
         if crc32c::crc32c(payload) != crc {
             break;

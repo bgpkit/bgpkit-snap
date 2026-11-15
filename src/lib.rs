@@ -70,6 +70,9 @@ pub enum Error {
     BadPrefix(String),
     /// A section's body is not a valid archive of the type this reader asked for.
     BadArchive(u16),
+    /// The directory or object was written under a different configuration than the
+    /// one this call was made with, and adopting it would reinterpret the bytes.
+    ConfigMismatch(String),
     BadValue,
     // journal
     BadRecord(&'static str),
@@ -110,6 +113,7 @@ impl fmt::Display for Error {
             Error::BadArchive(id) => {
                 write!(f, "section {id} is not an archive of this value type")
             }
+            Error::ConfigMismatch(why) => write!(f, "{why}"),
             Error::BadValue => write!(f, "value could not be decoded"),
             Error::BadRecord(why) => write!(f, "bad journal record: {why}"),
             Error::SequenceGap { expected, found } => {
@@ -604,6 +608,9 @@ where
     }
 
     /// The whole object, IPv4 then IPv6.
+    ///
+    /// Materialised, unlike the archived view: an owned value has to be built, so a
+    /// lazy iterator would only move that allocation into the loop body.
     pub fn iter(&self) -> Result<Vec<(IpNet, T)>, Error> {
         self.snap
             .iter()
@@ -611,7 +618,7 @@ where
             .collect()
     }
 
-    /// The values alone, IPv4 then IPv6.
+    /// The values alone, IPv4 then IPv6. Materialised, like `iter`.
     pub fn values(&self) -> Result<Vec<T>, Error> {
         self.snap.values().map(|v| Self::decode(v)).collect()
     }
@@ -627,13 +634,22 @@ where
 
 // ---------------------------------------------------------------- reader
 
+/// One section as a validator sees it: the table row and where its bytes are.
+#[derive(Debug, Clone, Copy)]
+pub struct SectionRef {
+    pub entry: Entry,
+    /// Byte offset of the section body in the whole object.
+    pub offset: usize,
+    /// Length of the section body.
+    pub len: usize,
+}
+
 /// What a validator may inspect when an object is opened.
 pub struct SnapshotView<'a> {
     /// The parsed header: type, identity, stream coordinates, coverage window.
     pub header: &'a Header,
-    /// One tuple per section: `(entry, offset, len)`, where `offset` is a byte
-    /// offset into the whole object and `len` is the section's length.
-    pub sections: &'a [(Entry, usize, usize)],
+    /// One row per section, in table order.
+    pub sections: &'a [SectionRef],
     bytes: &'a [u8],
     table: &'a [u8],
 }
@@ -643,8 +659,8 @@ impl SnapshotView<'_> {
     pub fn section_bytes(&self, id: u16) -> Option<&[u8]> {
         self.sections
             .iter()
-            .find(|(e, _, _)| e.id == id)
-            .map(|(_, off, len)| &self.bytes[*off..*off + *len])
+            .find(|s| s.entry.id == id)
+            .map(|s| &self.bytes[s.offset..s.offset + s.len])
     }
 
     /// The table entry for section `id`: its id, kind, required flag and length.
@@ -653,8 +669,8 @@ impl SnapshotView<'_> {
     pub fn entry(&self, id: u16) -> Option<&Entry> {
         self.sections
             .iter()
-            .find(|(e, _, _)| e.id == id)
-            .map(|(e, _, _)| e)
+            .find(|s| s.entry.id == id)
+            .map(|s| &s.entry)
     }
 
     /// Raw table bytes, for a reader that only wants to enumerate sections.
@@ -693,7 +709,15 @@ pub fn verify_bytes(raw: &[u8]) -> Result<Header, Error> {
             _ => {}
         }
         while !cursor.is_multiple_of(16) {
-            if raw[cursor] != 0 {
+            // untrusted bytes: the alignment walk must not run off the end of the
+            // file, which a crafted object can aim at
+            let Some(byte) = raw.get(cursor) else {
+                return Err(Error::Truncated {
+                    need: cursor + 1,
+                    have: raw.len(),
+                });
+            };
+            if *byte != 0 {
                 return Err(Error::BadSectionTable("padding is not zero"));
             }
             cursor += 1;
@@ -724,6 +748,12 @@ pub fn verify_bytes(raw: &[u8]) -> Result<Header, Error> {
         while !cursor.is_multiple_of(16) {
             cursor += 1;
         }
+        if cursor + entry.len as usize > raw.len() {
+            return Err(Error::Truncated {
+                need: cursor + entry.len as usize,
+                have: raw.len(),
+            });
+        }
         h.update(&raw[cursor..cursor + entry.len as usize]);
         cursor += entry.len as usize;
     }
@@ -753,7 +783,7 @@ impl Validator for NoValidator {}
 pub struct Snapshot<T: SnapValue> {
     bytes: AlignedVec,
     header: Header,
-    sections: Vec<(Entry, usize, usize)>,
+    sections: Vec<SectionRef>,
     table_range: (usize, usize),
     _t: std::marker::PhantomData<T>,
 }
@@ -810,7 +840,7 @@ impl<T: SnapValue> Snapshot<T> {
         let table_end = table_start + header.section_table_len as usize;
         let table = &aligned[table_start..table_end];
 
-        let mut sections: Vec<(Entry, usize, usize)> = Vec::new();
+        let mut sections: Vec<SectionRef> = Vec::new();
         let mut cursor = table_end;
         let mut prev_id = 0u16;
         for i in 0..header.section_count as usize {
@@ -821,7 +851,13 @@ impl<T: SnapValue> Snapshot<T> {
             // every section starts at the next 16-byte boundary at or after the
             // previous end, so the offset is computed and never stored
             while !cursor.is_multiple_of(16) {
-                if raw[cursor] != 0 {
+                let Some(byte) = raw.get(cursor) else {
+                    return Err(Error::Truncated {
+                        need: cursor + 1,
+                        have: raw.len(),
+                    });
+                };
+                if *byte != 0 {
                     return Err(Error::BadSectionTable("padding is not zero"));
                 }
                 cursor += 1;
@@ -836,7 +872,11 @@ impl<T: SnapValue> Snapshot<T> {
                     have: raw.len(),
                 });
             }
-            sections.push((entry, cursor, len));
+            sections.push(SectionRef {
+                entry,
+                offset: cursor,
+                len,
+            });
             prev_id = entry.id;
             cursor = end;
         }
@@ -846,7 +886,7 @@ impl<T: SnapValue> Snapshot<T> {
 
         // the family sections must be the kind they claim, which is the guard
         // against reading an IPv4 archive as IPv6
-        for (entry, _, _) in &sections {
+        for SectionRef { entry, .. } in &sections {
             match entry.id {
                 ID_V4 if entry.kind != KIND_V4 => return Err(Error::BadSectionKind(entry.id)),
                 ID_V6 if entry.kind != KIND_V6 => return Err(Error::BadSectionKind(entry.id)),
@@ -866,7 +906,10 @@ impl<T: SnapValue> Snapshot<T> {
         h.update(b"bgpkit-snap-v4\0");
         h.update(&aligned[..header::HASH_END]);
         h.update(table);
-        for (_, off, len) in &sections {
+        for SectionRef {
+            offset: off, len, ..
+        } in &sections
+        {
             h.update(&aligned[*off..*off + *len]);
         }
         if *h.finalize().as_bytes() != header.content_id {
@@ -890,7 +933,7 @@ impl<T: SnapValue> Snapshot<T> {
         };
 
         let view = snap.view();
-        for (entry, _, _) in &snap.sections {
+        for SectionRef { entry, .. } in &snap.sections {
             let known = matches!(entry.id, ID_V4 | ID_V6);
             if entry.required && !known && !validator.knows(entry) {
                 return Err(Error::UnknownRequiredSection(entry.id));
@@ -908,7 +951,7 @@ impl<T: SnapValue> Snapshot<T> {
     }
 
     pub fn entries(&self) -> Vec<Entry> {
-        self.sections.iter().map(|(e, _, _)| *e).collect()
+        self.sections.iter().map(|s| s.entry).collect()
     }
 
     pub fn header(&self) -> &Header {
@@ -922,8 +965,8 @@ impl<T: SnapValue> Snapshot<T> {
     pub fn section_bytes(&self, id: u16) -> Option<&[u8]> {
         self.sections
             .iter()
-            .find(|(e, _, _)| e.id == id)
-            .map(|(_, off, len)| &self.bytes[*off..*off + *len])
+            .find(|s| s.entry.id == id)
+            .map(|s| &self.bytes[s.offset..s.offset + s.len])
     }
 
     /// What a `Validator` is handed: the header, the section table and the raw
@@ -942,7 +985,12 @@ impl<T: SnapValue> Snapshot<T> {
         T::Archived:
             for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
     {
-        for (entry, off, len) in &self.sections {
+        for SectionRef {
+            entry,
+            offset: off,
+            len,
+        } in &self.sections
+        {
             let slice = &self.bytes[*off..*off + *len];
             match entry.id {
                 ID_V4 => {

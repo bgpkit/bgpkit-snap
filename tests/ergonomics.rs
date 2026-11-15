@@ -211,3 +211,76 @@ fn a_zero_generation_is_refused_rather_than_breaking_every_checkpoint() {
     assert!(format!("{err}").contains("generation"), "got {err}");
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn a_checkpoint_that_holds_an_undecodable_value_is_refused_before_the_commit() {
+    use bgpkit_snap::rkyv;
+
+    // the journal decodes every value when it reopens, so committing a value its own
+    // type cannot decode would make the directory unopenable for good
+    #[derive(Clone, rkyv::Archive, rkyv::Serialize)]
+    struct F(u32);
+    impl SnapValue for F {
+        const TYPE_ID: &str = "ergo.ckp-refuses:v1";
+    }
+    impl rkyv::Deserialize<F, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>> for ArchivedF {
+        fn deserialize(
+            &self,
+            _d: &mut rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+        ) -> Result<F, rkyv::rancor::Error> {
+            Err(rkyv::rancor::Source::new(std::io::Error::other("refused")))
+        }
+    }
+
+    let d = dir("checkpoint-refuses");
+    let mut j: Journal<F> = Journal::open(&d, TreeId::from_name("undecodable")).unwrap();
+    j.insert("10.0.0.0/8".parse().unwrap(), F(1)).unwrap();
+    let err = j
+        .checkpoint(&Opts::now())
+        .expect_err("an object no reader can open must not be committed");
+    assert!(
+        format!("{err}").to_lowercase().contains("value"),
+        "got {err}"
+    );
+    let state = std::fs::read_to_string(d.join("state.json")).unwrap_or_default();
+    assert!(
+        !state.contains("checkpoint"),
+        "nothing was committed: {state}"
+    );
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_journal_refuses_a_value_type_or_payload_other_than_its_own() {
+    let d = dir("config-mismatch");
+    let tree = TreeId::from_name("config-mismatch");
+    {
+        let mut j: Journal<V> =
+            Journal::open_with_payload(&d, tree, PayloadSection::payload(16)).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+        j.sync().unwrap();
+    }
+    let err = match Journal::<V>::open_with_payload(&d, tree, PayloadSection::payload(17)) {
+        Ok(_) => panic!("another payload id must not adopt the directory"),
+        Err(e) => e,
+    };
+    assert!(format!("{err}").contains("payload section 16"), "got {err}");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn repair_refuses_a_directory_that_still_has_its_state_file() {
+    let d = dir("repair-live-state");
+    let tree = TreeId::from_name("repair-live");
+    {
+        let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+        j.checkpoint(&Opts::now()).unwrap();
+    }
+    let err = match Journal::<V>::repair(&d, tree, None) {
+        Ok(_) => panic!("repair must not rewrite a live state file"),
+        Err(e) => e,
+    };
+    assert!(format!("{err}").contains("state.json exists"), "got {err}");
+    std::fs::remove_dir_all(&d).ok();
+}
