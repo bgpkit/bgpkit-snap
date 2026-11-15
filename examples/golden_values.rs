@@ -19,7 +19,7 @@ fn main() {
     }
     let bytes = w
         .finish(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: Some((1_790_000_000, 1_794_355_200)),
             stream: None,
             extras: &[],

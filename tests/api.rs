@@ -28,7 +28,7 @@ fn build(path: &Path) -> Snapshot<V> {
         w.insert(p.parse().unwrap(), V(v));
     }
     let written = w
-        .finish_to(path, &Opts::default())
+        .finish_to(path, &Opts::now())
         .expect("finish_to writes the object");
     assert!(written > 0);
     // a path, not a string: this is the whole point of the signature change
@@ -44,11 +44,11 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
 
     // exact
     assert_eq!(
-        snap.get("10.1.0.0/16".parse().unwrap())
+        snap.get_exact("10.1.0.0/16".parse().unwrap())
             .map(|v| v.0.to_native()),
         Some(2)
     );
-    assert!(snap.get("10.2.0.0/16".parse().unwrap()).is_none());
+    assert!(snap.get_exact("10.2.0.0/16".parse().unwrap()).is_none());
     assert!(snap.contains_key("192.0.2.0/24".parse().unwrap()));
     assert!(!snap.contains_key("192.0.2.128/25".parse().unwrap()));
     assert_eq!(
@@ -59,13 +59,13 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
 
     // longest and shortest covering prefix
     assert_eq!(
-        snap.get_lpm_prefix("10.1.2.128/25".parse().unwrap())
+        snap.lpm_prefix("10.1.2.128/25".parse().unwrap())
             .map(|p| p.to_string()),
         Some("10.1.2.0/24".to_string())
     );
     // spm is the least specific prefix that contains the query
     assert_eq!(
-        snap.get_spm_prefix("10.1.2.0/24".parse().unwrap())
+        snap.spm_prefix("10.1.2.0/24".parse().unwrap())
             .map(|p| p.to_string()),
         Some("10.0.0.0/8".to_string())
     );
@@ -119,7 +119,7 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
     assert!(snap.address_counts().0.is_some() || snap.address_counts().0.is_none());
 
     // owned values, for a caller that does not want to depend on rkyv directly
-    let owned = snap.get_owned("10.1.2.0/24".parse().unwrap());
+    let owned = snap.get_exact_owned("10.1.2.0/24".parse().unwrap());
     assert_eq!(owned.map(|v| v.0), Some(3));
     let hit = snap
         .search_owned(std::net::IpAddr::V4("10.1.2.9".parse().unwrap()))

@@ -146,16 +146,22 @@ pub struct ExtraSection<'a> {
 
 /// Everything a writer declares about the object.
 pub struct Opts<'a> {
-    pub created_at: &'a str,
+    /// unix seconds UTC, written into the header. `created_at` is deliberately
+    /// outside the content id, so this is provenance rather than identity.
+    pub created_at: i64,
     pub stream: Option<StreamRef>,
     pub window: Option<(i64, i64)>,
     pub extras: &'a [ExtraSection<'a>],
 }
 
-impl Default for Opts<'_> {
-    fn default() -> Self {
+impl Opts<'_> {
+    /// The options most writers want: the current time, no window, no extras.
+    ///
+    /// There is no `Default`: a default would have to invent a creation time, and
+    /// an invented one is a valid header with false provenance.
+    pub fn now() -> Self {
         Self {
-            created_at: "1970-01-01T00:00:01Z",
+            created_at: chrono::Utc::now().timestamp(),
             stream: None,
             window: None,
             extras: &[],
@@ -205,9 +211,7 @@ impl<T: SnapValue> Writer<T> {
 
     /// Build the object. The caller writes the returned bytes wherever it likes.
     pub fn finish(self, opts: &Opts<'_>) -> Result<Vec<u8>, Error> {
-        let created_at = chrono::DateTime::parse_from_rfc3339(opts.created_at)
-            .map_err(|_| Error::BadHeader("created_at is not RFC 3339"))?
-            .timestamp();
+        let created_at = opts.created_at;
 
         let v4_bytes = rkyv::to_bytes::<RkyvError>(&self.v4).map_err(|_| Error::BadValue)?;
         let v6_bytes = rkyv::to_bytes::<RkyvError>(&self.v6).map_err(|_| Error::BadValue)?;
@@ -698,8 +702,8 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
-    /// Longest-prefix match for a prefix that may not be a host route.
-    pub fn search_prefix(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
+    /// Longest prefix that covers `prefix`, and its value.
+    pub fn lpm(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
         match prefix {
             IpNet::V4(p) => {
                 let map = self.v4()?;
@@ -720,8 +724,8 @@ impl<T: SnapValue> Snapshot<T> {
     // read API so a caller does not have to match on the family and hold two
     // code paths for every query.
 
-    /// The value stored exactly at `prefix`.
-    pub fn get(&self, prefix: IpNet) -> Option<&T::Archived> {
+    /// The value stored exactly at `prefix`, with no ancestor fallback.
+    pub fn get_exact(&self, prefix: IpNet) -> Option<&T::Archived> {
         match prefix {
             IpNet::V4(p) => self.v4().and_then(|m| m.get(&p)),
             IpNet::V6(p) => self.v6().and_then(|m| m.get(&p)),
@@ -750,18 +754,14 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
-    /// Longest prefix that covers `prefix`, and its value.
-    pub fn get_lpm(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
-        self.search_prefix(prefix)
-    }
-
     /// The key of the longest prefix that covers `prefix`.
-    pub fn get_lpm_prefix(&self, prefix: IpNet) -> Option<IpNet> {
-        self.get_lpm(prefix).map(|(p, _)| p)
+    pub fn lpm_prefix(&self, prefix: IpNet) -> Option<IpNet> {
+        self.lpm(prefix).map(|(p, _)| p)
     }
 
-    /// Shortest prefix that sits under `prefix`, and its value.
-    pub fn get_spm(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
+    /// Least specific prefix that covers `prefix`, and its value. This is
+    /// prefix_trie's `get_spm`: the shortest stored prefix containing the query.
+    pub fn spm(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
         match prefix {
             IpNet::V4(p) => self
                 .v4()
@@ -775,8 +775,8 @@ impl<T: SnapValue> Snapshot<T> {
     }
 
     /// The key of the shortest prefix that sits under `prefix`.
-    pub fn get_spm_prefix(&self, prefix: IpNet) -> Option<IpNet> {
-        self.get_spm(prefix).map(|(p, _)| p)
+    pub fn spm_prefix(&self, prefix: IpNet) -> Option<IpNet> {
+        self.spm(prefix).map(|(p, _)| p)
     }
 
     /// Whether some stored prefix covers `prefix`.
@@ -800,11 +800,11 @@ impl<T: SnapValue> Snapshot<T> {
     ///
     /// A caller that only reads a scalar should not have to depend on the
     /// archive library to get it out.
-    pub fn get_owned(&self, prefix: IpNet) -> Option<T>
+    pub fn get_exact_owned(&self, prefix: IpNet) -> Option<T>
     where
         T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
     {
-        let value = self.get(prefix)?;
+        let value = self.get_exact(prefix)?;
         rkyv::deserialize::<T, RkyvError>(value).ok()
     }
 

@@ -103,7 +103,7 @@ fn demo_b_handle_round_trip_and_bad_range() {
 
     let bytes = w
         .finish(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: None,
             stream: None,
             extras: &[ExtraSection {
@@ -175,7 +175,7 @@ fn demo_b_journal_carries_the_payload() {
         j.sync().expect("sync");
         let snap_path = j
             .checkpoint(&Opts {
-                created_at: "2026-11-14T00:00:00Z",
+                created_at: 1_763_164_800,
                 window: None,
                 stream: None,
                 extras: &[],
@@ -196,7 +196,7 @@ fn demo_b_journal_carries_the_payload() {
         assert_eq!(j.blob_len(), a.len() + b.len());
         let snap_path = j
             .checkpoint(&Opts {
-                created_at: "2026-11-14T00:00:00Z",
+                created_at: 1_763_164_800,
                 window: None,
                 stream: None,
                 extras: &[],
@@ -243,7 +243,7 @@ fn demo_b_journal_updates_the_live_tree_and_refuses_a_second_writer() {
     j.sync().expect("sync");
     let snap_path = j
         .checkpoint(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: None,
             stream: None,
             extras: &[],
@@ -276,7 +276,7 @@ fn children_are_limited_to_the_requested_prefix() {
     }
     let bytes = w
         .finish(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: None,
             stream: None,
             extras: &[ExtraSection {
@@ -330,7 +330,7 @@ fn recovery_keeps_a_committed_checkpoint_when_a_segment_is_lost() {
             .expect("insert");
         j.sync().expect("sync");
         j.checkpoint(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: None,
             stream: None,
             extras: &[],
@@ -376,7 +376,7 @@ fn an_empty_tree_can_be_checkpointed() {
 
     let path = j
         .checkpoint(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: None,
             stream: None,
             extras: &[],
@@ -432,7 +432,7 @@ fn a_torn_tail_costs_only_the_uncommitted_record() {
     let mut j: Journal<PathRef> =
         Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).expect("reopen");
     j.checkpoint(&Opts {
-        created_at: "2026-11-14T00:00:00Z",
+        created_at: 1_763_164_800,
         window: None,
         stream: None,
         extras: &[],
@@ -537,7 +537,7 @@ fn a_corrupt_state_file_is_not_treated_as_absent() {
             .unwrap();
         j.sync().unwrap();
         j.checkpoint(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: None,
             stream: None,
             extras: &[],
@@ -565,7 +565,7 @@ fn a_snapshot_no_state_file_names_is_cleaned_up() {
             .unwrap();
         j.sync().unwrap();
         j.checkpoint(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: None,
             stream: None,
             extras: &[],
@@ -610,7 +610,7 @@ fn a_checkpoint_is_not_adopted_without_its_configuration() {
         .unwrap();
         j.sync().unwrap();
         j.checkpoint(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: None,
             stream: None,
             extras: &[],
@@ -639,7 +639,7 @@ fn checkpoints_without_a_state_file_are_refused() {
             .unwrap();
         j.sync().unwrap();
         j.checkpoint(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: None,
             stream: None,
             extras: &[],
@@ -693,7 +693,7 @@ fn a_malformed_checkpoint_field_is_an_error() {
             .unwrap();
         j.sync().unwrap();
         j.checkpoint(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: None,
             stream: None,
             extras: &[],
@@ -785,7 +785,7 @@ fn a_long_random_op_sequence_survives_recovery_unchanged() {
 
     let mut expected: std::collections::BTreeMap<String, u32> = Default::default();
     let opts = Opts {
-        created_at: "2026-11-14T00:00:00Z",
+        created_at: 1_763_164_800,
         window: None,
         stream: None,
         extras: &[],
@@ -825,7 +825,7 @@ fn a_long_random_op_sequence_survives_recovery_unchanged() {
     let snap: Snapshot<PathRef> = Snapshot::open(path.to_str().unwrap()).unwrap();
     for (prefix, off) in &expected {
         let (_, value) = snap
-            .search_prefix(prefix.parse().unwrap())
+            .lpm(prefix.parse().unwrap())
             .unwrap_or_else(|| panic!("recovery lost {prefix}"));
         assert_eq!(value.off, *off, "wrong value for {prefix}");
     }

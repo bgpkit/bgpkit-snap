@@ -24,7 +24,7 @@ fn build(path: &std::path::Path) {
 
     let bytes = w
         .finish(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             window: Some((1_760_000_000, 1_794_355_200)),
             stream: None,
             extras: &[],
@@ -55,7 +55,7 @@ fn demo_a_build_write_open_search() {
 
     // a prefix query, not an address
     assert_eq!(
-        snap.search_prefix("10.9.0.0/16".parse().unwrap())
+        snap.lpm("10.9.0.0/16".parse().unwrap())
             .map(|(p, _)| p.to_string()),
         Some("10.0.0.0/8".into())
     );

@@ -487,6 +487,49 @@ where
         Ok(seq)
     }
 
+    /// Adopt `snapshot-<seq>.snap` as the committed state after `state.json` was
+    /// lost or damaged.
+    ///
+    /// This is the repair path for the one failure the journal cannot resolve on
+    /// its own: the object is intact, but nothing names it. Records after the
+    /// checkpoint are replayed from the segments; anything already pruned and not
+    /// covered by the checkpoint stays gone, and the caller is told the sequence
+    /// the adopted object ended at.
+    pub fn adopt_checkpoint(&mut self, file: &str) -> Result<u64, Error> {
+        let path = self.dir.join(file);
+        let raw = std::fs::read(&path)
+            .map_err(|_| Error::BadRecord("the named checkpoint cannot be read"))?;
+        struct KnownPayload(Option<u16>);
+        impl crate::Validator for KnownPayload {
+            fn knows(&self, entry: &crate::Entry) -> bool {
+                Some(entry.id) == self.0
+            }
+        }
+        let snap: Snapshot<T> =
+            Snapshot::from_bytes_with(&raw, &KnownPayload(self.payload.map(|p| p.id)))?;
+        let Some(stream) = snap.header().stream() else {
+            return Err(Error::BadRecord(
+                "the checkpoint carries no stream identity",
+            ));
+        };
+        if stream.tree_id != self.tree_id || stream.generation != self.generation {
+            return Err(Error::BadRecord(
+                "the checkpoint belongs to another tree or generation",
+            ));
+        }
+        let base = stream.base_seq;
+        write_state(
+            &self.dir,
+            &State {
+                next_seq: base + 1,
+                generation: self.generation,
+                tree_id: self.tree_id,
+                checkpoint: Some((base, file.to_string())),
+            },
+        )?;
+        Ok(base)
+    }
+
     /// A record is durable once this returns.
     pub fn sync(&mut self) -> Result<(), Error> {
         if let Some(seg) = self.seg.as_mut() {
@@ -559,6 +602,27 @@ where
         }
         std::fs::rename(&tmp, &path)?;
         File::open(&self.dir)?.sync_all()?;
+
+        // publish a stable name for readers: a service points at current.snap and
+        // a reload is "the link now names a different object". Written through a
+        // temporary link and renamed, so a reader never sees a half-updated name.
+        let link = self.dir.join("current.snap");
+        let tmp_link = self.dir.join(".current.snap.tmp");
+        let _ = std::fs::remove_file(&tmp_link);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&name, &tmp_link)?;
+            std::fs::rename(&tmp_link, &link)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::copy(&path, &tmp_link)?;
+            std::fs::rename(&tmp_link, &link)?;
+        }
 
         // commit the checkpoint: from here on, recovery starts from this object
         let covered = self.seq.saturating_sub(1);

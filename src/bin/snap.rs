@@ -23,8 +23,9 @@ enum Cmd {
         input: String,
         #[arg(short, long)]
         out: String,
-        #[arg(long, default_value = "2026-01-01T00:00:00Z")]
-        created_at: String,
+        /// unix seconds UTC; defaults to now
+        #[arg(long)]
+        created_at: Option<i64>,
         #[arg(long)]
         window: Option<String>,
     },
@@ -44,7 +45,7 @@ fn main() {
             out,
             created_at,
             window,
-        } => match build(&input, &out, &created_at, window.as_deref()) {
+        } => match build(&input, &out, created_at, window.as_deref()) {
             Ok((entries, bytes)) => println!("wrote {out}: {entries} entries, {bytes} bytes"),
             Err(e) => fail(&format!("{e}")),
         },
@@ -71,7 +72,7 @@ fn fail(msg: &str) -> ! {
 fn build(
     input: &str,
     out: &str,
-    created_at: &str,
+    created_at: Option<i64>,
     window: Option<&str>,
 ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(input)?;
@@ -92,7 +93,7 @@ fn build(
     };
     let entries = w.len();
     let bytes = w.finish(&bgpkit_snap::Opts {
-        created_at,
+        created_at: created_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
         stream: None,
         window: parsed_window,
         extras: &[],
@@ -152,7 +153,7 @@ fn verify(file: &str) -> Result<String, Box<dyn std::error::Error>> {
 fn search(file: &str, query: &str) -> Result<(), Box<dyn std::error::Error>> {
     let snap: Snapshot<u32> = Snapshot::open(file)?;
     let hit = match query.parse::<IpNet>() {
-        Ok(net) => snap.search_prefix(net),
+        Ok(net) => snap.lpm(net),
         Err(_) => snap.search(query.parse()?),
     };
     match hit {

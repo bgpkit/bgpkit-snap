@@ -95,7 +95,7 @@ pub trait SnapValue: Archive + Clone + Serialize<HighSer> {
 }
 
 pub struct Opts<'a> {
-    pub created_at: &'a str,
+    pub created_at: i64,        // unix seconds; Opts::now() for the current time
     pub stream: Option<StreamRef>,          // tree_id, generation, base_seq
     pub window: Option<(i64, i64)>,
     pub extras: &'a [ExtraSection],         // id, kind, required, bytes
@@ -107,6 +107,7 @@ Writer::<T>::new()
 Writer::insert(prefix, value)               // replaces an existing value
 Writer::len()
 Writer::finish(&Opts) -> Result<Vec<u8>>    // caller writes the file
+Writer::finish_to(path, &Opts) -> Result<u64>
 
 Snapshot::<T>::open(path)                   // takes any AsRef<Path>
 Snapshot::<T>::open_with(path, &dyn Validator)
@@ -116,18 +117,17 @@ Writer::finish_to(path, &opts) -> u64        // or writes them, atomically
 
 // longest-prefix lookups
 Snapshot::search(ip: IpAddr) -> Option<(IpNet, &T::Archived)>
-Snapshot::search_prefix(prefix) -> Option<(IpNet, &T::Archived)>
 Snapshot::search_owned(ip: IpAddr) -> Option<(IpNet, T)>   // deserialized
-Snapshot::get_owned(prefix) -> Option<T>
+Snapshot::get_exact(prefix) -> Option<&T::Archived>
+Snapshot::get_exact_owned(prefix) -> Option<T>
 
 // the prefix_trie read API, with IpNet keys and no family match in the caller
-Snapshot::get(prefix) -> Option<&T::Archived>
 Snapshot::get_key_value(prefix) -> Option<(IpNet, &T::Archived)>
 Snapshot::contains_key(prefix) -> bool
-Snapshot::get_lpm(prefix) -> Option<(IpNet, &T::Archived)>       // most specific cover
-Snapshot::get_lpm_prefix(prefix) -> Option<IpNet>
-Snapshot::get_spm(prefix) -> Option<(IpNet, &T::Archived)>       // least specific cover
-Snapshot::get_spm_prefix(prefix) -> Option<IpNet>
+Snapshot::lpm(prefix) -> Option<(IpNet, &T::Archived)>           // most specific cover
+Snapshot::lpm_prefix(prefix) -> Option<IpNet>
+Snapshot::spm(prefix) -> Option<(IpNet, &T::Archived)>           // least specific cover
+Snapshot::spm_prefix(prefix) -> Option<IpNet>
 Snapshot::is_covered(prefix) -> bool
 Snapshot::is_covered_in_aggregate(prefix) -> bool
 Snapshot::iter() -> Iterator<(IpNet, &T::Archived)>              // v4 then v6
@@ -189,7 +189,8 @@ journal.insert(prefix, &value)                  // updates the tree and the log
 journal.insert_with_blob(prefix, &value, &blob) // also appends blob to the arena
 journal.withdraw(prefix)
 journal.sync()                                  // durable on return
-journal.checkpoint(&opts) -> Result<PathBuf>     // verified before pruning
+journal.checkpoint(&opts) -> Result<PathBuf>     // verified before pruning, publishes current.snap
+journal.adopt_checkpoint(file) -> Result<u64>    // repair when state.json was lost
 journal.len()
 ```
 

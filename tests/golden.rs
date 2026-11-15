@@ -27,7 +27,7 @@ fn build() -> Vec<u8> {
         w.insert(p.parse().unwrap(), V(v));
     }
     w.finish(&Opts {
-        created_at: "2026-11-14T00:00:00Z",
+        created_at: 1_794_614_400,
         window: Some((1_790_000_000, 1_794_355_200)),
         stream: None,
         extras: &[],
@@ -65,7 +65,7 @@ fn insertion_order_does_not_change_the_object() {
             w.insert(p.parse().unwrap(), V(*v));
         }
         w.finish(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_794_614_400,
             window: Some((1_790_000_000, 1_794_355_200)),
             stream: None,
             extras: &[],

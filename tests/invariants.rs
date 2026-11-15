@@ -17,7 +17,7 @@ fn build(extras: &[ExtraSection<'_>]) -> Vec<u8> {
     w.insert("10.1.0.0/16".parse().unwrap(), N(2));
     w.insert("2001:db8::/32".parse().unwrap(), N(3));
     w.finish(&Opts {
-        created_at: "2026-11-14T00:00:00Z",
+        created_at: 1_763_164_800,
         window: Some((1_790_000_000, 1_794_355_200)),
         stream: None,
         extras,
@@ -174,7 +174,7 @@ fn verify_bytes_checks_the_container_without_the_value_type() {
     let mut w: Writer<u32> = crate::Writer::new();
     w.insert("10.0.0.0/8".parse().unwrap(), 1);
     w.insert("2001:db8::/32".parse().unwrap(), 2);
-    let bytes = w.finish(&Opts::default()).unwrap();
+    let bytes = w.finish(&Opts::now()).unwrap();
 
     let header = bgpkit_snap::verify_bytes(&bytes).expect("a good object verifies");
     assert_eq!(header.section_count, 2);
@@ -200,25 +200,26 @@ fn a_writer_cannot_emit_what_the_reader_rejects() {
     let mut w: Writer<u32> = Writer::new();
     w.insert("10.0.0.0/8".parse().unwrap(), 1);
 
-    // epoch, reversed window and a half-zero stream are all refused at write
+    // an epoch, a reversed window and a half-zero stream are all refused at write
+    let stamp = 1_794_614_400;
     let cases: [Opts; 3] = [
         Opts {
-            created_at: "1970-01-01T00:00:00Z",
-            ..Opts::default()
+            created_at: 0,
+            ..Opts::now()
         },
         Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: stamp,
             window: Some((2_000, 1_000)),
-            ..Opts::default()
+            ..Opts::now()
         },
         Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: stamp,
             stream: Some(bgpkit_snap::StreamRef {
                 tree_id: [0u8; 16],
                 generation: [7u8; 16],
                 base_seq: 0,
             }),
-            ..Opts::default()
+            ..Opts::now()
         },
     ];
     for opts in &cases {
@@ -235,7 +236,7 @@ fn a_writer_cannot_emit_what_the_reader_rejects() {
 fn a_family_kind_at_the_wrong_id_is_refused_not_ignored() {
     let mut w: Writer<u32> = Writer::new();
     w.insert("10.0.0.0/8".parse().unwrap(), 7);
-    let bytes = w.finish(&Opts::default()).unwrap();
+    let bytes = w.finish(&Opts::now()).unwrap();
 
     // the IPv4 section is at id 2; move it to 1 and fix the identity, which is
     // what a writer that never read the table of ids would produce
@@ -266,14 +267,17 @@ fn an_extra_section_cannot_claim_a_family_kind() {
     let arena = [0u8; 8];
     let err = w
         .finish(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             extras: &[ExtraSection {
                 id: 16,
                 kind: header::KIND_V4,
                 required: false,
                 bytes: &arena,
             }],
-            ..Opts::default()
+            ..Opts {
+                created_at: 1_763_164_800,
+                ..Opts::now()
+            }
         })
         .unwrap_err();
     assert!(format!("{err}").contains("family"), "got {err}");
@@ -286,14 +290,17 @@ fn nonzero_padding_is_refused() {
     let arena = [0u8; 5]; // 5 bytes, so the next section needs 11 bytes of padding
     let bytes = w
         .finish(&Opts {
-            created_at: "2026-11-14T00:00:00Z",
+            created_at: 1_763_164_800,
             extras: &[ExtraSection {
                 id: 16,
                 kind: bgpkit_snap::KIND_PAYLOAD,
                 required: false,
                 bytes: &arena,
             }],
-            ..Opts::default()
+            ..Opts {
+                created_at: 1_763_164_800,
+                ..Opts::now()
+            }
         })
         .unwrap();
 
@@ -337,7 +344,7 @@ fn nonzero_padding_is_refused() {
 fn bytes_the_document_fixes_to_zero_are_checked() {
     let mut w: Writer<u32> = Writer::new();
     w.insert("10.0.0.0/8".parse().unwrap(), 1);
-    let bytes = w.finish(&Opts::default()).unwrap();
+    let bytes = w.finish(&Opts::now()).unwrap();
 
     // type_id padding after the terminator
     let mut tail = bytes.clone();

@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     w.insert("10.0.0.0/8".parse()?, RoaSet(vec![64512]));
     w.insert("2001:db8::/32".parse()?, RoaSet(vec![64513]));
     let bytes = w.finish(&Opts {
-        created_at: "2026-11-14T00:00:00Z",
+        created_at: 1_763_164_800,
         window: None,
         stream: None,
         extras: &[],
