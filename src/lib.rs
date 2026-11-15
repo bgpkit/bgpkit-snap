@@ -10,7 +10,13 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use prefix_trie::rkyv::ArchivedPrefixMap;
 use prefix_trie::{AsView, PrefixMap, TrieView};
 use rkyv::rancor::Error as RkyvError;
+
+/// The archive library this crate builds value types on, re-exported so a
+/// caller can write `bgpkit_snap::rkyv::Archive` instead of adding a second
+/// dependency that must match this one exactly.
+pub use rkyv;
 use rkyv::util::AlignedVec;
+use std::io::Write;
 
 pub mod header;
 pub mod journal;
@@ -137,6 +143,9 @@ where
 // ---------------------------------------------------------------- writer
 
 /// One section the caller supplies, e.g. a payload arena.
+/// One section the caller supplies next to the tries: an arena, a sidecar, any
+/// bytes the profile owns. `id` is 16 or higher, `kind` is a four-byte tag, and
+/// `required` makes a reader that does not implement the id refuse the object.
 pub struct ExtraSection<'a> {
     pub id: u16,
     pub kind: [u8; 4],
@@ -190,6 +199,12 @@ impl<T: SnapValue> Writer<T> {
 
     /// Insert a value, replacing any value already stored for that prefix.
     pub fn insert(&mut self, prefix: IpNet, mut value: T) {
+        debug_assert!(
+            prefix.addr() == prefix.network(),
+            "prefix {prefix} has host bits set; it would be stored as {}/{}",
+            prefix.network(),
+            prefix.prefix_len()
+        );
         value.canonicalize();
         match prefix {
             IpNet::V4(p) => {
@@ -280,6 +295,9 @@ impl<T: SnapValue> Writer<T> {
 
         let mut type_id = [0u8; 32];
         let id_bytes = T::TYPE_ID.as_bytes();
+        if id_bytes.is_empty() {
+            return Err(Error::BadHeader("type id is empty"));
+        }
         if id_bytes.len() > 31 {
             return Err(Error::BadHeader("type id is longer than 31 bytes"));
         }
@@ -341,9 +359,17 @@ impl<T: SnapValue> Writer<T> {
     ) -> Result<u64, Error> {
         let bytes = self.finish(opts)?;
         let path = path.as_ref();
-        let tmp = path.with_extension("snap.tmp");
-        std::fs::write(&tmp, &bytes)?;
+        // one temp name per writer, or two writers to one path fight over it
+        let tmp = path.with_extension(format!("snap.{}.tmp", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+        }
         Ok(bytes.len() as u64)
     }
 }
@@ -352,13 +378,17 @@ impl<T: SnapValue> Writer<T> {
 
 /// What a validator may inspect when an object is opened.
 pub struct SnapshotView<'a> {
+    /// The parsed header: type, identity, stream coordinates, coverage window.
     pub header: &'a Header,
+    /// One tuple per section: `(entry, offset, len)`, where `offset` is a byte
+    /// offset into the whole object and `len` is the section's length.
     pub sections: &'a [(Entry, usize, usize)],
     bytes: &'a [u8],
     table: &'a [u8],
 }
 
 impl SnapshotView<'_> {
+    /// The raw bytes of section `id`, exactly as written.
     pub fn section_bytes(&self, id: u16) -> Option<&[u8]> {
         self.sections
             .iter()
@@ -666,11 +696,13 @@ impl<T: SnapValue> Snapshot<T> {
         Ok(())
     }
 
+    /// The IPv4 trie, if the object has one.
     pub fn v4(&self) -> Option<&ArchivedPrefixMap<Ipv4Net, T>> {
         self.section_bytes(ID_V4)
             .map(|s| unsafe { rkyv::access_unchecked::<ArchivedPrefixMap<Ipv4Net, T>>(s) })
     }
 
+    /// The IPv6 trie, if the object has one.
     pub fn v6(&self) -> Option<&ArchivedPrefixMap<Ipv6Net, T>> {
         self.section_bytes(ID_V6)
             .map(|s| unsafe { rkyv::access_unchecked::<ArchivedPrefixMap<Ipv6Net, T>>(s) })

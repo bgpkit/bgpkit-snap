@@ -112,7 +112,6 @@ Writer::finish_to(path, &Opts) -> Result<u64>
 Snapshot::<T>::open(path)                   // takes any AsRef<Path>
 Snapshot::<T>::open_with(path, &dyn Validator)
 Snapshot::<T>::from_bytes(&[u8])            // and from_bytes_with
-Writer::finish(&opts) -> Vec<u8>             // caller writes the bytes
 Writer::finish_to(path, &opts) -> u64        // or writes them, atomically
 
 // longest-prefix lookups

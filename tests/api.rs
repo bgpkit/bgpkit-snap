@@ -116,7 +116,12 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
         snap.cover("10.1.2.0/24".parse().unwrap()).len(),
         "cover_values and cover agree on how many prefixes cover the query"
     );
-    assert!(snap.address_counts().0.is_some() || snap.address_counts().0.is_none());
+    // the /8 plus the disjoint /24: entries are summed with overlaps counted once
+    let (v4, v6) = snap.address_counts();
+    assert_eq!(v4, Some(16_777_472), "one /8 plus one /24");
+    assert_eq!(v6, Some(79_228_162_514_264_337_593_543_950_336));
+    let empty = Snapshot::<V>::from_bytes(&build_empty()).unwrap();
+    assert_eq!(empty.address_counts(), (None, None));
 
     // owned values, for a caller that does not want to depend on rkyv directly
     let owned = snap.get_exact_owned("10.1.2.0/24".parse().unwrap());
@@ -130,4 +135,10 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An object with no entries at all, for the "no family" case.
+fn build_empty() -> Vec<u8> {
+    let w: Writer<V> = Writer::new();
+    w.finish(&Opts::now()).unwrap()
 }

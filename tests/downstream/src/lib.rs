@@ -50,7 +50,7 @@ impl AttrsProfile {
 }
 
 /// Build an object from `(prefix, attributes)` pairs, interning the attributes.
-pub fn build(pairs: &[(ipnet::IpNet, Vec<u8>)], created_at: &str) -> Vec<u8> {
+pub fn build(pairs: &[(ipnet::IpNet, Vec<u8>)], created_at: i64) -> Vec<u8> {
     let mut arena: Vec<u8> = Vec::new();
     let mut writer: Writer<AttrRef> = Writer::new();
     for (prefix, attrs) in pairs {
@@ -89,7 +89,7 @@ mod tests {
             ("10.0.0.0/8".parse().unwrap(), b"AS_PATH 64500".to_vec()),
             ("10.9.0.0/16".parse().unwrap(), b"AS_PATH 64501".to_vec()),
         ];
-        let bytes = build(&pairs, "2026-11-14T00:00:00Z");
+        let bytes = build(&pairs, 1_794_614_400);
         let snap: Snapshot<AttrRef> =
             Snapshot::from_bytes_with(&bytes, &AttrsProfile).expect("open");
         let (_, v) = snap.search("10.0.1.1".parse().unwrap()).expect("hit");
@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn without_the_profile_the_object_is_refused() {
-        let bytes = build(&[("10.0.0.0/8".parse().unwrap(), b"x".to_vec())], "2026-11-14T00:00:00Z");
+        let bytes = build(&[("10.0.0.0/8".parse().unwrap(), b"x".to_vec())], 1_794_614_400);
         let err = Snapshot::<AttrRef>::from_bytes(&bytes).unwrap_err();
         assert!(format!("{err}").contains("32"), "{err}");
     }

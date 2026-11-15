@@ -30,11 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     j.insert_with_blob("192.0.2.0/24".parse()?, &V(9), b"payload")?;
     j.sync()?;
     j.checkpoint(&Opts {
-        created_at: 1_763_164_800,
-        ..Opts {
-            created_at: 1_763_164_800,
-            ..Opts::now()
-        }
+        created_at: 1_794_614_400,
+        ..Opts::now()
     })?;
     drop(j);
 

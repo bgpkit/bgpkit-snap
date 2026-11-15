@@ -76,7 +76,7 @@ impl SnapValue for RoaSet {
 let mut w: Writer<RoaSet> = Writer::new();
 w.insert("10.0.0.0/8".parse()?, RoaSet(vec![64512]));
 let bytes = w.finish(&Opts {
-    created_at: "2026-11-14T00:00:00Z",
+    created_at: 1_794_614_400,   // unix seconds; Opts::now() for "now"
     window: None,
     stream: None,
     extras: &[],
@@ -105,7 +105,7 @@ The CLI does the same from a shell (install it with
 `cargo install bgpkit-snap --features cli`):
 
 ```sh
-snap build prefixes.jsonl --out example.snap --created-at 2026-11-14T00:00:00Z
+snap build prefixes.jsonl --out example.snap --created-at 1794614400
 snap info example.snap      # reads 192 bytes only
 snap verify example.snap    # full integrity check
 snap search example.snap 10.1.2.3

@@ -878,8 +878,11 @@ fn a_writer_can_read_back_what_it_holds() {
     )
     .unwrap();
 
-    assert_eq!(j.get("10.0.0.0/8".parse().unwrap()).map(|v| v.off), Some(7));
-    assert!(j.get("10.1.0.0/16".parse().unwrap()).is_none());
+    assert_eq!(
+        j.get_exact("10.0.0.0/8".parse().unwrap()).map(|v| v.off),
+        Some(7)
+    );
+    assert!(j.get_exact("10.1.0.0/16".parse().unwrap()).is_none());
 
     let mut seen: Vec<String> = Vec::new();
     j.for_each(|p, _| seen.push(p.to_string()));

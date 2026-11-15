@@ -27,8 +27,28 @@ const RECORD_FIXED_LEN: usize = 56;
 pub const KIND_INSERT: u8 = 1;
 pub const KIND_WITHDRAW: u8 = 2;
 
+/// When a record happened. Both fields are unix seconds; leave them zero when the
+/// feed has no clock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Times {
+    /// When the collector received the event.
+    pub recv_ts: i64,
+    /// When the event itself happened, if the feed says so.
+    pub event_ts: i64,
+}
+
+/// What `insert_with_blob` did: the record's sequence number and the arena offset
+/// its blob landed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobInserted {
+    pub seq: u64,
+    pub offset: u64,
+}
+
 /// Where the journal's blob arena lands in a snapshot.
 #[derive(Debug, Clone, Copy)]
+/// Where a journal's blob arena lands in the snapshots it checkpoints: the
+/// section id (16 or higher), its kind tag, and whether a reader must know it.
 pub struct PayloadSection {
     pub id: u16,
     pub kind: [u8; 4],
@@ -36,6 +56,7 @@ pub struct PayloadSection {
 }
 
 impl PayloadSection {
+    /// A required payload section at `id`, with the standard `PAY` kind.
     pub fn payload(id: u16) -> Self {
         Self {
             id,
@@ -62,6 +83,9 @@ pub struct Journal<T: Codec> {
     seg_index: u64,
     /// Offset to cut back to before the next append, set when a write failed.
     seg_dirty_from: Option<u64>,
+    /// The committed checkpoint: `(base_seq, file)`. Held in memory so a `sync`
+    /// after a lost `state.json` cannot silently drop it.
+    checkpoint: Option<(u64, String)>,
     seq: u64,
     base_seq: u64,
     v4: PrefixMap<ipnet::Ipv4Net, T>,
@@ -95,6 +119,20 @@ where
         generation: Option<[u8; 16]>,
     ) -> Result<Self, Error> {
         let dir = dir.as_ref().to_path_buf();
+        // reject here what a checkpoint would reject later, after data was written
+        if tree_id == [0u8; 16] {
+            return Err(Error::BadRecord("tree id is all zero"));
+        }
+        if let Some(p) = payload {
+            if p.id < crate::header::FIRST_PROFILE_ID {
+                return Err(Error::BadRecord(
+                    "payload section id is below 16; ids 2 and 3 are the tries",
+                ));
+            }
+            if p.kind == crate::header::KIND_V4 || p.kind == crate::header::KIND_V6 {
+                return Err(Error::BadRecord("payload section uses a family kind"));
+            }
+        }
         std::fs::create_dir_all(&dir)?;
 
         let lock = OpenOptions::new()
@@ -138,6 +176,7 @@ where
             seg_path: None,
             seg_index: index,
             seg_dirty_from: None,
+            checkpoint: None,
             seq: 1,
             base_seq: 0,
             v4: PrefixMap::new(),
@@ -163,6 +202,13 @@ where
                 .to_string();
             if Some(&name) != keep.as_ref() {
                 let _ = std::fs::remove_file(&path);
+            }
+        }
+        // the stable name must never point at an object this open just removed
+        match keep.as_ref() {
+            Some(name) => journal.publish_current(name)?,
+            None => {
+                let _ = std::fs::remove_file(journal.dir.join("current.snap"));
             }
         }
         Ok(journal)
@@ -193,6 +239,24 @@ where
             seg.file.get_ref().set_len(offset)?;
             seg.file.get_ref().sync_all()?;
             seg.bytes = offset;
+        }
+        Ok(())
+    }
+
+    /// Point `<dir>/current.snap` at `name`, atomically.
+    fn publish_current(&self, name: &str) -> Result<(), Error> {
+        let link = self.dir.join("current.snap");
+        let tmp = self.dir.join(".current.snap.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(name, &tmp)?;
+            std::fs::rename(&tmp, &link)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::copy(self.dir.join(name), &tmp)?;
+            std::fs::rename(&tmp, &link)?;
         }
         Ok(())
     }
@@ -273,6 +337,7 @@ where
             }
             self.base_seq = base;
             self.seq = base + 1;
+            self.checkpoint = Some((base, file.clone()));
         }
 
         let mut paths = segment_paths(&self.dir)?;
@@ -391,10 +456,17 @@ where
     }
 
     pub fn insert(&mut self, prefix: IpNet, value: &T) -> Result<u64, Error> {
+        self.insert_at(prefix, value, Times::default())
+    }
+
+    /// Insert a value and record when it was received and when the event it
+    /// describes happened, both unix seconds. `Times::default()` leaves both zero,
+    /// which is what a caller who does not track time wants.
+    pub fn insert_at(&mut self, prefix: IpNet, value: &T, times: Times) -> Result<u64, Error> {
         let mut value = value.clone();
         value.canonicalize();
         let bytes = T::encode(&value)?;
-        let seq = self.append(KIND_INSERT, prefix, &bytes, &[])?;
+        let seq = self.append(KIND_INSERT, prefix, &bytes, &[], times)?;
         self.apply_value(prefix, value);
         Ok(seq)
     }
@@ -404,7 +476,19 @@ where
         prefix: IpNet,
         value: &T,
         blob: &[u8],
-    ) -> Result<u64, Error> {
+    ) -> Result<BlobInserted, Error> {
+        self.insert_with_blob_at(prefix, value, blob, Times::default())
+    }
+
+    /// The same, with timestamps. Returns the sequence number and the arena offset
+    /// the blob landed at, which is what a handle value has to store.
+    pub fn insert_with_blob_at(
+        &mut self,
+        prefix: IpNet,
+        value: &T,
+        blob: &[u8],
+        times: Times,
+    ) -> Result<BlobInserted, Error> {
         if self.payload.is_none() {
             return Err(Error::BadRecord(
                 "insert_with_blob needs a payload section to carry the blob",
@@ -413,12 +497,13 @@ where
         let mut value = value.clone();
         value.canonicalize();
         let bytes = T::encode(&value)?;
-        let seq = self.append(KIND_INSERT, prefix, &bytes, blob)?;
+        let offset = self.blob.len() as u64;
+        let seq = self.append(KIND_INSERT, prefix, &bytes, blob, times)?;
         // only now: a failed append must not leave the arena ahead of the log,
         // or the offsets recorded earlier would point past what replay rebuilds
         self.blob.extend_from_slice(blob);
         self.apply_value(prefix, value);
-        Ok(seq)
+        Ok(BlobInserted { seq, offset })
     }
 
     fn apply_value(&mut self, prefix: IpNet, value: T) {
@@ -435,7 +520,7 @@ where
     pub fn withdraw(&mut self, prefix: IpNet) -> Result<u64, Error> {
         // log first: if the append fails, the tree must still hold what the
         // previous record promised, or a later checkpoint would drop it
-        let seq = self.append(KIND_WITHDRAW, prefix, &[], &[])?;
+        let seq = self.append(KIND_WITHDRAW, prefix, &[], &[], Times::default())?;
         match prefix {
             IpNet::V4(p) => {
                 self.v4.remove(&p);
@@ -447,13 +532,20 @@ where
         Ok(seq)
     }
 
-    fn append(&mut self, kind: u8, prefix: IpNet, value: &[u8], blob: &[u8]) -> Result<u64, Error> {
+    fn append(
+        &mut self,
+        kind: u8,
+        prefix: IpNet,
+        value: &[u8],
+        blob: &[u8],
+        times: Times,
+    ) -> Result<u64, Error> {
         let seq = self.seq;
         let (family, plen, addr) = prefix_fields(prefix);
         let mut payload = Vec::with_capacity(RECORD_FIXED_LEN + value.len() + blob.len());
         payload.extend_from_slice(&seq.to_le_bytes());
-        payload.extend_from_slice(&0i64.to_le_bytes()); // recv_ts
-        payload.extend_from_slice(&0i64.to_le_bytes()); // event_ts
+        payload.extend_from_slice(&times.recv_ts.to_le_bytes());
+        payload.extend_from_slice(&times.event_ts.to_le_bytes());
         payload.push(kind);
         payload.push(family);
         payload.push(plen);
@@ -533,14 +625,19 @@ where
     /// A record is durable once this returns.
     pub fn sync(&mut self) -> Result<(), Error> {
         if let Some(seg) = self.seg.as_mut() {
-            seg.file.flush()?;
-            seg.file.get_ref().sync_all()?;
+            // a failed flush or fsync leaves bytes whose completeness is unknown;
+            // the next append must cut back to the last acknowledged offset
+            let start = seg.bytes;
+            if seg.file.flush().is_err() || seg.file.get_ref().sync_all().is_err() {
+                self.seg_dirty_from = Some(start);
+                return Err(Error::Io(std::io::Error::other("segment fsync failed")));
+            }
         }
         let state = State {
             next_seq: self.seq,
             generation: self.generation,
             tree_id: self.tree_id,
-            checkpoint: read_state(&self.dir)?.and_then(|s| s.checkpoint),
+            checkpoint: self.checkpoint.clone(),
         };
         write_state(&self.dir, &state)?;
         Ok(())
@@ -603,28 +700,10 @@ where
         std::fs::rename(&tmp, &path)?;
         File::open(&self.dir)?.sync_all()?;
 
-        // publish a stable name for readers: a service points at current.snap and
-        // a reload is "the link now names a different object". Written through a
-        // temporary link and renamed, so a reader never sees a half-updated name.
-        let link = self.dir.join("current.snap");
-        let tmp_link = self.dir.join(".current.snap.tmp");
-        let _ = std::fs::remove_file(&tmp_link);
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&name, &tmp_link)?;
-            std::fs::rename(&tmp_link, &link)?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::copy(&path, &tmp_link)?;
-            std::fs::rename(&tmp_link, &link)?;
-        }
-
-        // commit the checkpoint: from here on, recovery starts from this object
+        // commit the checkpoint first: from here on, recovery starts from this
+        // object. The stable link is published after the state names it, so a crash
+        // in between cannot leave current.snap pointing at an unnamed snapshot,
+        // which the next open would delete.
         let covered = self.seq.saturating_sub(1);
         write_state(
             &self.dir,
@@ -635,6 +714,21 @@ where
                 checkpoint: Some((covered, name.clone())),
             },
         )?;
+        self.checkpoint = Some((covered, name.clone()));
+        self.publish_current(&name)?;
+
+        // G4: an older snapshot is dead weight once a newer one is committed, and
+        // only a restart used to clean it up
+        for old in snapshot_paths(&self.dir)? {
+            let old_name = old
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if old_name != name {
+                let _ = std::fs::remove_file(&old);
+            }
+        }
+
         self.base_seq = covered;
         self.stream.base_seq = covered;
 
@@ -652,17 +746,27 @@ where
         Ok(path)
     }
 
+    /// How many bytes the arena holds. `insert_with_blob` reports the offset a
+    /// blob landed at, so this is only needed to inspect the arena as a whole.
     pub fn blob_len(&self) -> usize {
         self.blob.len()
     }
 
-    /// The value the journal currently holds for `prefix`. A writer needs this
-    /// to compute the next value from the previous one instead of rebuilding the
-    /// whole tree for every update.
-    pub fn get(&self, prefix: ipnet::IpNet) -> Option<&T> {
+    /// The value the journal currently holds for `prefix`, with no ancestor
+    /// fallback. A writer needs this to compute the next value from the previous
+    /// one instead of rebuilding the whole tree for every update.
+    pub fn get_exact(&self, prefix: ipnet::IpNet) -> Option<&T> {
         match prefix {
             ipnet::IpNet::V4(p) => self.v4.get(&p),
             ipnet::IpNet::V6(p) => self.v6.get(&p),
+        }
+    }
+
+    /// The longest stored prefix that covers `prefix`, with its value.
+    pub fn lpm(&self, prefix: ipnet::IpNet) -> Option<(ipnet::IpNet, &T)> {
+        match prefix {
+            ipnet::IpNet::V4(p) => self.v4.get_lpm(&p).map(|(k, v)| (ipnet::IpNet::V4(k), v)),
+            ipnet::IpNet::V6(p) => self.v6.get_lpm(&p).map(|(k, v)| (ipnet::IpNet::V6(k), v)),
         }
     }
 

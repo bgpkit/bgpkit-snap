@@ -129,7 +129,12 @@ fn info(file: &str) -> Result<(), Box<dyn std::error::Error>> {
         None => println!("window     none"),
     }
     match h.stream() {
-        Some(s) => println!("stream     tree {:?} seq {}", &s.tree_id[..4], s.base_seq),
+        Some(s) => println!(
+            "stream     tree {} gen {} base_seq {}",
+            bgpkit_snap::header::hex16(&s.tree_id),
+            bgpkit_snap::header::hex16(&s.generation),
+            s.base_seq
+        ),
         None => println!("stream     none"),
     }
     Ok(())

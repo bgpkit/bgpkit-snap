@@ -14,5 +14,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --all-targets --features cli -- -D warnings
+      - run: cargo test --features cli
+      - name: Build the out-of-crate consumer
+        run: cargo test --manifest-path tests/downstream/Cargo.toml
