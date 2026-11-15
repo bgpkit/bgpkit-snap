@@ -865,6 +865,39 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
+    /// Every value, IPv4 first then IPv6.
+    pub fn values(&self) -> Box<dyn Iterator<Item = &T::Archived> + '_> {
+        let v4 = self.v4().into_iter().flat_map(|m| m.values());
+        let v6 = self.v6().into_iter().flat_map(|m| m.values());
+        Box::new(v4.chain(v6))
+    }
+
+    /// The keys of the prefixes that cover `prefix`.
+    pub fn cover_keys(&self, prefix: IpNet) -> Vec<IpNet> {
+        match prefix {
+            IpNet::V4(p) => self
+                .v4()
+                .map(|m| m.cover_keys(&p).map(IpNet::V4).collect())
+                .unwrap_or_default(),
+            IpNet::V6(p) => self
+                .v6()
+                .map(|m| m.cover_keys(&p).map(IpNet::V6).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The values of the prefixes that cover `prefix`.
+    pub fn cover_values(&self, prefix: IpNet) -> Vec<&T::Archived> {
+        self.cover(prefix).into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// How many addresses each family's entries cover, when the trie tracks it.
+    pub fn address_counts(&self) -> (Option<u128>, Option<u128>) {
+        let v4 = self.v4().and_then(|m| m.address_count()).map(u128::from);
+        let v6 = self.v6().and_then(|m| m.address_count());
+        (v4, v6)
+    }
+
     /// The prefixes that cover `prefix`, each with its value.
     pub fn cover(&self, prefix: IpNet) -> Vec<(IpNet, &T::Archived)> {
         match prefix {

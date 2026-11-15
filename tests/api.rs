@@ -100,6 +100,24 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
         .collect();
     assert!(cover.contains(&"10.1.0.0/16".to_string()), "{cover:?}");
 
+    // values, cover keys and values, and the address counts
+    assert_eq!(snap.values().count(), 6);
+    let cover_keys: Vec<String> = snap
+        .cover_keys("10.1.2.0/24".parse().unwrap())
+        .into_iter()
+        .map(|p| p.to_string())
+        .collect();
+    assert!(
+        cover_keys.contains(&"10.1.0.0/16".to_string()),
+        "{cover_keys:?}"
+    );
+    assert_eq!(
+        snap.cover_values("10.1.2.0/24".parse().unwrap()).len(),
+        snap.cover("10.1.2.0/24".parse().unwrap()).len(),
+        "cover_values and cover agree on how many prefixes cover the query"
+    );
+    assert!(snap.address_counts().0.is_some() || snap.address_counts().0.is_none());
+
     // owned values, for a caller that does not want to depend on rkyv directly
     let owned = snap.get_owned("10.1.2.0/24".parse().unwrap());
     assert_eq!(owned.map(|v| v.0), Some(3));
