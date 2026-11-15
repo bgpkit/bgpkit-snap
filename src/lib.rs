@@ -216,6 +216,12 @@ impl<T: SnapValue> Writer<T> {
     }
 
     /// Insert a value, replacing any value already stored for that prefix.
+    /// Store `value` under `prefix`, replacing any value already there.
+    ///
+    /// The prefix must be canonical (`addr() == network()`); a prefix with host
+    /// bits set is a caller error and trips a debug assertion, because silently
+    /// storing it under its network address would make the key you asked for and
+    /// the key you get back differ.
     pub fn insert(&mut self, prefix: IpNet, mut value: T) {
         debug_assert!(
             prefix.addr() == prefix.network(),

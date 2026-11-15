@@ -1,10 +1,11 @@
 # bgpkit-snap
 
-A versioned, memory-mappable container for prefix tries, plus an append-only
-journal for building one incrementally.
+A versioned, single-file container for prefix tries, plus an append-only journal
+for building one incrementally.
 
 `bgpkit-snap` stores a map from IP prefixes to arbitrary values in a single
-immutable file that can be memory-mapped and queried without parsing. The same
+immutable file that is read once, validated once, and then queried in memory
+without parsing. The same
 data built in any insertion order produces byte-identical files, so an object's
 identity is a hash of its content. A journal turns a live, mutable tree into the
 next snapshot without losing updates.
