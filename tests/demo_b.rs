@@ -890,3 +890,53 @@ fn a_writer_can_read_back_what_it_holds() {
     assert_eq!(seen, vec!["10.0.0.0/8", "2001:db8::/32"]);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn the_lock_is_its_own_error_and_the_repair_path_can_be_reached() {
+    let dir = std::env::temp_dir().join(format!("snap-lock-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [91u8; 16];
+
+    let mut j: Journal<PathRef> =
+        Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+    j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 0 })
+        .unwrap();
+    j.sync().unwrap();
+    let object = j
+        .checkpoint(&Opts {
+            created_at: 1_794_614_400,
+            ..Opts::now()
+        })
+        .unwrap();
+    let name = object.file_name().unwrap().to_string_lossy().into_owned();
+
+    // a second writer is a lock, not corruption
+    match Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))) {
+        Err(bgpkit_snap::Error::Locked) => {}
+        other => panic!(
+            "expected Locked, got {:?}",
+            other.err().map(|e| e.to_string())
+        ),
+    }
+    drop(j);
+
+    // the repair the guide documents is reachable: lose the state, then adopt
+    std::fs::remove_file(log.join("state.json")).unwrap();
+    match Journal::<PathRef>::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))) {
+        Ok(_) => panic!("with no state file, open must refuse"),
+        Err(e) => assert!(format!("{e}").contains("state.json"), "got {e}"),
+    }
+
+    // the repair the guide documents: state.json is gone, the object survives
+    let reopened =
+        Journal::<PathRef>::repair(&log, tree_id, Some(PayloadSection::payload(SECTION_ID)))
+            .expect("repair adopts the newest checkpoint");
+    assert_eq!(reopened.len(), 1, "repair recovered the tree");
+    assert_eq!(
+        std::fs::read_link(log.join("current.snap")).unwrap(),
+        std::path::PathBuf::from(&name),
+        "the stable link names the adopted object"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

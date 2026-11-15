@@ -121,13 +121,11 @@ where
         let dir = dir.as_ref().to_path_buf();
         // reject here what a checkpoint would reject later, after data was written
         if tree_id == [0u8; 16] {
-            return Err(Error::BadRecord("tree id is all zero"));
+            return Err(Error::BadOpts("tree id is all zero"));
         }
         if let Some(p) = payload {
             if p.id < crate::header::FIRST_PROFILE_ID {
-                return Err(Error::BadRecord(
-                    "payload section id is below 16; ids 2 and 3 are the tries",
-                ));
+                return Err(Error::BadSectionId(p.id));
             }
             if p.kind == crate::header::KIND_V4 || p.kind == crate::header::KIND_V6 {
                 return Err(Error::BadRecord("payload section uses a family kind"));
@@ -140,8 +138,7 @@ where
             .truncate(false)
             .write(true)
             .open(dir.join("writer.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock)
-            .map_err(|_| Error::BadRecord("another writer holds this journal"))?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Error::Locked)?;
 
         let state = read_state(&dir)?;
         let generation = state
@@ -490,7 +487,7 @@ where
         times: Times,
     ) -> Result<BlobInserted, Error> {
         if self.payload.is_none() {
-            return Err(Error::BadRecord(
+            return Err(Error::BadOpts(
                 "insert_with_blob needs a payload section to carry the blob",
             ));
         }
@@ -577,6 +574,71 @@ where
         seg.bytes += 8 + payload.len() as u64;
         self.seq += 1;
         Ok(seq)
+    }
+
+    /// Recover a journal directory whose `state.json` was lost but whose snapshots
+    /// survive.
+    ///
+    /// `open` refuses that state on purpose, because it cannot tell which object
+    /// is current; this picks the newest checkpoint, adopts its own tree and
+    /// generation, writes the state file, and returns the journal `open` would
+    /// have returned. Records above that checkpoint are replayed; anything pruned
+    /// and not covered by it is gone.
+    pub fn repair(
+        dir: impl AsRef<Path>,
+        tree_id: [u8; 16],
+        payload: Option<PayloadSection>,
+    ) -> Result<Self, Error> {
+        let dir = dir.as_ref().to_path_buf();
+        let mut candidates: Vec<(u64, String)> = snapshot_paths(&dir)?
+            .into_iter()
+            .filter_map(|p| {
+                let name = p.file_name()?.to_str()?.to_string();
+                let seq = name
+                    .strip_prefix("snapshot-")?
+                    .strip_suffix(".snap")?
+                    .parse()
+                    .ok()?;
+                Some((seq, name))
+            })
+            .collect();
+        candidates.sort();
+        let Some((seq, file)) = candidates.last() else {
+            return Err(Error::BadOpts("there is no checkpoint to repair from"));
+        };
+        let raw = std::fs::read(dir.join(file))
+            .map_err(|_| Error::BadRecord("the newest checkpoint cannot be read"))?;
+
+        struct KnownPayload(Option<u16>);
+        impl crate::Validator for KnownPayload {
+            fn knows(&self, entry: &crate::Entry) -> bool {
+                Some(entry.id) == self.0
+            }
+        }
+        // open the object directly: this is the only place a generation is taken
+        // from the object rather than from the state file
+        // the header says which sequence the object ends at; the file name only
+        // says which checkpoint it is
+        let (generation, base) = {
+            let header = crate::Header::parse(&raw)?;
+            match header.stream() {
+                Some(s) if s.tree_id == tree_id => (s.generation, s.base_seq),
+                _ => return Err(Error::BadRecord("the checkpoint belongs to another tree")),
+            }
+        };
+        // byte-check the object before its name is written into state.json
+        Snapshot::<T>::from_bytes_with(&raw, &KnownPayload(payload.map(|p| p.id)))?;
+        let _ = seq;
+        write_state(
+            &dir,
+            &State {
+                next_seq: base + 1,
+                generation,
+                tree_id,
+                checkpoint: Some((base, file.clone())),
+            },
+        )?;
+        Self::open(dir, tree_id, payload)
     }
 
     /// Adopt `snapshot-<seq>.snap` as the committed state after `state.json` was

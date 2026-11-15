@@ -39,17 +39,32 @@ pub enum Error {
     BadVersion(u16),
     BadHeader(&'static str),
     BadHeaderCrc,
-    Truncated { need: usize, have: usize },
+    Truncated {
+        need: usize,
+        have: usize,
+    },
     BadSectionTable(&'static str),
     SectionOrder,
     UnknownRequiredSection(u16),
     BadSectionKind(u16),
-    TypeMismatch { expected: String, found: String },
+    TypeMismatch {
+        expected: String,
+        found: String,
+    },
     ContentId,
+    /// Another writer holds this journal's lock. Retry later; this is not damage.
+    Locked,
+    /// A caller-supplied option is not something a writer can emit.
+    BadOpts(&'static str),
+    /// A section id the caller supplied is not usable here.
+    BadSectionId(u16),
     BadValue,
     // journal
     BadRecord(&'static str),
-    SequenceGap { expected: u64, found: u64 },
+    SequenceGap {
+        expected: u64,
+        found: u64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -76,6 +91,9 @@ impl fmt::Display for Error {
                 )
             }
             Error::ContentId => write!(f, "content id mismatch"),
+            Error::Locked => write!(f, "another writer holds this journal"),
+            Error::BadOpts(what) => write!(f, "bad writer option: {what}"),
+            Error::BadSectionId(id) => write!(f, "section id {id} cannot be used here"),
             Error::BadValue => write!(f, "value could not be decoded"),
             Error::BadRecord(why) => write!(f, "bad journal record: {why}"),
             Error::SequenceGap { expected, found } => {
