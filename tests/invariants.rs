@@ -407,34 +407,23 @@ fn a_non_canonical_prefix_is_refused_in_every_build() {
 }
 
 #[test]
-fn checkpoint_keeps_the_callers_sections_and_always_carries_the_arena() {
+fn a_journal_checkpoint_carries_its_arena_and_nothing_else() {
     use bgpkit_snap::journal::{Journal, PayloadSection};
 
     let dir = std::env::temp_dir().join(format!("snap-extras-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
+    // an empty arena still gets a section, so a validator that requires it can open
+    // the journal's own object
     let mut j: Journal<u32> =
-        Journal::open(&dir, [31u8; 16], Some(PayloadSection::payload(16))).unwrap();
-    j.insert("10.0.0.0/8".parse().unwrap(), &1).unwrap();
-
-    let sidecar = b"sidecar";
-    let object = j
-        .checkpoint(&Opts {
-            created_at: 1_794_614_400,
-            extras: &[ExtraSection {
-                id: 32,
-                kind: bgpkit_snap::KIND_PAYLOAD,
-                required: false,
-                bytes: sidecar,
-            }],
-            ..Opts::now()
-        })
-        .expect("checkpoint keeps the caller's section");
+        Journal::open_with_payload(&dir, [31u8; 16], PayloadSection::payload(16)).unwrap();
+    j.insert("10.0.0.0/8".parse().unwrap(), 1).unwrap();
+    let object = j.checkpoint(&Opts::now()).expect("checkpoint");
 
     let raw = std::fs::read(&object).unwrap();
     let header = Header::parse(&raw[..192]).unwrap();
     assert_eq!(
-        header.section_count, 3,
-        "the IPv4 trie plus the arena and the caller's sidecar"
+        header.section_count, 2,
+        "the IPv4 trie plus the arena, and nothing else"
     );
     let snap: Snapshot<u32> = Snapshot::from_bytes_with(&raw, &{
         struct Knows;
@@ -446,11 +435,10 @@ fn checkpoint_keeps_the_callers_sections_and_always_carries_the_arena() {
         Knows
     })
     .unwrap();
-    assert_eq!(snap.section_bytes(32), Some(&sidecar[..]));
     assert_eq!(
         snap.section_bytes(16),
         Some(&[][..]),
-        "an empty arena is still a section, so a validator that requires it can open the object"
+        "an empty arena is still a section"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

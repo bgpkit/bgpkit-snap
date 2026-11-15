@@ -1,12 +1,12 @@
 //! The read API a caller actually reaches for, exercised on one object.
 //!
-//! These are the prefix_trie operations forwarded by `Snapshot` plus the two
-//! conveniences a consumer asked for: a path instead of a `&str`, and owned
-//! values instead of archived ones.
+//! These are the prefix_trie operations forwarded by `Snapshot` plus the
+//! conveniences a consumer asked for: a path instead of a `&str`, and an owned view
+//! instead of archived values.
 
 use std::path::Path;
 
-use bgpkit_snap::{Opts, SnapValue, Snapshot, Writer};
+use bgpkit_snap::{AddressCounts, Count, Opts, SnapValue, Snapshot, Writer};
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct V(u32);
@@ -103,20 +103,34 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
     // values, and the address counts
     assert_eq!(snap.values().count(), 6);
     // the /8 plus the disjoint /24: entries are summed with overlaps counted once
-    let (v4, v6) = snap.address_counts();
-    assert_eq!(v4, Some(16_777_472), "one /8 plus one /24");
-    assert_eq!(v6, Some(79_228_162_514_264_337_593_543_950_336));
+    let counts = snap.address_counts();
+    assert_eq!(counts.v4, Count::Exact(16_777_472), "one /8 plus one /24");
+    assert_eq!(
+        counts.v6,
+        Count::Exact(79_228_162_514_264_337_593_543_950_336)
+    );
     let empty = Snapshot::<V>::from_bytes(&build_empty()).unwrap();
-    assert_eq!(empty.address_counts(), (None, None));
+    assert_eq!(
+        empty.address_counts(),
+        AddressCounts {
+            v4: Count::NoEntries,
+            v6: Count::NoEntries
+        },
+        "an absent family is not the same as a covered one"
+    );
 
     // owned values: the same queries, without naming the archived type
     let owned = snap.owned();
     assert_eq!(
-        owned.get_exact("10.1.2.0/24".parse().unwrap()).map(|v| v.0),
+        owned
+            .get_exact("10.1.2.0/24".parse().unwrap())
+            .unwrap()
+            .map(|v| v.0),
         Some(3)
     );
     let hit = owned
         .search(std::net::IpAddr::V4("10.1.2.9".parse().unwrap()))
+        .unwrap()
         .expect("10.1.2.9 is inside the tree");
     assert_eq!(
         (hit.0.to_string(), hit.1 .0),
@@ -124,9 +138,16 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
     );
     // and it covers the queries the old *_owned pair did not
     // the covering entries of 10.1.2.0/24 are the /8, the /16 and itself
-    assert_eq!(owned.cover("10.1.2.0/24".parse().unwrap()).len(), 3);
-    assert_eq!(owned.children("10.0.0.0/8".parse().unwrap()).len(), 3);
-    assert_eq!(owned.iter().count(), 6);
+    assert_eq!(
+        owned.cover("10.1.2.0/24".parse().unwrap()).unwrap().len(),
+        3
+    );
+    assert_eq!(
+        owned.children("10.0.0.0/8".parse().unwrap()).unwrap().len(),
+        3
+    );
+    assert_eq!(owned.iter().unwrap().len(), 6);
+    assert_eq!(owned.values().unwrap().len(), 6);
     assert_eq!(owned.len(), 6);
 
     std::fs::remove_dir_all(&dir).ok();

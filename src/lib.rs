@@ -35,7 +35,12 @@ pub type HighSer<'a> =
 
 // ---------------------------------------------------------------- errors
 
+/// Every way this crate refuses.
+///
+/// `#[non_exhaustive]`: a new refusal is a change to the crate, not to the caller's
+/// match, so a caller needs a catch-all arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     Io(std::io::Error),
     BadMagic,
@@ -132,6 +137,30 @@ impl From<std::io::Error> for Error {
     }
 }
 
+// ---------------------------------------------------------------- coverage
+
+/// How much of an address space a tree's entries cover.
+///
+/// A tuple of options could not tell "this family has no entries" from "this family
+/// is covered end to end" (an IPv6 tree holding `::/0` covers 2^128 addresses, which
+/// does not fit in the count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Count {
+    /// The tree holds no entry for this family.
+    NoEntries,
+    /// The whole address space is claimed.
+    All,
+    /// That many distinct addresses are covered; overlapping entries count once.
+    Exact(u128),
+}
+
+/// The answer to `Snapshot::address_counts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressCounts {
+    pub v4: Count,
+    pub v6: Count,
+}
+
 // ---------------------------------------------------------------- values
 
 /// A value type that can live in a trie.
@@ -187,6 +216,7 @@ where
 /// `required` makes a reader that does not implement the id refuse the object.
 /// The identity of the tree a journal writes.
 ///
+///
 /// A journal refuses a checkpoint that belongs to another tree, so the id is what
 /// stops two feeds from writing into one directory. `from_name` exists because
 /// hand-writing sixteen bytes is the kind of detail a caller gets wrong silently.
@@ -229,6 +259,9 @@ impl std::fmt::Display for TreeId {
     }
 }
 
+/// One section the caller supplies next to the tries: an arena, a sidecar, any
+/// bytes the profile owns. `id` is 16 or higher, `kind` is a four-byte tag, and
+/// `required` makes a reader that does not implement the id refuse the object.
 #[derive(Clone, Copy)]
 pub struct ExtraSection<'a> {
     pub id: u16,
@@ -242,6 +275,9 @@ pub struct Opts<'a> {
     /// unix seconds UTC, written into the header. `created_at` is deliberately
     /// outside the content id, so this is provenance rather than identity.
     pub created_at: i64,
+    /// Set by a journal, which owns the stream coordinates; ignored if a caller sets
+    /// it, because the journal's own `tree_id`, `generation` and `base_seq` are the
+    /// ones the checkpoint is written under.
     pub stream: Option<StreamRef>,
     pub window: Option<(i64, i64)>,
     pub extras: &'a [ExtraSection<'a>],
@@ -502,11 +538,11 @@ impl<T: SnapValue> Owned<'_, T>
 where
     T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
 {
-    /// A value that is present but cannot be decoded reads as absent. The archives
-    /// were byte-checked when the object was opened, so this cannot happen to a
-    /// value a writer stored.
-    fn decode(value: &T::Archived) -> Option<T> {
-        rkyv::deserialize::<T, RkyvError>(value).ok()
+    /// A value whose `Deserialize` refuses is an error, not an absence: returning
+    /// `None` would make `len()` disagree with `iter().count()` and hide a broken
+    /// value type behind a lookup miss.
+    fn decode(value: &T::Archived) -> Result<T, Error> {
+        rkyv::deserialize::<T, RkyvError>(value).map_err(|_| Error::BadValue)
     }
 
     pub fn len(&self) -> usize {
@@ -518,45 +554,74 @@ where
     }
 
     /// The entry stored exactly at `prefix`.
-    pub fn get_exact(&self, prefix: IpNet) -> Option<T> {
-        Self::decode(self.snap.get_exact(prefix)?)
+    pub fn get_exact(&self, prefix: IpNet) -> Result<Option<T>, Error> {
+        match self.snap.get_exact(prefix) {
+            Some(value) => Ok(Some(Self::decode(value)?)),
+            None => Ok(None),
+        }
     }
 
     /// The most specific stored entry covering `addr`.
-    pub fn search(&self, addr: std::net::IpAddr) -> Option<(IpNet, T)> {
-        let (prefix, value) = self.snap.search(addr)?;
-        Some((prefix, Self::decode(value)?))
+    pub fn search(&self, addr: std::net::IpAddr) -> Result<Option<(IpNet, T)>, Error> {
+        match self.snap.search(addr) {
+            Some((prefix, value)) => Ok(Some((prefix, Self::decode(value)?))),
+            None => Ok(None),
+        }
     }
 
     /// The most specific stored entry covering `prefix`.
-    pub fn lpm(&self, prefix: IpNet) -> Option<(IpNet, T)> {
-        let (prefix, value) = self.snap.lpm(prefix)?;
-        Some((prefix, Self::decode(value)?))
+    pub fn lpm(&self, prefix: IpNet) -> Result<Option<(IpNet, T)>, Error> {
+        match self.snap.lpm(prefix) {
+            Some((prefix, value)) => Ok(Some((prefix, Self::decode(value)?))),
+            None => Ok(None),
+        }
     }
 
-    /// Every stored entry covering `prefix`, most specific first.
-    pub fn cover(&self, prefix: IpNet) -> Vec<(IpNet, T)> {
+    /// The least specific stored entry covering `prefix`.
+    pub fn spm(&self, prefix: IpNet) -> Result<Option<(IpNet, T)>, Error> {
+        match self.snap.spm(prefix) {
+            Some((prefix, value)) => Ok(Some((prefix, Self::decode(value)?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Every stored entry covering `prefix`, in trie order (least specific first).
+    pub fn cover(&self, prefix: IpNet) -> Result<Vec<(IpNet, T)>, Error> {
         self.snap
             .cover(prefix)
             .into_iter()
-            .filter_map(|(p, v)| Some((p, Self::decode(v)?)))
+            .map(|(p, v)| Ok((p, Self::decode(v)?)))
             .collect()
     }
 
     /// `prefix` itself when stored, plus every stored entry under it.
-    pub fn children(&self, prefix: IpNet) -> Vec<(IpNet, T)> {
+    pub fn children(&self, prefix: IpNet) -> Result<Vec<(IpNet, T)>, Error> {
         self.snap
             .children(prefix)
             .into_iter()
-            .filter_map(|(p, v)| Some((p, Self::decode(v)?)))
+            .map(|(p, v)| Ok((p, Self::decode(v)?)))
             .collect()
     }
 
     /// The whole object, IPv4 then IPv6.
-    pub fn iter(&self) -> impl Iterator<Item = (IpNet, T)> + '_ {
+    pub fn iter(&self) -> Result<Vec<(IpNet, T)>, Error> {
         self.snap
             .iter()
-            .filter_map(|(p, v)| Some((p, Self::decode(v)?)))
+            .map(|(p, v)| Ok((p, Self::decode(v)?)))
+            .collect()
+    }
+
+    /// The values alone, IPv4 then IPv6.
+    pub fn values(&self) -> Result<Vec<T>, Error> {
+        self.snap.values().map(|v| Self::decode(v)).collect()
+    }
+
+    /// Entries at or after `prefix` in trie order, within `prefix`'s family.
+    pub fn iter_from(&self, prefix: IpNet, inclusive: bool) -> Result<Vec<(IpNet, T)>, Error> {
+        self.snap
+            .iter_from(prefix, inclusive)
+            .map(|(p, v)| Ok((p, Self::decode(v)?)))
+            .collect()
     }
 }
 
@@ -861,7 +926,9 @@ impl<T: SnapValue> Snapshot<T> {
             .map(|(_, off, len)| &self.bytes[*off..*off + *len])
     }
 
-    fn view(&self) -> SnapshotView<'_> {
+    /// What a `Validator` is handed: the header, the section table and the raw
+    /// bytes, after the container and both trie archives have been checked.
+    pub fn view(&self) -> SnapshotView<'_> {
         SnapshotView {
             header: &self.header,
             sections: &self.sections,
@@ -1050,10 +1117,16 @@ impl<T: SnapValue> Snapshot<T> {
         Box::new(v4.chain(v6))
     }
 
-    pub fn address_counts(&self) -> (Option<u128>, Option<u128>) {
-        let v4 = self.v4().and_then(|m| m.address_count()).map(u128::from);
-        let v6 = self.v6().and_then(|m| m.address_count());
-        (v4, v6)
+    pub fn address_counts(&self) -> AddressCounts {
+        let count = |m: Option<Option<u128>>| match m {
+            None => Count::NoEntries,
+            Some(None) => Count::All,
+            Some(Some(n)) => Count::Exact(n),
+        };
+        AddressCounts {
+            v4: count(self.v4().map(|m| m.address_count().map(u128::from))),
+            v6: count(self.v6().map(|m| m.address_count())),
+        }
     }
 
     /// The prefixes that cover `prefix`, each with its value.
@@ -1073,13 +1146,18 @@ impl<T: SnapValue> Snapshot<T> {
     /// The prefix itself when it is stored, plus everything under it, in trie
     /// order. A query for a block that is not stored returns only what is under
     /// it, never a sibling.
+    ///
+    /// The query prefix is read as its network address, and every key returned is a
+    /// key the object contains: a query for `10.1.2.3/16` answers for `10.1.0.0/16`
+    /// and returns that key, never the caller's spelling of it.
     pub fn children(&self, prefix: IpNet) -> Vec<(IpNet, &T::Archived)> {
         let mut out: Vec<(IpNet, &T::Archived)> = Vec::new();
         match prefix {
             IpNet::V4(p) => {
+                let p = p.trunc();
                 let Some(map) = self.v4() else { return out };
-                if let Some(v) = map.get(&p) {
-                    out.push((IpNet::V4(p), v));
+                if let Some((k, v)) = map.get_key_value(&p) {
+                    out.push((IpNet::V4(k), v));
                 }
                 if let Some(view) = map.view_at(&p) {
                     for (k, v) in view.iter() {
@@ -1090,9 +1168,10 @@ impl<T: SnapValue> Snapshot<T> {
                 }
             }
             IpNet::V6(p) => {
+                let p = p.trunc();
                 let Some(map) = self.v6() else { return out };
-                if let Some(v) = map.get(&p) {
-                    out.push((IpNet::V6(p), v));
+                if let Some((k, v)) = map.get_key_value(&p) {
+                    out.push((IpNet::V6(k), v));
                 }
                 if let Some(view) = map.view_at(&p) {
                     for (k, v) in view.iter() {

@@ -120,12 +120,9 @@ Snapshot::get_exact(prefix) -> Option<&T::Archived>
 Snapshot::owned() -> Owned<T>                    // the same queries, returning T
 
 // the prefix_trie read API, with IpNet keys and no family match in the caller
-Snapshot::get_key_value(prefix) -> Option<(IpNet, &T::Archived)>
 Snapshot::contains_key(prefix) -> bool
 Snapshot::lpm(prefix) -> Option<(IpNet, &T::Archived)>           // most specific cover
-Snapshot::lpm_prefix(prefix) -> Option<IpNet>
 Snapshot::spm(prefix) -> Option<(IpNet, &T::Archived)>           // least specific cover
-Snapshot::spm_prefix(prefix) -> Option<IpNet>
 Snapshot::is_covered(prefix) -> bool
 Snapshot::is_covered_in_aggregate(prefix) -> bool
 Snapshot::iter() -> Iterator<(IpNet, &T::Archived)>              // v4 then v6
@@ -133,6 +130,8 @@ Snapshot::iter_from(prefix, inclusive) -> Iterator<...>
 Snapshot::keys() -> Iterator<IpNet>
 Snapshot::children(prefix) -> Vec<(IpNet, &T::Archived)>         // prefix plus subtree
 Snapshot::cover(prefix) -> Vec<(IpNet, &T::Archived)>
+Snapshot::address_counts() -> AddressCounts                  // NoEntries | All | Exact
+Snapshot::values() -> Iterator<&T::Archived>
 Snapshot::section_bytes(id) -> Option<&[u8]>
 Snapshot::header() -> &Header
 
@@ -182,7 +181,8 @@ One owner: `Journal<T>` holds the live tree, the blob arena, the segment writer,
 the writer lock and the directory, and it recovers on open.
 
 ```rust
-Journal::<T>::open(dir, TreeId, Option<PayloadSection>) -> Result<Journal<T>>
+Journal::<T>::open(dir, TreeId) -> Result<Journal<T>>
+Journal::<T>::open_with_payload(dir, TreeId, PayloadSection) -> Result<Journal<T>>
 Journal::<T>::to_snapshot(&Opts) -> Result<Snapshot<T>>   // every query, no file
 Journal::<T>::to_bytes(&Opts) -> Result<Vec<u8>>          // the same object, unwritten
 journal.insert(prefix, &value)                  // updates the tree and the log
@@ -190,6 +190,7 @@ journal.insert_with_blob(prefix, blob, |off| value) // value is built from the a
 journal.withdraw(prefix) / withdraw_at(prefix, Times)
 journal.sync()                                  // durable on return
 journal.checkpoint(&opts) -> Result<PathBuf>     // verified before pruning, publishes current.snap
+journal.checkpoint_with(&opts, &validator)       // the same, with the profile's own check
 Journal::repair(dir, tree_id, payload) -> Journal<T>  // recover a lost state.json
 journal.len()
 ```

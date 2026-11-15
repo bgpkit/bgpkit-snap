@@ -22,7 +22,17 @@ API
 - five queries removed because they were compositions of the others: `lpm_prefix`,
   `spm_prefix`, `get_key_value`, `cover_keys`, `cover_values`.
 - `Error::BadArchive(u16)` separates "this section's body is not an archive of your
-  type" from `BadSectionKind`, which is about the four-byte kind tag.
+  type" from `BadSectionKind`, which is about the four-byte kind tag. `Error` is
+  `#[non_exhaustive]`, so a new refusal does not break a caller's match.
+- `AddressCounts` / `Count { NoEntries, All, Exact(u128) }`: the old pair of options
+  could not tell "no entries in this family" from "this family is covered end to end"
+  (`::/0` covers 2^128 addresses, which does not fit in the count).
+- `Journal::open(dir, tree)` and `open_with_payload(dir, tree, payload)` replace the
+  positional `Option<PayloadSection>`; `checkpoint_with(&opts, &validator)` runs a
+  profile's own check before the object is committed; `Snapshot::view()` is public so
+  a validator can be run over an object a caller already holds.
+- every write path takes the value by value (`Journal::insert(prefix, value)`), like
+  `Writer::insert`, instead of borrowing one the journal copies anyway.
 
 Journal
 
@@ -31,9 +41,19 @@ Journal
   rotated segment had never reached stable storage.
 - the torn-tail cut runs before rotation, so a recovery offset recorded against the
   old segment is not applied to the new one.
-- `checkpoint` refuses a required `extras` section it cannot reopen, and recovery
-  ignores a caller's optional sidecar instead of refusing the checkpoint that
-  carried it.
+- `checkpoint` carries the journal's own sections only, because a checkpoint has to be
+  an object the journal can reopen; recovery refuses a checkpoint written under a
+  different payload configuration instead of opening it and losing the arena. Pruning
+  is best effort and never fails a committed checkpoint.
+- `children` returns stored keys: a query prefix with host bits answers for its
+  network address instead of returning a key the object does not contain.
+- the owned view reports a value whose `Deserialize` refuses as an error, not as an
+  absent prefix (which made `len()` disagree with `iter().count()`).
+- a zero generation is refused at open; it used to be accepted and then fail every
+  checkpoint.
+- a checkpoint that cannot be read reports the file system's error rather than
+  "missing" for every `io::Error`, and rotation and `sync` keep errno on a failed
+  flush.
 
 Verification
 

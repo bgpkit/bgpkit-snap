@@ -17,6 +17,7 @@ const SECTION: u16 = 16;
 fn dir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("snap-ergo-{name}-{}", std::process::id()));
     std::fs::remove_dir_all(&d).ok();
+    std::fs::create_dir_all(&d).ok();
     d
 }
 
@@ -35,11 +36,11 @@ fn a_tree_id_from_a_name_is_stable_and_distinguishes_trees() {
     let d = dir("treeid");
     {
         let mut j: Journal<V> =
-            Journal::open(&d, a, Some(PayloadSection::payload(SECTION))).unwrap();
-        j.insert("10.0.0.0/8".parse().unwrap(), &V(1)).unwrap();
+            Journal::open_with_payload(&d, a, PayloadSection::payload(SECTION)).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.sync().unwrap();
     }
-    let j: Journal<V> = Journal::open(&d, a, Some(PayloadSection::payload(SECTION)))
+    let j: Journal<V> = Journal::open_with_payload(&d, a, PayloadSection::payload(SECTION))
         .expect("the same name reopens its own journal");
     assert_eq!(j.len(), 1);
     std::fs::remove_dir_all(&d).ok();
@@ -49,19 +50,19 @@ fn a_tree_id_from_a_name_is_stable_and_distinguishes_trees() {
 fn a_journal_cannot_adopt_another_trees_directory() {
     let d = dir("wrong-tree");
     {
-        let mut j: Journal<V> = Journal::open(
+        let mut j: Journal<V> = Journal::open_with_payload(
             &d,
             TreeId::from_name("first"),
-            Some(PayloadSection::payload(SECTION)),
+            PayloadSection::payload(SECTION),
         )
         .unwrap();
-        j.insert("10.0.0.0/8".parse().unwrap(), &V(1)).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.checkpoint(&Opts::now()).unwrap();
     }
-    let err = match Journal::<V>::open(
+    let err = match Journal::<V>::open_with_payload(
         &d,
         TreeId::from_name("second"),
-        Some(PayloadSection::payload(SECTION)),
+        PayloadSection::payload(SECTION),
     ) {
         Ok(_) => panic!("a checkpoint from another tree must be refused"),
         Err(e) => e,
@@ -76,14 +77,14 @@ fn a_journal_cannot_adopt_another_trees_directory() {
 #[test]
 fn to_bytes_answers_the_queries_the_journal_does_not() {
     let d = dir("tobytes");
-    let mut j: Journal<V> = Journal::open(
+    let mut j: Journal<V> = Journal::open_with_payload(
         &d,
         TreeId::from_name("tobytes"),
-        Some(PayloadSection::payload(SECTION)),
+        PayloadSection::payload(SECTION),
     )
     .unwrap();
-    j.insert("10.0.0.0/8".parse().unwrap(), &V(1)).unwrap();
-    j.insert("10.1.0.0/16".parse().unwrap(), &V(2)).unwrap();
+    j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+    j.insert("10.1.0.0/16".parse().unwrap(), V(2)).unwrap();
     j.sync().unwrap();
 
     let snap: Snapshot<V> = j
@@ -125,4 +126,88 @@ fn insert_many_stops_at_the_first_prefix_it_refuses() {
         .expect_err("the middle prefix has host bits set");
     assert!(format!("{err}").contains("host bits"), "got {err}");
     assert_eq!(w.len(), 1, "the entry before the failure is kept");
+}
+
+#[test]
+fn a_query_prefix_with_host_bits_answers_for_its_network_address() {
+    let d = dir("children-canon");
+    let path = d.join("o.snap");
+    let mut w: Writer<V> = Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+    w.insert("10.1.0.0/16".parse().unwrap(), V(2)).unwrap();
+    w.insert("10.1.2.0/24".parse().unwrap(), V(3)).unwrap();
+    w.finish_to(&path, &Opts::now()).unwrap();
+    let snap: Snapshot<V> = Snapshot::open(&path).unwrap();
+
+    let keys: Vec<String> = snap
+        .children("10.1.2.3/16".parse().unwrap())
+        .into_iter()
+        .map(|(p, _)| p.to_string())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["10.1.0.0/16".to_string(), "10.1.2.0/24".to_string()],
+        "the query is read as its network address and every key is a stored key"
+    );
+    let owned: Vec<String> = snap
+        .owned()
+        .children("10.1.2.3/16".parse().unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|(p, _)| p.to_string())
+        .collect();
+    assert_eq!(owned, keys, "both views answer the same way");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_value_whose_deserialize_refuses_is_an_error_not_a_miss() {
+    use bgpkit_snap::rkyv;
+
+    // rkyv allows a Deserialize that refuses; the owned view must not turn that into
+    // "no such prefix", which would make len() disagree with iter()
+    #[derive(Clone, rkyv::Archive, rkyv::Serialize)]
+    struct F(u32);
+    impl SnapValue for F {
+        const TYPE_ID: &str = "ergonomics.fallible:v1";
+    }
+    impl rkyv::Deserialize<F, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>> for ArchivedF {
+        fn deserialize(
+            &self,
+            _d: &mut rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+        ) -> Result<F, rkyv::rancor::Error> {
+            Err(rkyv::rancor::Source::new(std::io::Error::other("refused")))
+        }
+    }
+
+    let d = dir("fallible");
+    let path = d.join("o.snap");
+    let mut w: Writer<F> = Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), F(1)).unwrap();
+    w.finish_to(&path, &Opts::now()).unwrap();
+    let snap: Snapshot<F> = Snapshot::open(&path).unwrap();
+    assert!(
+        snap.get_exact("10.0.0.0/8".parse().unwrap()).is_some(),
+        "the archived view still answers"
+    );
+    assert!(
+        snap.owned()
+            .get_exact("10.0.0.0/8".parse().unwrap())
+            .is_err(),
+        "the owned view reports the value it could not build"
+    );
+    assert_eq!(snap.owned().len(), 1);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_zero_generation_is_refused_rather_than_breaking_every_checkpoint() {
+    let d = dir("zero-generation");
+    let err =
+        match Journal::<V>::open_with(&d, TreeId::from_name("zero-gen"), None, Some([0u8; 16])) {
+            Ok(_) => panic!("a zero generation cannot be committed"),
+            Err(e) => e,
+        };
+    assert!(format!("{err}").contains("generation"), "got {err}");
+    std::fs::remove_dir_all(&d).ok();
 }

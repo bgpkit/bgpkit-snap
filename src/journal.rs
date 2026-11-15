@@ -100,13 +100,19 @@ where
 {
     /// Open a journal, recovering the tree from the last checkpoint plus the
     /// segments. The generation is reused when a journal already exists.
-    pub fn open(
+    /// A journal over a tree with no payload section, which is the common case.
+    pub fn open(dir: impl AsRef<Path>, tree_id: impl Into<crate::TreeId>) -> Result<Self, Error> {
+        Self::open_with(dir, tree_id, None, None)
+    }
+
+    /// A journal whose values point into a blob arena. The section has to be the one
+    /// the directory was checkpointed with, or `open` refuses it.
+    pub fn open_with_payload(
         dir: impl AsRef<Path>,
         tree_id: impl Into<crate::TreeId>,
-        payload: Option<PayloadSection>,
+        payload: PayloadSection,
     ) -> Result<Self, Error> {
-        let tree_id = *tree_id.into().as_bytes();
-        Self::open_with(dir, tree_id, payload, None)
+        Self::open_with(dir, tree_id, Some(payload), None)
     }
 
     /// `generation` names the stream incarnation. A caller passes `Some` only to
@@ -121,6 +127,11 @@ where
         let tree_id = *tree_id.into().as_bytes();
         let dir = dir.as_ref().to_path_buf();
         // reject here what a checkpoint would reject later, after data was written
+        if generation.unwrap_or([1u8; 16]) == [0u8; 16] {
+            return Err(Error::BadOpts(
+                "a journal generation of all zeros means \"mint one\"; pass None to mint it",
+            ));
+        }
         if tree_id == [0u8; 16] {
             return Err(Error::BadOpts("tree id is all zero"));
         }
@@ -228,12 +239,16 @@ where
         let Some(mut seg) = self.seg.take() else {
             return Ok(());
         };
-        if seg.file.flush().is_err() || seg.file.get_ref().sync_all().is_err() {
+        // keep the file system's error: on a full disk or a dying device, errno is
+        // the only thing that says which
+        let durability = seg
+            .file
+            .flush()
+            .and_then(|()| seg.file.get_ref().sync_all());
+        if let Err(e) = durability {
             self.seg_dirty_from = Some(seg.bytes);
             self.seg = Some(seg);
-            return Err(Error::Io(std::io::Error::other(
-                "could not flush the segment being rotated",
-            )));
+            return Err(Error::Io(e));
         }
         self.seg_path = None;
         self.seg_index += 1;
@@ -307,8 +322,15 @@ where
     fn recover(&mut self, state: Option<State>) -> Result<Option<String>, Error> {
         if let Some((base, file)) = state.as_ref().and_then(|s| s.checkpoint.clone()) {
             let path = self.dir.join(&file);
-            let raw = std::fs::read(&path)
-                .map_err(|_| Error::BadRecord("checkpoint named by state.json is missing"))?;
+            let raw = std::fs::read(&path).map_err(|e| match e.kind() {
+                // a missing checkpoint is a state problem the caller can repair
+                std::io::ErrorKind::NotFound => {
+                    Error::BadRecord("checkpoint named by state.json is missing")
+                }
+                // permission, a directory in its place, a broken mount: report what
+                // the file system said rather than guessing at its meaning
+                _ => Error::Io(e),
+            })?;
             struct KnownPayload(Option<u16>);
             impl crate::Validator for KnownPayload {
                 fn knows(&self, entry: &crate::Entry) -> bool {
@@ -316,7 +338,19 @@ where
                 }
             }
             let snap: Snapshot<T> =
-                Snapshot::from_bytes_with(&raw, &KnownPayload(self.payload.map(|p| p.id)))?;
+                match Snapshot::from_bytes_with(&raw, &KnownPayload(self.payload.map(|p| p.id))) {
+                    Ok(snap) => snap,
+                    // a payload-bearing checkpoint opened without its payload is the
+                    // configuration mistake that costs the arena, so name it as such
+                    Err(Error::UnknownRequiredSection(_)) if self.payload.is_none() => {
+                        return Err(Error::BadRecord(
+                            "checkpoint carries a payload section this journal was not opened \
+                         with; reopen it with that PayloadSection, or the arena the handles \
+                         point into is gone",
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                };
             match snap.header().stream() {
                 Some(s) if s.tree_id == self.tree_id && s.generation == self.generation => {}
                 _ => {
@@ -339,10 +373,10 @@ where
                 Some(s) if s.base_seq == base => {}
                 _ => return Err(Error::BadRecord("checkpoint base_seq disagrees with state")),
             }
-            // the tries and the arena are what a journal needs back. A caller's
-            // optional sidecar is data for whoever opened the object, not for the
-            // journal, so it is ignored rather than treated as a mismatch. A
-            // required section is different: dropping it would lose data.
+            // The checkpoint must have exactly the sections this journal writes:
+            // the tries plus the payload it was opened with. Anything else means the
+            // directory was written under a different configuration, and opening it
+            // anyway would drop the arena that the handles point into.
             for entry in snap.entries() {
                 if entry.id == crate::header::ID_V4 || entry.id == crate::header::ID_V6 {
                     continue;
@@ -350,9 +384,18 @@ where
                 let is_payload = self
                     .payload
                     .is_some_and(|p| p.id == entry.id && p.kind == entry.kind);
-                if !is_payload && entry.required {
+                if !is_payload {
                     return Err(Error::BadRecord(
-                        "checkpoint has a required section this journal cannot carry",
+                        "checkpoint carries a section this journal was not opened with; \
+                         reopen it with that payload section, or the data it holds is lost",
+                    ));
+                }
+            }
+            if let Some(payload) = self.payload {
+                if snap.section_bytes(payload.id).is_none() {
+                    return Err(Error::BadRecord(
+                        "checkpoint has no payload section, but this journal was opened \
+                         with one; the arena the handles point into would be lost",
                     ));
                 }
             }
@@ -481,14 +524,14 @@ where
         Ok(())
     }
 
-    pub fn insert(&mut self, prefix: IpNet, value: &T) -> Result<u64, Error> {
+    pub fn insert(&mut self, prefix: IpNet, value: T) -> Result<u64, Error> {
         self.insert_at(prefix, value, Times::default())
     }
 
     /// Insert a value and record when it was received and when the event it
     /// describes happened, both unix seconds. `Times::default()` leaves both zero,
     /// which is what a caller who does not track time wants.
-    pub fn insert_at(&mut self, prefix: IpNet, value: &T, times: Times) -> Result<u64, Error> {
+    pub fn insert_at(&mut self, prefix: IpNet, value: T, times: Times) -> Result<u64, Error> {
         if prefix.addr() != prefix.network() {
             return Err(Error::BadPrefix(prefix.to_string()));
         }
@@ -704,7 +747,7 @@ where
             },
         )?;
         drop(lock);
-        Self::open(dir, tree_id, payload)
+        Self::open_with(dir, tree_id, payload, None)
     }
 
     /// A record is durable once this returns.
@@ -713,9 +756,13 @@ where
             // a failed flush or fsync leaves bytes whose completeness is unknown;
             // the next append must cut back to the last acknowledged offset
             let start = seg.bytes;
-            if seg.file.flush().is_err() || seg.file.get_ref().sync_all().is_err() {
+            let durability = seg
+                .file
+                .flush()
+                .and_then(|()| seg.file.get_ref().sync_all());
+            if let Err(e) = durability {
                 self.seg_dirty_from = Some(start);
-                return Err(Error::Io(std::io::Error::other("segment fsync failed")));
+                return Err(Error::Io(e));
             }
         }
         let state = State {
@@ -733,9 +780,9 @@ where
     /// The object this journal would checkpoint, as bytes, without writing or
     /// pruning anything.
     ///
-    /// `Snapshot::from_bytes` on the result gives every query the journal itself
-    /// does not answer (`children`, `iter`, `cover`), which is why the journal
-    /// does not grow a second copy of that surface.
+    /// The object carries the journal's payload section, so a plain
+    /// `Snapshot::from_bytes` refuses it; use `to_snapshot` for queries, or
+    /// `Snapshot::from_bytes_with` with a validator that knows that section.
     pub fn to_bytes(&self, opts: &Opts<'_>) -> Result<Vec<u8>, Error> {
         Self::build_object(
             &self.v4,
@@ -793,13 +840,11 @@ where
         // the caller's sections travel with the object; the journal adds the arena
         // it owns. Dropping them silently would produce a checkpoint that is not
         // what the caller asked for.
-        for extra in opts.extras {
-            if extra.required {
-                return Err(Error::BadOpts(
-                    "a checkpoint cannot carry a required section: this journal cannot \
-                     reopen a section it has no validator for",
-                ));
-            }
+        if !opts.extras.is_empty() {
+            return Err(Error::BadOpts(
+                "a checkpoint carries the journal's own sections only: write a general \
+                 object with Writer::finish when you need your own",
+            ));
         }
         let mut extras: Vec<ExtraSection<'_>> = opts.extras.to_vec();
         if let Some(payload) = payload {
@@ -829,7 +874,33 @@ where
         Ok(bytes)
     }
 
+    /// Write a snapshot of the live tree, verify it, commit it, publish it and prune
+    /// what it covers.
+    ///
+    /// The commit point is `state.json`: before it is written, a failure leaves the
+    /// previous checkpoint current and the call can simply be retried. Publishing
+    /// `current.snap` and pruning after the commit are best effort, because a reader
+    /// that opens `current.snap` after a crash gets the previous object and the
+    /// journal itself is already correct; a failed prune costs disk, not data.
+    ///
+    /// A checkpoint carries the journal's own sections only. Use `Writer::finish`
+    /// when the object needs a profile section, and `checkpoint_with` when the
+    /// profile has a validator that must pass before the object is committed.
     pub fn checkpoint(&mut self, opts: &Opts<'_>) -> Result<PathBuf, Error> {
+        struct NoSections;
+        impl crate::Validator for NoSections {}
+        self.checkpoint_with(opts, &NoSections)
+    }
+
+    /// A checkpoint that also runs `validator` over the object before committing it.
+    ///
+    /// `checkpoint` only proves the container and the tries; a profile that adds a
+    /// section of its own is the only thing that can check it.
+    pub fn checkpoint_with(
+        &mut self,
+        opts: &Opts<'_>,
+        validator: &dyn crate::Validator,
+    ) -> Result<PathBuf, Error> {
         let bytes = self.to_bytes(opts)?;
 
         // verify before pruning: a bad object must not take the history with it.
@@ -843,6 +914,9 @@ where
         }
         let snap: Snapshot<T> =
             Snapshot::from_bytes_with(&bytes, &KnownPayload(self.payload.map(|p| p.id)))?;
+        // the container and the tries are the journal's business; the profile's own
+        // sections are the caller's, and only its validator can check them
+        validator.validate(&snap.view())?;
         if snap.len() != self.len() {
             return Err(Error::BadRecord("checkpoint does not hold the live tree"));
         }
@@ -874,15 +948,18 @@ where
         self.checkpoint = Some((covered, name.clone()));
         self.publish_current(&name)?;
 
-        // G4: an older snapshot is dead weight once a newer one is committed, and
-        // only a restart used to clean it up
-        for old in snapshot_paths(&self.dir)? {
-            let old_name = old
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if old_name != name {
-                let _ = std::fs::remove_file(&old);
+        // An older snapshot is dead weight once a newer one is committed. This is
+        // reclamation, not correctness, so it never fails a checkpoint that is
+        // already committed; the next one tries again.
+        if let Ok(old_snapshots) = snapshot_paths(&self.dir) {
+            for old in old_snapshots {
+                let old_name = old
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if old_name != name {
+                    let _ = std::fs::remove_file(&old);
+                }
             }
         }
 
@@ -1207,8 +1284,8 @@ mod tests {
             let tree_id = [71u8; 16];
             {
                 let mut j: Journal<V> =
-                    Journal::open(&dir, tree_id, Some(PayloadSection::payload(16))).unwrap();
-                j.insert("10.0.0.0/8".parse().unwrap(), &V(1)).unwrap();
+                    Journal::open_with_payload(&dir, tree_id, PayloadSection::payload(16)).unwrap();
+                j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
                 j.sync().unwrap();
             }
             let segment = std::fs::read_dir(&dir)
@@ -1229,7 +1306,8 @@ mod tests {
             raw[SEGMENT_HEADER_LEN + 4..payload_base].copy_from_slice(&crc.to_le_bytes());
             std::fs::write(&segment, &raw).unwrap();
 
-            let reopened = Journal::<V>::open(&dir, tree_id, Some(PayloadSection::payload(16)));
+            let reopened =
+                Journal::<V>::open_with_payload(&dir, tree_id, PayloadSection::payload(16));
             match reopened {
                 Ok(j) => panic!(
                     "a record with {name} set must be refused, got len {}",
@@ -1254,8 +1332,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("snap-torn-write-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let mut j: Journal<V> =
-            Journal::open(&dir, [1u8; 16], Some(PayloadSection::payload(16))).unwrap();
-        j.insert("10.0.0.0/8".parse().unwrap(), &V(1)).unwrap();
+            Journal::open_with_payload(&dir, [1u8; 16], PayloadSection::payload(16)).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.sync().unwrap();
 
         // what a half-finished write looks like: the length and crc of a frame
@@ -1274,12 +1352,13 @@ mod tests {
         }
         j.seg_dirty_from = Some(written);
 
-        j.insert("192.0.2.0/24".parse().unwrap(), &V(2)).unwrap();
+        j.insert("192.0.2.0/24".parse().unwrap(), V(2)).unwrap();
         j.sync().unwrap();
         drop(j);
 
-        let j: Journal<V> = Journal::open(&dir, [1u8; 16], Some(PayloadSection::payload(16)))
-            .expect("the torn bytes must not survive into a reopen");
+        let j: Journal<V> =
+            Journal::open_with_payload(&dir, [1u8; 16], PayloadSection::payload(16))
+                .expect("the torn bytes must not survive into a reopen");
         assert_eq!(j.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
