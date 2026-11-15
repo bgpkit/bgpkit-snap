@@ -108,13 +108,33 @@ Writer::insert(prefix, value)               // replaces an existing value
 Writer::len()
 Writer::finish(&Opts) -> Result<Vec<u8>>    // caller writes the file
 
-Snapshot::<T>::open(path)                   // refuses unknown required sections
+Snapshot::<T>::open(path)                   // takes any AsRef<Path>
 Snapshot::<T>::open_with(path, &dyn Validator)
 Snapshot::<T>::from_bytes(&[u8])            // and from_bytes_with
+Writer::finish(&opts) -> Vec<u8>             // caller writes the bytes
+Writer::finish_to(path, &opts) -> u64        // or writes them, atomically
+
+// longest-prefix lookups
 Snapshot::search(ip: IpAddr) -> Option<(IpNet, &T::Archived)>
 Snapshot::search_prefix(prefix) -> Option<(IpNet, &T::Archived)>
-Snapshot::children(prefix) -> Vec<(IpNet, &T::Archived)>   // the prefix itself when
-                                                          // stored, plus what is under it
+Snapshot::search_owned(ip: IpAddr) -> Option<(IpNet, T)>   // deserialized
+Snapshot::get_owned(prefix) -> Option<T>
+
+// the prefix_trie read API, with IpNet keys and no family match in the caller
+Snapshot::get(prefix) -> Option<&T::Archived>
+Snapshot::get_key_value(prefix) -> Option<(IpNet, &T::Archived)>
+Snapshot::contains_key(prefix) -> bool
+Snapshot::get_lpm(prefix) -> Option<(IpNet, &T::Archived)>       // most specific cover
+Snapshot::get_lpm_prefix(prefix) -> Option<IpNet>
+Snapshot::get_spm(prefix) -> Option<(IpNet, &T::Archived)>       // least specific cover
+Snapshot::get_spm_prefix(prefix) -> Option<IpNet>
+Snapshot::is_covered(prefix) -> bool
+Snapshot::is_covered_in_aggregate(prefix) -> bool
+Snapshot::iter() -> Iterator<(IpNet, &T::Archived)>              // v4 then v6
+Snapshot::iter_from(prefix, inclusive) -> Iterator<...>
+Snapshot::keys() -> Iterator<IpNet>
+Snapshot::children(prefix) -> Vec<(IpNet, &T::Archived)>         // prefix plus subtree
+Snapshot::cover(prefix) -> Vec<(IpNet, &T::Archived)>
 Snapshot::section_bytes(id) -> Option<&[u8]>
 Snapshot::header() -> &Header
 

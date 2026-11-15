@@ -326,6 +326,22 @@ impl<T: SnapValue> Writer<T> {
         debug_assert_eq!(out.len() as u64, file_len);
         Ok(out)
     }
+
+    /// Build the object and write it to `path` in one call, returning the number
+    /// of bytes written. The file is written beside the target and renamed, so a
+    /// reader never sees a half-written object.
+    pub fn finish_to(
+        self,
+        path: impl AsRef<std::path::Path>,
+        opts: &Opts<'_>,
+    ) -> Result<u64, Error> {
+        let bytes = self.finish(opts)?;
+        let path = path.as_ref();
+        let tmp = path.with_extension("snap.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(bytes.len() as u64)
+    }
 }
 
 // ---------------------------------------------------------------- reader
@@ -457,20 +473,23 @@ impl<T: SnapValue> fmt::Debug for Snapshot<T> {
 }
 
 impl<T: SnapValue> Snapshot<T> {
-    pub fn open(path: &str) -> Result<Self, Error>
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, Error>
     where
         T::Archived:
             for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
     {
-        Self::from_bytes(&std::fs::read(path)?)
+        Self::from_bytes(&std::fs::read(path.as_ref())?)
     }
 
-    pub fn open_with(path: &str, validator: &dyn Validator) -> Result<Self, Error>
+    pub fn open_with(
+        path: impl AsRef<std::path::Path>,
+        validator: &dyn Validator,
+    ) -> Result<Self, Error>
     where
         T::Archived:
             for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
     {
-        Self::from_bytes_with(&std::fs::read(path)?, validator)
+        Self::from_bytes_with(&std::fs::read(path.as_ref())?, validator)
     }
 
     pub fn from_bytes(raw: &[u8]) -> Result<Self, Error>
@@ -692,6 +711,171 @@ impl<T: SnapValue> Snapshot<T> {
                 let (lpm, value) = map.get_lpm(&p)?;
                 Some((IpNet::V6(lpm), value))
             }
+        }
+    }
+
+    // ---- the read side of prefix_trie, with IpNet keys ----
+    //
+    // A snapshot holds two tries, one per family. These forward the map's own
+    // read API so a caller does not have to match on the family and hold two
+    // code paths for every query.
+
+    /// The value stored exactly at `prefix`.
+    pub fn get(&self, prefix: IpNet) -> Option<&T::Archived> {
+        match prefix {
+            IpNet::V4(p) => self.v4().and_then(|m| m.get(&p)),
+            IpNet::V6(p) => self.v6().and_then(|m| m.get(&p)),
+        }
+    }
+
+    /// The stored prefix and its value, when `prefix` is stored as given.
+    pub fn get_key_value(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
+        match prefix {
+            IpNet::V4(p) => self
+                .v4()
+                .and_then(|m| m.get_key_value(&p))
+                .map(|(k, v)| (IpNet::V4(k), v)),
+            IpNet::V6(p) => self
+                .v6()
+                .and_then(|m| m.get_key_value(&p))
+                .map(|(k, v)| (IpNet::V6(k), v)),
+        }
+    }
+
+    /// Whether `prefix` is stored as given.
+    pub fn contains_key(&self, prefix: IpNet) -> bool {
+        match prefix {
+            IpNet::V4(p) => self.v4().is_some_and(|m| m.contains_key(&p)),
+            IpNet::V6(p) => self.v6().is_some_and(|m| m.contains_key(&p)),
+        }
+    }
+
+    /// Longest prefix that covers `prefix`, and its value.
+    pub fn get_lpm(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
+        self.search_prefix(prefix)
+    }
+
+    /// The key of the longest prefix that covers `prefix`.
+    pub fn get_lpm_prefix(&self, prefix: IpNet) -> Option<IpNet> {
+        self.get_lpm(prefix).map(|(p, _)| p)
+    }
+
+    /// Shortest prefix that sits under `prefix`, and its value.
+    pub fn get_spm(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
+        match prefix {
+            IpNet::V4(p) => self
+                .v4()
+                .and_then(|m| m.get_spm(&p))
+                .map(|(k, v)| (IpNet::V4(k), v)),
+            IpNet::V6(p) => self
+                .v6()
+                .and_then(|m| m.get_spm(&p))
+                .map(|(k, v)| (IpNet::V6(k), v)),
+        }
+    }
+
+    /// The key of the shortest prefix that sits under `prefix`.
+    pub fn get_spm_prefix(&self, prefix: IpNet) -> Option<IpNet> {
+        self.get_spm(prefix).map(|(p, _)| p)
+    }
+
+    /// Whether some stored prefix covers `prefix`.
+    pub fn is_covered(&self, prefix: IpNet) -> bool {
+        match prefix {
+            IpNet::V4(p) => self.v4().is_some_and(|m| m.is_covered(&p)),
+            IpNet::V6(p) => self.v6().is_some_and(|m| m.is_covered(&p)),
+        }
+    }
+
+    /// Whether `prefix` is covered by an aggregate entry, that is a stored
+    /// prefix carrying its whole subtree.
+    pub fn is_covered_in_aggregate(&self, prefix: IpNet) -> bool {
+        match prefix {
+            IpNet::V4(p) => self.v4().is_some_and(|m| m.is_covered_in_aggregate(&p)),
+            IpNet::V6(p) => self.v6().is_some_and(|m| m.is_covered_in_aggregate(&p)),
+        }
+    }
+
+    /// The value stored exactly at `prefix`, deserialized.
+    ///
+    /// A caller that only reads a scalar should not have to depend on the
+    /// archive library to get it out.
+    pub fn get_owned(&self, prefix: IpNet) -> Option<T>
+    where
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
+    {
+        let value = self.get(prefix)?;
+        rkyv::deserialize::<T, RkyvError>(value).ok()
+    }
+
+    /// Longest-prefix match for an address, with the value deserialized.
+    pub fn search_owned(&self, addr: std::net::IpAddr) -> Option<(IpNet, T)>
+    where
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
+    {
+        let (prefix, value) = self.search(addr)?;
+        let value = rkyv::deserialize::<T, RkyvError>(value).ok()?;
+        Some((prefix, value))
+    }
+
+    /// Every entry, IPv4 first then IPv6, in trie order.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = (IpNet, &T::Archived)> + '_> {
+        let v4 = self
+            .v4()
+            .into_iter()
+            .flat_map(|m| m.iter())
+            .map(|(p, v)| (IpNet::V4(p), v));
+        let v6 = self
+            .v6()
+            .into_iter()
+            .flat_map(|m| m.iter())
+            .map(|(p, v)| (IpNet::V6(p), v));
+        Box::new(v4.chain(v6))
+    }
+
+    /// Every key, IPv4 first then IPv6.
+    pub fn keys(&self) -> Box<dyn Iterator<Item = IpNet> + '_> {
+        Box::new(self.iter().map(|(p, _)| p))
+    }
+
+    /// Every entry at or after `prefix` in trie order, for a caller that wants to
+    /// walk a range instead of the whole object.
+    pub fn iter_from(
+        &self,
+        prefix: IpNet,
+        inclusive: bool,
+    ) -> Box<dyn Iterator<Item = (IpNet, &T::Archived)> + '_> {
+        match prefix {
+            IpNet::V4(p) => {
+                let it = self
+                    .v4()
+                    .into_iter()
+                    .flat_map(move |m| m.iter_from(&p, inclusive))
+                    .map(|(k, v)| (IpNet::V4(k), v));
+                Box::new(it)
+            }
+            IpNet::V6(p) => {
+                let it = self
+                    .v6()
+                    .into_iter()
+                    .flat_map(move |m| m.iter_from(&p, inclusive))
+                    .map(|(k, v)| (IpNet::V6(k), v));
+                Box::new(it)
+            }
+        }
+    }
+
+    /// The prefixes that cover `prefix`, each with its value.
+    pub fn cover(&self, prefix: IpNet) -> Vec<(IpNet, &T::Archived)> {
+        match prefix {
+            IpNet::V4(p) => self
+                .v4()
+                .map(|m| m.cover(&p).map(|(k, v)| (IpNet::V4(k), v)).collect())
+                .unwrap_or_default(),
+            IpNet::V6(p) => self
+                .v6()
+                .map(|m| m.cover(&p).map(|(k, v)| (IpNet::V6(k), v)).collect())
+                .unwrap_or_default(),
         }
     }
 
