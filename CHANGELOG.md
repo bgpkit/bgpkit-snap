@@ -19,6 +19,12 @@ API
   query surface on the journal.
 - `Writer::insert_many` stops at the first refused prefix. `Writer` deliberately does
   not implement `Extend`, which cannot report that.
+- `Snapshot::merge_last_wins` and `merge_with`: fold several objects into one, the
+  daily-merge step. The merge drops stream coordinates because several streams are not
+  one stream, and takes the union of the input windows when every input declares one.
+- `ipnet` is re-exported. Unlike the archive re-export this one is complete, because no
+  macro expands `::ipnet::` paths, so a caller cannot end up on a different `ipnet`
+  version than the signatures use.
 - five queries removed because they were compositions of the others: `lpm_prefix`,
   `spm_prefix`, `get_key_value`, `cover_keys`, `cover_values`.
 - `Error::BadArchive(u16)` separates "this section's body is not an archive of your

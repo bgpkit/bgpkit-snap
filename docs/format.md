@@ -118,6 +118,8 @@ Snapshot::<T>::from_bytes(&[u8])            // and from_bytes_with
 Snapshot::search(ip: IpAddr) -> Option<(IpNet, &T::Archived)>
 Snapshot::get_exact(prefix) -> Option<&T::Archived>
 Snapshot::owned() -> Owned<T>                    // the same queries, returning Result<T>
+Snapshot::merge_last_wins(&[&Snapshot], &Opts) -> Result<Vec<u8>>
+Snapshot::merge_with(&[&Snapshot], &Opts, combine) -> Result<Vec<u8>>
 
 // the prefix_trie read API, with IpNet keys and no family match in the caller
 Snapshot::contains_key(prefix) -> bool

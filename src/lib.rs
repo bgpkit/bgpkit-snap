@@ -11,6 +11,11 @@ use prefix_trie::rkyv::ArchivedPrefixMap;
 use prefix_trie::{AsView, PrefixMap, TrieView};
 use rkyv::rancor::Error as RkyvError;
 
+/// The address types this crate takes and returns, re-exported so a caller cannot
+/// end up on another version of `ipnet` than the one in its signatures. Unlike the
+/// archive re-export this one is complete: no macro expands `::ipnet::` paths.
+pub use ipnet;
+
 /// The archive library this crate builds value types on, re-exported so a
 /// caller can name the same version in a signature.
 ///
@@ -516,6 +521,97 @@ impl<T: SnapValue> Writer<T> {
             let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
         }
         Ok(bytes.len() as u64)
+    }
+}
+
+// ---------------------------------------------------------------- merge
+
+impl<T: SnapValue> Snapshot<T> {
+    /// Merge several objects into one, later inputs winning where they overlap.
+    ///
+    /// This is what a daily merge is: build one object per collector or per hour,
+    /// then fold them. Order matters only for overlaps; the bytes do not depend on
+    /// it, because the writer sorts by prefix like any other build.
+    ///
+    /// The stream coordinates are dropped: a merge of several streams is not one
+    /// stream. `opts.window` left as `None` becomes the union of the inputs'
+    /// windows when every input declares one, and stays absent otherwise.
+    pub fn merge_last_wins(inputs: &[&Snapshot<T>], opts: &Opts<'_>) -> Result<Vec<u8>, Error>
+    where
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
+    {
+        Self::merge_with(inputs, opts, |_, later| Some(later))
+    }
+
+    /// The same, with `combine` deciding an overlap. Returning `None` drops the
+    /// prefix from the result, which is how a withdrawal is expressed.
+    ///
+    /// Both values are owned: a merge that has to look at two archived values and
+    /// then write one cannot avoid building at least one of them.
+    pub fn merge_with(
+        inputs: &[&Snapshot<T>],
+        opts: &Opts<'_>,
+        mut combine: impl FnMut(T, T) -> Option<T>,
+    ) -> Result<Vec<u8>, Error>
+    where
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
+    {
+        let mut merged: std::collections::HashMap<IpNet, T> = std::collections::HashMap::new();
+        for snap in inputs {
+            for (prefix, value) in snap.iter() {
+                let value =
+                    rkyv::deserialize::<T, RkyvError>(value).map_err(|_| Error::BadValue)?;
+                match merged.remove(&prefix) {
+                    None => {
+                        merged.insert(prefix, value);
+                    }
+                    Some(earlier) => {
+                        if let Some(next) = combine(earlier, value) {
+                            merged.insert(prefix, next);
+                        }
+                    }
+                }
+            }
+        }
+
+        let window = match opts.window {
+            Some(w) => Some(w),
+            None => {
+                let mut from: Option<i64> = None;
+                let mut to: Option<i64> = None;
+                let mut all = !inputs.is_empty();
+                for snap in inputs {
+                    match snap.header().window() {
+                        Some((a, b)) => {
+                            from = Some(from.map_or(a, |f: i64| f.min(a)));
+                            to = Some(to.map_or(b, |t: i64| t.max(b)));
+                        }
+                        None => {
+                            all = false;
+                            break;
+                        }
+                    }
+                }
+                if all {
+                    match (from, to) {
+                        (Some(a), Some(b)) => Some((a, b)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        let mut writer = Writer::<T>::new();
+        writer.insert_many(merged)?;
+        let opts = Opts {
+            created_at: opts.created_at,
+            stream: None,
+            window,
+            extras: &[],
+        };
+        writer.finish(&opts)
     }
 }
 
