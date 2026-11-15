@@ -109,7 +109,14 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
@@ -122,6 +129,10 @@ impl From<std::io::Error> for Error {
 /// A value type that can live in a trie.
 pub trait SnapValue: rkyv::Archive + Clone + for<'a> rkyv::Serialize<HighSer<'a>> {
     /// Stable identifier, e.g. `snap.u32:v1`.
+    ///
+    /// At most 31 bytes of printable ASCII, no space, quote or backslash, and not
+    /// empty: it is stored verbatim in the header and compared on every open, so a
+    /// value that cannot round-trip through those bytes is rejected at `finish`.
     const TYPE_ID: &'static str;
 
     /// Bring the value into canonical form before it is written. The default is
@@ -424,6 +435,16 @@ impl SnapshotView<'_> {
             .iter()
             .find(|(e, _, _)| e.id == id)
             .map(|(_, off, len)| &self.bytes[*off..*off + *len])
+    }
+
+    /// The table entry for section `id`: its id, kind, required flag and length.
+    /// `knows` only runs for required sections, so a profile that also wants to
+    /// check the kind of an optional one does it here.
+    pub fn entry(&self, id: u16) -> Option<&Entry> {
+        self.sections
+            .iter()
+            .find(|(e, _, _)| e.id == id)
+            .map(|(e, _, _)| e)
     }
 
     /// Raw table bytes, for a reader that only wants to enumerate sections.

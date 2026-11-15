@@ -26,14 +26,15 @@ enum Cmd {
         /// unix seconds UTC; defaults to now
         #[arg(long)]
         created_at: Option<i64>,
+        /// Coverage claim as FROM,TO in unix seconds
         #[arg(long)]
         window: Option<String>,
     },
     /// Print what the 192-byte header says
     Info { file: String },
-    /// Verify the whole object
+    /// Verify the container, and the bodies when the type is snap.u32:v1
     Verify { file: String },
-    /// Longest-prefix match for an address or prefix
+    /// Longest-prefix match for an address or prefix, in a snap.u32:v1 object
     Search { file: String, query: String },
 }
 
@@ -119,6 +120,14 @@ fn info(file: &str) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::File::open(file)?.read_exact(&mut raw)?;
     }
     let h = Header::parse(&raw)?;
+    // the header is a claim about the file, so say when the file disagrees
+    let on_disk = std::fs::metadata(file)?.len();
+    if on_disk != h.file_len {
+        println!(
+            "unverified the header claims {} bytes, the file has {on_disk}",
+            h.file_len
+        );
+    }
     println!("type_id    {}", h.type_id_str());
     println!("content_id {}", h.content_id_hex());
     println!("file_len   {}", h.file_len);

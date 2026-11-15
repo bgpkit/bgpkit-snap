@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/bgpkit/bgpkit-snap"
 readme = "README.md"
 description = "Versioned single-file container for prefix tries, with an append-only journal"
-keywords = ["bgp", "prefix", "trie", "snapshot", "mmap"]
+keywords = ["bgp", "prefix", "trie", "snapshot", "index"]
 categories = ["network-programming", "data-structures", "filesystem"]
 exclude = ["tests/downstream"]
 

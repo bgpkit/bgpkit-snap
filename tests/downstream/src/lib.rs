@@ -23,14 +23,19 @@ pub struct AttrsProfile;
 
 impl Validator for AttrsProfile {
     fn knows(&self, entry: &Entry) -> bool {
-        entry.id == ATTRS_SECTION && entry.kind == bgpkit_snap::KIND_PAYLOAD
+        entry.id == ATTRS_SECTION
     }
 
     fn validate(&self, view: &SnapshotView<'_>) -> Result<(), bgpkit_snap::Error> {
-        if view.section_bytes(ATTRS_SECTION).is_none() {
-            return Err(bgpkit_snap::Error::BadSectionTable("section 32 is missing"));
+        // kind is checked here, not in `knows`: an optional section never reaches
+        // `knows`, so a kind test there would only cover the required case
+        match view.entry(ATTRS_SECTION) {
+            Some(s) if s.kind == bgpkit_snap::KIND_PAYLOAD => Ok(()),
+            Some(_) => Err(bgpkit_snap::Error::BadSectionTable(
+                "section 32 is not a payload section",
+            )),
+            None => Err(bgpkit_snap::Error::BadSectionTable("section 32 is missing")),
         }
-        Ok(())
     }
 }
 
