@@ -84,14 +84,16 @@ fn demo_b_handle_round_trip_and_bad_range() {
             off: off_a,
             len: a.len() as u32,
         },
-    );
+    )
+    .expect("canonical prefix");
     w.insert(
         "10.1.0.0/16".parse().unwrap(),
         PathRef {
             off: off_b,
             len: b.len() as u32,
         },
-    );
+    )
+    .expect("canonical prefix");
     // a deliberately broken handle
     w.insert(
         "10.2.0.0/16".parse().unwrap(),
@@ -99,7 +101,8 @@ fn demo_b_handle_round_trip_and_bad_range() {
             off: 9_000,
             len: 40,
         },
-    );
+    )
+    .expect("canonical prefix");
 
     let bytes = w
         .finish(&Opts {
@@ -154,23 +157,15 @@ fn demo_b_journal_carries_the_payload() {
         let mut j: Journal<PathRef> =
             Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID)))
                 .expect("open journal");
-        j.insert_with_blob(
-            "10.0.0.0/8".parse().unwrap(),
-            &PathRef {
-                off: 0,
-                len: a.len() as u32,
-            },
-            &a,
-        )
+        j.insert_with_blob("10.0.0.0/8".parse().unwrap(), &a, |off| PathRef {
+            off: off as u32,
+            len: a.len() as u32,
+        })
         .expect("insert a");
-        j.insert_with_blob(
-            "10.1.0.0/16".parse().unwrap(),
-            &PathRef {
-                off: a.len() as u32,
-                len: b.len() as u32,
-            },
-            &b,
-        )
+        j.insert_with_blob("10.1.0.0/16".parse().unwrap(), &b, |off| PathRef {
+            off: off as u32,
+            len: b.len() as u32,
+        })
         .expect("insert b");
         j.sync().expect("sync");
         let snap_path = j
@@ -249,7 +244,7 @@ fn demo_b_journal_updates_the_live_tree_and_refuses_a_second_writer() {
             extras: &[],
         })
         .expect("checkpoint");
-    let snap: Snapshot<PathRef> = Snapshot::open(snap_path.to_str().unwrap()).expect("open");
+    let snap: Snapshot<PathRef> = open_with_sections(snap_path.to_str().unwrap());
     assert!(
         snap.search("10.1.2.3".parse().unwrap()).is_some(),
         "the checkpoint must contain what was inserted"
@@ -272,7 +267,8 @@ fn children_are_limited_to_the_requested_prefix() {
     let arena = b"x".to_vec();
     let mut w: bgpkit_snap::Writer<PathRef> = bgpkit_snap::Writer::new();
     for p in ["10.0.0.0/8", "10.2.0.0/16", "10.3.0.0/16", "10.4.0.0/16"] {
-        w.insert(p.parse().unwrap(), PathRef { off: 0, len: 1 });
+        w.insert(p.parse().unwrap(), PathRef { off: 0, len: 1 })
+            .expect("canonical");
     }
     let bytes = w
         .finish(&Opts {
@@ -382,7 +378,7 @@ fn an_empty_tree_can_be_checkpointed() {
             extras: &[],
         })
         .expect("an empty tree is a legal object");
-    let snap: Snapshot<PathRef> = Snapshot::open(path.to_str().unwrap()).expect("open");
+    let snap: Snapshot<PathRef> = open_with_sections(path.to_str().unwrap());
     assert_eq!(snap.len(), 0);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -514,11 +510,10 @@ fn a_blob_without_a_payload_section_is_refused() {
     let log = dir.join("journal");
     let mut j: Journal<PathRef> = Journal::open(&log, [6u8; 16], None).unwrap();
     let err = j
-        .insert_with_blob(
-            "10.0.0.0/8".parse().unwrap(),
-            &PathRef { off: 0, len: 0 },
-            b"x",
-        )
+        .insert_with_blob("10.0.0.0/8".parse().unwrap(), b"x", |_| PathRef {
+            off: 0,
+            len: 0,
+        })
         .unwrap_err();
     assert!(format!("{err}").contains("payload"), "got {err}");
     std::fs::remove_dir_all(&dir).ok();
@@ -602,11 +597,10 @@ fn a_checkpoint_is_not_adopted_without_its_configuration() {
     {
         let mut j: Journal<PathRef> =
             Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
-        j.insert_with_blob(
-            "10.0.0.0/8".parse().unwrap(),
-            &PathRef { off: 0, len: 4 },
-            b"abcd",
-        )
+        j.insert_with_blob("10.0.0.0/8".parse().unwrap(), b"abcd", |off| PathRef {
+            off: off as u32,
+            len: 4,
+        })
         .unwrap();
         j.sync().unwrap();
         j.checkpoint(&Opts {
@@ -663,11 +657,10 @@ fn a_journal_holding_blobs_cannot_reopen_without_its_payload_section() {
     {
         let mut j: Journal<PathRef> =
             Journal::open(&log, tree_id, Some(PayloadSection::payload(SECTION_ID))).unwrap();
-        j.insert_with_blob(
-            "10.0.0.0/8".parse().unwrap(),
-            &PathRef { off: 0, len: 4 },
-            b"abcd",
-        )
+        j.insert_with_blob("10.0.0.0/8".parse().unwrap(), b"abcd", |off| PathRef {
+            off: off as u32,
+            len: 4,
+        })
         .unwrap();
         j.sync().unwrap();
         // no checkpoint yet: the arena lives only in the segments
@@ -822,7 +815,7 @@ fn a_long_random_op_sequence_survives_recovery_unchanged() {
         "the recovered tree has a different size"
     );
     let path = j.checkpoint(&opts).unwrap();
-    let snap: Snapshot<PathRef> = Snapshot::open(path.to_str().unwrap()).unwrap();
+    let snap: Snapshot<PathRef> = open_with_sections(path.to_str().unwrap());
     for (prefix, off) in &expected {
         let (_, value) = snap
             .lpm(prefix.parse().unwrap())
@@ -939,4 +932,16 @@ fn the_lock_is_its_own_error_and_the_repair_path_can_be_reached() {
         "the stable link names the adopted object"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Open a snapshot a journal produced: it carries the payload section even when
+/// the arena is empty, so a reader has to declare it.
+fn open_with_sections(path: &str) -> Snapshot<PathRef> {
+    struct Knows;
+    impl bgpkit_snap::Validator for Knows {
+        fn knows(&self, entry: &bgpkit_snap::Entry) -> bool {
+            entry.id == SECTION_ID
+        }
+    }
+    Snapshot::open_with(path, &Knows).expect("open with the journal's sections")
 }

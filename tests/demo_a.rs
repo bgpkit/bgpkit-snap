@@ -19,8 +19,10 @@ impl SnapValue for RoaSet {
 
 fn build(path: &std::path::Path) {
     let mut w: Writer<RoaSet> = Writer::new();
-    w.insert("10.0.0.0/8".parse().unwrap(), RoaSet(vec![64512, 64513]));
-    w.insert("2001:db8::/32".parse().unwrap(), RoaSet(vec![64514]));
+    w.insert("10.0.0.0/8".parse().unwrap(), RoaSet(vec![64512, 64513]))
+        .expect("canonical prefix");
+    w.insert("2001:db8::/32".parse().unwrap(), RoaSet(vec![64514]))
+        .expect("canonical prefix");
 
     let bytes = w
         .finish(&Opts {

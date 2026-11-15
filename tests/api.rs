@@ -25,7 +25,8 @@ fn build(path: &Path) -> Snapshot<V> {
         ("2001:db8::/32", 5),
         ("2001:db8:1::/48", 6),
     ] {
-        w.insert(p.parse().unwrap(), V(v));
+        w.insert(p.parse().unwrap(), V(v))
+            .expect("canonical prefix");
     }
     let written = w
         .finish_to(path, &Opts::now())

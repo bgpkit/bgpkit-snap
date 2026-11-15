@@ -62,7 +62,7 @@ pub fn build(pairs: &[(ipnet::IpNet, Vec<u8>)], created_at: i64) -> Vec<u8> {
                 off,
                 len: attrs.len() as u32,
             },
-        );
+        ).expect("canonical prefix");
     }
     writer
         .finish(&Opts {

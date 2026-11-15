@@ -80,7 +80,7 @@ fn build(
     for (i, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
         let (prefix, value) = parse_line(line)
             .map_err(|e| std::io::Error::other(format!("{}, line {}", e, i + 1)))?;
-        w.insert(prefix, value);
+        w.insert(prefix, value).expect("canonical prefix");
     }
     let parsed_window = match window {
         Some(spec) => {

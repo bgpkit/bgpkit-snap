@@ -24,7 +24,8 @@ fn build() -> Vec<u8> {
         ("192.0.2.0/24", 3),
         ("2001:db8::/32", 4),
     ] {
-        w.insert(p.parse().unwrap(), V(v));
+        w.insert(p.parse().unwrap(), V(v))
+            .expect("canonical prefix");
     }
     w.finish(&Opts {
         created_at: 1_794_614_400,
@@ -62,7 +63,8 @@ fn insertion_order_does_not_change_the_object() {
     let make = |items: &mut Vec<(&str, u32)>| {
         let mut w: Writer<V> = Writer::new();
         for (p, v) in items.iter() {
-            w.insert(p.parse().unwrap(), V(*v));
+            w.insert(p.parse().unwrap(), V(*v))
+                .expect("canonical prefix");
         }
         w.finish(&Opts {
             created_at: 1_794_614_400,

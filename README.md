@@ -10,7 +10,7 @@ data built in any insertion order produces byte-identical files, so an object's
 identity is a hash of its content. A journal turns a live, mutable tree into the
 next snapshot without losing updates.
 
-Status: **1.0.0-rc.2**. The layout is frozen for release candidates; see
+Status: **1.0.0-rc.3**. The layout is frozen for release candidates; see
 [Scope](#scope-and-what-this-is-not) and [Known limitations](#known-limitations)
 before depending on it.
 
@@ -97,18 +97,20 @@ A reader identifies an object from its first 192 bytes, without touching the
 body:
 
 ```rust
-let raw = std::fs::read("example.snap")?;
-let header = bgpkit_snap::Header::parse(&raw[..192])?;
+let mut head = [0u8; 192];
+std::io::Read::read_exact(&mut std::fs::File::open("example.snap")?, &mut head)?;
+let header = bgpkit_snap::Header::parse(&head)?;
 println!("{} sections, type {}", header.section_count, header.type_id_str());
 ```
 
 The CLI does the same from a shell (install it with
-`cargo install bgpkit-snap --features cli`):
+`cargo install bgpkit-snap --features cli`). It builds and searches `snap.u32:v1`
+objects only, from a JSONL file of `{"prefix": "10.0.0.0/8", "value": 7}` lines:
 
 ```sh
 snap build prefixes.jsonl --out example.snap --created-at 1794614400
 snap info example.snap      # reads 192 bytes only
-snap verify example.snap    # full integrity check
+snap verify example.snap    # container, and bodies when the type is this binary's
 snap search example.snap 10.1.2.3
 ```
 

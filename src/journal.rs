@@ -213,6 +213,10 @@ where
 
     /// Create this session's segment. Called on the first append, so a journal
     /// that is opened and closed without writes leaves no empty file.
+    /// A segment is rotated once it passes this size, so a long-running journal
+    /// does not carry every record since start in one file.
+    const SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
     fn open_segment(&mut self) -> Result<(), Error> {
         let path = self.dir.join(format!("segment-{:012}.log", self.seg_index));
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -460,6 +464,9 @@ where
     /// describes happened, both unix seconds. `Times::default()` leaves both zero,
     /// which is what a caller who does not track time wants.
     pub fn insert_at(&mut self, prefix: IpNet, value: &T, times: Times) -> Result<u64, Error> {
+        if prefix.addr() != prefix.network() {
+            return Err(Error::BadPrefix(prefix.to_string()));
+        }
         let mut value = value.clone();
         value.canonicalize();
         let bytes = T::encode(&value)?;
@@ -468,22 +475,26 @@ where
         Ok(seq)
     }
 
+    /// Append `blob` to the arena and insert a value built from where it landed.
+    ///
+    /// `build` receives the offset the blob will occupy, so the handle is written
+    /// in the same call that decides it. There is no way to do that after the
+    /// fact: the value is encoded before the record is appended.
     pub fn insert_with_blob(
         &mut self,
         prefix: IpNet,
-        value: &T,
         blob: &[u8],
+        build: impl FnOnce(u64) -> T,
     ) -> Result<BlobInserted, Error> {
-        self.insert_with_blob_at(prefix, value, blob, Times::default())
+        self.insert_with_blob_at(prefix, blob, build, Times::default())
     }
 
-    /// The same, with timestamps. Returns the sequence number and the arena offset
-    /// the blob landed at, which is what a handle value has to store.
+    /// The same, with timestamps.
     pub fn insert_with_blob_at(
         &mut self,
         prefix: IpNet,
-        value: &T,
         blob: &[u8],
+        build: impl FnOnce(u64) -> T,
         times: Times,
     ) -> Result<BlobInserted, Error> {
         if self.payload.is_none() {
@@ -491,10 +502,10 @@ where
                 "insert_with_blob needs a payload section to carry the blob",
             ));
         }
-        let mut value = value.clone();
+        let offset = self.blob.len() as u64;
+        let mut value = build(offset);
         value.canonicalize();
         let bytes = T::encode(&value)?;
-        let offset = self.blob.len() as u64;
         let seq = self.append(KIND_INSERT, prefix, &bytes, blob, times)?;
         // only now: a failed append must not leave the arena ahead of the log,
         // or the offsets recorded earlier would point past what replay rebuilds
@@ -514,10 +525,19 @@ where
         }
     }
 
+    /// Remove `prefix` from the tree and record the removal.
+    ///
+    /// The record is appended before the tree changes, so a failed append leaves
+    /// the tree holding what the previous record promised.
     pub fn withdraw(&mut self, prefix: IpNet) -> Result<u64, Error> {
+        self.withdraw_at(prefix, Times::default())
+    }
+
+    /// The same, with the times the feed knows.
+    pub fn withdraw_at(&mut self, prefix: IpNet, times: Times) -> Result<u64, Error> {
         // log first: if the append fails, the tree must still hold what the
         // previous record promised, or a later checkpoint would drop it
-        let seq = self.append(KIND_WITHDRAW, prefix, &[], &[], Times::default())?;
+        let seq = self.append(KIND_WITHDRAW, prefix, &[], &[], times)?;
         match prefix {
             IpNet::V4(p) => {
                 self.v4.remove(&p);
@@ -553,6 +573,17 @@ where
         payload.extend_from_slice(&(blob.len() as u32).to_le_bytes());
         payload.extend_from_slice(blob);
 
+        if self
+            .seg
+            .as_ref()
+            .is_some_and(|s| s.bytes >= Self::SEGMENT_MAX_BYTES)
+        {
+            // close this segment and start the next one; recovery walks them in
+            // order, so nothing about the sequence changes
+            self.seg = None;
+            self.seg_path = None;
+            self.seg_index += 1;
+        }
         if self.seg.is_none() {
             self.open_segment()?;
         }
@@ -590,6 +621,15 @@ where
         payload: Option<PayloadSection>,
     ) -> Result<Self, Error> {
         let dir = dir.as_ref().to_path_buf();
+        // take the writer lock first: writing state before it would overwrite a
+        // live writer's commit record on the way to reporting Locked
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("writer.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Error::Locked)?;
+
         let mut candidates: Vec<(u64, String)> = snapshot_paths(&dir)?
             .into_iter()
             .filter_map(|p| {
@@ -603,7 +643,7 @@ where
             })
             .collect();
         candidates.sort();
-        let Some((seq, file)) = candidates.last() else {
+        let Some((_, file)) = candidates.last() else {
             return Err(Error::BadOpts("there is no checkpoint to repair from"));
         };
         let raw = std::fs::read(dir.join(file))
@@ -615,10 +655,6 @@ where
                 Some(entry.id) == self.0
             }
         }
-        // open the object directly: this is the only place a generation is taken
-        // from the object rather than from the state file
-        // the header says which sequence the object ends at; the file name only
-        // says which checkpoint it is
         let (generation, base) = {
             let header = crate::Header::parse(&raw)?;
             match header.stream() {
@@ -626,9 +662,8 @@ where
                 _ => return Err(Error::BadRecord("the checkpoint belongs to another tree")),
             }
         };
-        // byte-check the object before its name is written into state.json
         Snapshot::<T>::from_bytes_with(&raw, &KnownPayload(payload.map(|p| p.id)))?;
-        let _ = seq;
+
         write_state(
             &dir,
             &State {
@@ -638,50 +673,8 @@ where
                 checkpoint: Some((base, file.clone())),
             },
         )?;
+        drop(lock);
         Self::open(dir, tree_id, payload)
-    }
-
-    /// Adopt `snapshot-<seq>.snap` as the committed state after `state.json` was
-    /// lost or damaged.
-    ///
-    /// This is the repair path for the one failure the journal cannot resolve on
-    /// its own: the object is intact, but nothing names it. Records after the
-    /// checkpoint are replayed from the segments; anything already pruned and not
-    /// covered by the checkpoint stays gone, and the caller is told the sequence
-    /// the adopted object ended at.
-    pub fn adopt_checkpoint(&mut self, file: &str) -> Result<u64, Error> {
-        let path = self.dir.join(file);
-        let raw = std::fs::read(&path)
-            .map_err(|_| Error::BadRecord("the named checkpoint cannot be read"))?;
-        struct KnownPayload(Option<u16>);
-        impl crate::Validator for KnownPayload {
-            fn knows(&self, entry: &crate::Entry) -> bool {
-                Some(entry.id) == self.0
-            }
-        }
-        let snap: Snapshot<T> =
-            Snapshot::from_bytes_with(&raw, &KnownPayload(self.payload.map(|p| p.id)))?;
-        let Some(stream) = snap.header().stream() else {
-            return Err(Error::BadRecord(
-                "the checkpoint carries no stream identity",
-            ));
-        };
-        if stream.tree_id != self.tree_id || stream.generation != self.generation {
-            return Err(Error::BadRecord(
-                "the checkpoint belongs to another tree or generation",
-            ));
-        }
-        let base = stream.base_seq;
-        write_state(
-            &self.dir,
-            &State {
-                next_seq: base + 1,
-                generation: self.generation,
-                tree_id: self.tree_id,
-                checkpoint: Some((base, file.to_string())),
-            },
-        )?;
-        Ok(base)
     }
 
     /// A record is durable once this returns.
@@ -709,14 +702,26 @@ where
     /// segments. The object is verified end to end before anything is deleted.
     pub fn checkpoint(&mut self, opts: &Opts<'_>) -> Result<PathBuf, Error> {
         let mut writer = Writer::<T>::new();
+        // the journal's own keys are canonical, so these cannot fail; a failure
+        // here would mean the in-memory tree holds a prefix it could not have
         for (p, v) in self.v4.iter() {
-            writer.insert(IpNet::V4(p), v.clone());
+            writer
+                .insert(IpNet::V4(p), v.clone())
+                .map_err(|_| Error::BadPrefix(p.to_string()))?;
         }
         for (p, v) in self.v6.iter() {
-            writer.insert(IpNet::V6(p), v.clone());
+            writer
+                .insert(IpNet::V6(p), v.clone())
+                .map_err(|_| Error::BadPrefix(p.to_string()))?;
         }
-        let mut extras: Vec<ExtraSection<'_>> = Vec::new();
-        if let (Some(payload), true) = (self.payload, !self.blob.is_empty()) {
+        // the caller's sections travel with the object; the journal adds the arena
+        // it owns. Dropping them silently would produce a checkpoint that is not
+        // what the caller asked for.
+        let mut extras: Vec<ExtraSection<'_>> = opts.extras.to_vec();
+        if let Some(payload) = self.payload {
+            if extras.iter().any(|e| e.id == payload.id) {
+                return Err(Error::BadSectionId(payload.id));
+            }
             extras.push(ExtraSection {
                 id: payload.id,
                 kind: payload.kind,

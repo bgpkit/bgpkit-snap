@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.0.0-rc.3
+
+The first release where the API is what a developer guide can describe without
+apologising for it, and the first with the write path's silent-loss cases closed.
+
+API
+
+- one name per query: `lpm`, `lpm_prefix`, `spm`, `spm_prefix`, `get_exact`,
+  `get_exact_owned`. `search_prefix`, `get_lpm`, `get_spm` and `Snapshot::get` are
+  gone; a reader wanting the stored entry can no longer silently get an ancestor.
+- `Opts.created_at` is unix seconds and `Opts::now()` exists. `Opts::default()` is
+  gone: a default would invent provenance.
+- `Snapshot::open` takes any `AsRef<Path>`; `Writer::finish_to` writes atomically
+  with a per-call temp name and fsyncs.
+- `Writer::insert` returns a `Result` and refuses a prefix with host bits set in
+  every build, not only in debug.
+- `rkyv` is re-exported, but a value type still needs its own `rkyv` dependency:
+  the derive generates paths the re-export cannot satisfy.
+
+Journal
+
+- `checkpoint` keeps the caller's `Opts.extras` instead of dropping them, always
+  writes the payload section it was opened with (even when the arena is empty),
+  publishes `current.snap` only after `state.json` names the object, and removes
+  older snapshots instead of accumulating one per checkpoint.
+- `Journal::repair(dir, tree_id, payload)` recovers a journal whose `state.json`
+  was lost, taking the writer lock before it writes the state it is repairing.
+  `adopt_checkpoint` is gone: two names for one repair confused two review rounds.
+- `insert_with_blob(prefix, blob, |offset| value)` builds the handle from the
+  offset in the same call that decides it; `insert_with_blob_at` adds timestamps.
+- `Times { recv_ts, event_ts }`, `insert_at` and `withdraw_at` carry record time.
+- segments rotate at 64 MiB instead of growing for the life of the writer.
+- `Error::Locked`, `BadOpts`, `BadSectionId` and `BadPrefix` replace stringly-typed
+  variants for the cases a caller must act on.
+
+Verification
+
+- `Validator::validate` now runs after both trie archives are byte-checked, which
+  is what the documentation always claimed.
+- CI builds with `--features cli` and builds `tests/downstream`, the out-of-crate
+  consumer that proves a value type can be added without touching `src/`.
+
 ## 1.0.0-rc.2
 
 The container loses its metadata section, its footer and its JSON. The header is

@@ -4,7 +4,7 @@ Status: normative for 1.0.0-rc.2. This document is the byte contract for the
 container and the journal. It replaces the draft that shipped with 1.0.0-rc.1,
 which is kept as [`format-rc1.md`](format-rc1.md) for reference only.
 
-Scope: an immutable, memory-mappable container for a prefix trie with arbitrary
+Scope: an immutable, single-file container for a prefix trie with arbitrary
 values, an append-only journal for building one incrementally, and the rules a
 reader must apply before it answers. What a section's bytes mean is named by the
 value type; this document says where they are and how they are covered.
@@ -112,13 +112,12 @@ Writer::finish_to(path, &Opts) -> Result<u64>
 Snapshot::<T>::open(path)                   // takes any AsRef<Path>
 Snapshot::<T>::open_with(path, &dyn Validator)
 Snapshot::<T>::from_bytes(&[u8])            // and from_bytes_with
-Writer::finish_to(path, &opts) -> u64        // or writes them, atomically
 
 // longest-prefix lookups
 Snapshot::search(ip: IpAddr) -> Option<(IpNet, &T::Archived)>
 Snapshot::search_owned(ip: IpAddr) -> Option<(IpNet, T)>   // deserialized
 Snapshot::get_exact(prefix) -> Option<&T::Archived>
-Snapshot::get_exact_owned(prefix) -> Option<T>
+Snapshot::get_exact_owned(prefix) -> Option<T>   // a decode failure reads as None
 
 // the prefix_trie read API, with IpNet keys and no family match in the caller
 Snapshot::get_key_value(prefix) -> Option<(IpNet, &T::Archived)>
@@ -189,7 +188,7 @@ journal.insert_with_blob(prefix, &value, &blob) // also appends blob to the aren
 journal.withdraw(prefix)
 journal.sync()                                  // durable on return
 journal.checkpoint(&opts) -> Result<PathBuf>     // verified before pruning, publishes current.snap
-journal.adopt_checkpoint(file) -> Result<u64>    // repair when state.json was lost
+Journal::repair(dir, tree_id, payload) -> Journal<T>  // recover a lost state.json
 journal.len()
 ```
 

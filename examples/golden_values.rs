@@ -15,7 +15,8 @@ fn main() {
         ("192.0.2.0/24", 3),
         ("2001:db8::/32", 4),
     ] {
-        w.insert(p.parse().unwrap(), V(v));
+        w.insert(p.parse().unwrap(), V(v))
+            .expect("canonical prefix");
     }
     let bytes = w
         .finish(&Opts {

@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some([0x22; 16]),
     )?;
     j.insert("10.0.0.0/8".parse()?, &V(7))?;
-    j.insert_with_blob("192.0.2.0/24".parse()?, &V(9), b"payload")?;
+    j.insert_with_blob("192.0.2.0/24".parse()?, b"payload", |off| V(off as u32))?;
     j.sync()?;
     j.checkpoint(&Opts {
         created_at: 1_794_614_400,

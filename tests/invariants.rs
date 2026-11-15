@@ -13,9 +13,12 @@ impl SnapValue for N {
 
 fn build(extras: &[ExtraSection<'_>]) -> Vec<u8> {
     let mut w: Writer<N> = Writer::new();
-    w.insert("10.0.0.0/8".parse().unwrap(), N(1));
-    w.insert("10.1.0.0/16".parse().unwrap(), N(2));
-    w.insert("2001:db8::/32".parse().unwrap(), N(3));
+    w.insert("10.0.0.0/8".parse().unwrap(), N(1))
+        .expect("canonical prefix");
+    w.insert("10.1.0.0/16".parse().unwrap(), N(2))
+        .expect("canonical prefix");
+    w.insert("2001:db8::/32".parse().unwrap(), N(3))
+        .expect("canonical prefix");
     w.finish(&Opts {
         created_at: 1_763_164_800,
         window: Some((1_790_000_000, 1_794_355_200)),
@@ -172,8 +175,10 @@ fn the_family_tag_stops_a_cross_family_read() {
 #[test]
 fn verify_bytes_checks_the_container_without_the_value_type() {
     let mut w: Writer<u32> = crate::Writer::new();
-    w.insert("10.0.0.0/8".parse().unwrap(), 1);
-    w.insert("2001:db8::/32".parse().unwrap(), 2);
+    w.insert("10.0.0.0/8".parse().unwrap(), 1)
+        .expect("canonical prefix");
+    w.insert("2001:db8::/32".parse().unwrap(), 2)
+        .expect("canonical prefix");
     let bytes = w.finish(&Opts::now()).unwrap();
 
     let header = bgpkit_snap::verify_bytes(&bytes).expect("a good object verifies");
@@ -198,7 +203,8 @@ fn verify_bytes_checks_the_container_without_the_value_type() {
 #[test]
 fn a_writer_cannot_emit_what_the_reader_rejects() {
     let mut w: Writer<u32> = Writer::new();
-    w.insert("10.0.0.0/8".parse().unwrap(), 1);
+    w.insert("10.0.0.0/8".parse().unwrap(), 1)
+        .expect("canonical prefix");
 
     // an epoch, a reversed window and a half-zero stream are all refused at write
     let stamp = 1_794_614_400;
@@ -224,7 +230,9 @@ fn a_writer_cannot_emit_what_the_reader_rejects() {
     ];
     for opts in &cases {
         let mut writer: Writer<u32> = Writer::new();
-        writer.insert("10.0.0.0/8".parse().unwrap(), 1);
+        writer
+            .insert("10.0.0.0/8".parse().unwrap(), 1)
+            .expect("canonical prefix");
         assert!(
             writer.finish(opts).is_err(),
             "finish accepted a header the reader rejects"
@@ -235,7 +243,8 @@ fn a_writer_cannot_emit_what_the_reader_rejects() {
 #[test]
 fn a_family_kind_at_the_wrong_id_is_refused_not_ignored() {
     let mut w: Writer<u32> = Writer::new();
-    w.insert("10.0.0.0/8".parse().unwrap(), 7);
+    w.insert("10.0.0.0/8".parse().unwrap(), 7)
+        .expect("canonical prefix");
     let bytes = w.finish(&Opts::now()).unwrap();
 
     // the IPv4 section is at id 2; move it to 1 and fix the identity, which is
@@ -263,7 +272,8 @@ fn a_family_kind_at_the_wrong_id_is_refused_not_ignored() {
 #[test]
 fn an_extra_section_cannot_claim_a_family_kind() {
     let mut w: Writer<u32> = Writer::new();
-    w.insert("10.0.0.0/8".parse().unwrap(), 1);
+    w.insert("10.0.0.0/8".parse().unwrap(), 1)
+        .expect("canonical prefix");
     let arena = [0u8; 8];
     let err = w
         .finish(&Opts {
@@ -286,7 +296,8 @@ fn an_extra_section_cannot_claim_a_family_kind() {
 #[test]
 fn nonzero_padding_is_refused() {
     let mut w: Writer<u32> = Writer::new();
-    w.insert("10.0.0.0/8".parse().unwrap(), 1);
+    w.insert("10.0.0.0/8".parse().unwrap(), 1)
+        .expect("canonical prefix");
     let arena = [0u8; 5]; // 5 bytes, so the next section needs 11 bytes of padding
     let bytes = w
         .finish(&Opts {
@@ -343,7 +354,8 @@ fn nonzero_padding_is_refused() {
 #[test]
 fn bytes_the_document_fixes_to_zero_are_checked() {
     let mut w: Writer<u32> = Writer::new();
-    w.insert("10.0.0.0/8".parse().unwrap(), 1);
+    w.insert("10.0.0.0/8".parse().unwrap(), 1)
+        .expect("canonical prefix");
     let bytes = w.finish(&Opts::now()).unwrap();
 
     // type_id padding after the terminator
@@ -380,4 +392,65 @@ fn rehash(bytes: &mut [u8]) {
     bytes[156..188].copy_from_slice(h.finalize().as_bytes());
     let crc = crc32c::crc32c(&bytes[..188]);
     bytes[188..192].copy_from_slice(&crc.to_le_bytes());
+}
+
+#[test]
+fn a_non_canonical_prefix_is_refused_in_every_build() {
+    let mut w: Writer<u32> = Writer::new();
+    let err = w
+        .insert("10.1.2.3/8".parse().unwrap(), 1)
+        .expect_err("a prefix with host bits set must not be stored");
+    assert!(format!("{err}").contains("host bits"), "got {err}");
+    // the canonical form is accepted
+    w.insert("10.0.0.0/8".parse().unwrap(), 1).unwrap();
+    assert_eq!(w.len(), 1);
+}
+
+#[test]
+fn checkpoint_keeps_the_callers_sections_and_always_carries_the_arena() {
+    use bgpkit_snap::journal::{Journal, PayloadSection};
+
+    let dir = std::env::temp_dir().join(format!("snap-extras-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let mut j: Journal<u32> =
+        Journal::open(&dir, [31u8; 16], Some(PayloadSection::payload(16))).unwrap();
+    j.insert("10.0.0.0/8".parse().unwrap(), &1).unwrap();
+
+    let sidecar = b"sidecar";
+    let object = j
+        .checkpoint(&Opts {
+            created_at: 1_794_614_400,
+            extras: &[ExtraSection {
+                id: 32,
+                kind: bgpkit_snap::KIND_PAYLOAD,
+                required: false,
+                bytes: sidecar,
+            }],
+            ..Opts::now()
+        })
+        .expect("checkpoint keeps the caller's section");
+
+    let raw = std::fs::read(&object).unwrap();
+    let header = Header::parse(&raw[..192]).unwrap();
+    assert_eq!(
+        header.section_count, 3,
+        "the IPv4 trie plus the arena and the caller's sidecar"
+    );
+    let snap: Snapshot<u32> = Snapshot::from_bytes_with(&raw, &{
+        struct Knows;
+        impl Validator for Knows {
+            fn knows(&self, entry: &Entry) -> bool {
+                entry.id == 16
+            }
+        }
+        Knows
+    })
+    .unwrap();
+    assert_eq!(snap.section_bytes(32), Some(&sidecar[..]));
+    assert_eq!(
+        snap.section_bytes(16),
+        Some(&[][..]),
+        "an empty arena is still a section, so a validator that requires it can open the object"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

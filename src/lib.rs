@@ -58,6 +58,8 @@ pub enum Error {
     BadOpts(&'static str),
     /// A section id the caller supplied is not usable here.
     BadSectionId(u16),
+    /// A prefix the caller supplied has host bits set.
+    BadPrefix(String),
     BadValue,
     // journal
     BadRecord(&'static str),
@@ -94,6 +96,7 @@ impl fmt::Display for Error {
             Error::Locked => write!(f, "another writer holds this journal"),
             Error::BadOpts(what) => write!(f, "bad writer option: {what}"),
             Error::BadSectionId(id) => write!(f, "section id {id} cannot be used here"),
+            Error::BadPrefix(p) => write!(f, "prefix {p} has host bits set"),
             Error::BadValue => write!(f, "value could not be decoded"),
             Error::BadRecord(why) => write!(f, "bad journal record: {why}"),
             Error::SequenceGap { expected, found } => {
@@ -164,6 +167,7 @@ where
 /// One section the caller supplies next to the tries: an arena, a sidecar, any
 /// bytes the profile owns. `id` is 16 or higher, `kind` is a four-byte tag, and
 /// `required` makes a reader that does not implement the id refuse the object.
+#[derive(Clone, Copy)]
 pub struct ExtraSection<'a> {
     pub id: u16,
     pub kind: [u8; 4],
@@ -222,13 +226,12 @@ impl<T: SnapValue> Writer<T> {
     /// bits set is a caller error and trips a debug assertion, because silently
     /// storing it under its network address would make the key you asked for and
     /// the key you get back differ.
-    pub fn insert(&mut self, prefix: IpNet, mut value: T) {
-        debug_assert!(
-            prefix.addr() == prefix.network(),
-            "prefix {prefix} has host bits set; it would be stored as {}/{}",
-            prefix.network(),
-            prefix.prefix_len()
-        );
+    pub fn insert(&mut self, prefix: IpNet, mut value: T) -> Result<(), Error> {
+        if prefix.addr() != prefix.network() {
+            // storing it under its network address would make the key you asked
+            // for and the key you get back differ, and two inputs would collide
+            return Err(Error::BadPrefix(prefix.to_string()));
+        }
         value.canonicalize();
         match prefix {
             IpNet::V4(p) => {
@@ -238,6 +241,7 @@ impl<T: SnapValue> Writer<T> {
                 self.v6.insert(p, value);
             }
         }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -383,8 +387,10 @@ impl<T: SnapValue> Writer<T> {
     ) -> Result<u64, Error> {
         let bytes = self.finish(opts)?;
         let path = path.as_ref();
-        // one temp name per writer, or two writers to one path fight over it
-        let tmp = path.with_extension(format!("snap.{}.tmp", std::process::id()));
+        // one temp name per call: two writers to one path must not share a temp
+        static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("snap.{}.{n}.tmp", std::process::id()));
         {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&bytes)?;
@@ -659,8 +665,8 @@ impl<T: SnapValue> Snapshot<T> {
                 return Err(Error::UnknownRequiredSection(entry.id));
             }
         }
-        validator.validate(&view)?;
         snap.validate_archives()?;
+        validator.validate(&view)?;
         Ok(snap)
     }
 
@@ -830,7 +836,7 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
-    /// The key of the shortest prefix that sits under `prefix`.
+    /// The key of the least specific stored prefix that covers `prefix`.
     pub fn spm_prefix(&self, prefix: IpNet) -> Option<IpNet> {
         self.spm(prefix).map(|(p, _)| p)
     }
@@ -856,6 +862,9 @@ impl<T: SnapValue> Snapshot<T> {
     ///
     /// A caller that only reads a scalar should not have to depend on the
     /// archive library to get it out.
+    /// Note: a value that is present but cannot be deserialized reads as `None`,
+    /// the same as an absent prefix. Use `get_exact` when that distinction
+    /// matters.
     pub fn get_exact_owned(&self, prefix: IpNet) -> Option<T>
     where
         T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
@@ -894,8 +903,8 @@ impl<T: SnapValue> Snapshot<T> {
         Box::new(self.iter().map(|(p, _)| p))
     }
 
-    /// Every entry at or after `prefix` in trie order, for a caller that wants to
-    /// walk a range instead of the whole object.
+    /// Every entry at or after `prefix` in trie order, within `prefix`'s family;
+    /// an IPv4 start does not continue into the IPv6 trie. Use `iter()` for both.
     pub fn iter_from(
         &self,
         prefix: IpNet,
