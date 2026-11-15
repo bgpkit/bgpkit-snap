@@ -592,6 +592,27 @@ where
         self.blob.len()
     }
 
+    /// The value the journal currently holds for `prefix`. A writer needs this
+    /// to compute the next value from the previous one instead of rebuilding the
+    /// whole tree for every update.
+    pub fn get(&self, prefix: ipnet::IpNet) -> Option<&T> {
+        match prefix {
+            ipnet::IpNet::V4(p) => self.v4.get(&p),
+            ipnet::IpNet::V6(p) => self.v6.get(&p),
+        }
+    }
+
+    /// Every prefix in the journal, in trie order. A caller that has to compare
+    /// two trees walks this instead of guessing the key space.
+    pub fn for_each(&self, mut f: impl FnMut(ipnet::IpNet, &T)) {
+        for (p, v) in self.v4.iter() {
+            f(ipnet::IpNet::V4(p), v);
+        }
+        for (p, v) in self.v6.iter() {
+            f(ipnet::IpNet::V6(p), v);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.v4.len() + self.v6.len()
     }

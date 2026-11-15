@@ -862,3 +862,28 @@ fn a_segment_header_with_unknown_fields_is_refused() {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[test]
+fn a_writer_can_read_back_what_it_holds() {
+    let dir = std::env::temp_dir().join(format!("snap-get-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let mut j: Journal<PathRef> =
+        Journal::open(&log, [77u8; 16], Some(PayloadSection::payload(SECTION_ID))).unwrap();
+    j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 7, len: 2 })
+        .unwrap();
+    j.insert(
+        "2001:db8::/32".parse().unwrap(),
+        &PathRef { off: 9, len: 1 },
+    )
+    .unwrap();
+
+    assert_eq!(j.get("10.0.0.0/8".parse().unwrap()).map(|v| v.off), Some(7));
+    assert!(j.get("10.1.0.0/16".parse().unwrap()).is_none());
+
+    let mut seen: Vec<String> = Vec::new();
+    j.for_each(|p, _| seen.push(p.to_string()));
+    seen.sort();
+    assert_eq!(seen, vec!["10.0.0.0/8", "2001:db8::/32"]);
+    std::fs::remove_dir_all(&dir).ok();
+}
