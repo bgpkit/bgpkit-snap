@@ -12,8 +12,11 @@ use prefix_trie::{AsView, PrefixMap, TrieView};
 use rkyv::rancor::Error as RkyvError;
 
 /// The archive library this crate builds value types on, re-exported so a
-/// caller can write `bgpkit_snap::rkyv::Archive` instead of adding a second
-/// dependency that must match this one exactly.
+/// caller can name the same version in a signature.
+///
+/// It does not remove the dependency: `#[derive(rkyv::Archive)]` expands to paths
+/// rooted at `rkyv`, so a crate that derives needs `rkyv` in its own manifest even
+/// though this re-export exists.
 pub use rkyv;
 use rkyv::util::AlignedVec;
 use std::io::Write;
@@ -174,7 +177,6 @@ where
 
 // ---------------------------------------------------------------- writer
 
-/// One section the caller supplies, e.g. a payload arena.
 /// One section the caller supplies next to the tries: an arena, a sidecar, any
 /// bytes the profile owns. `id` is 16 or higher, `kind` is a four-byte tag, and
 /// `required` makes a reader that does not implement the id refuse the object.
@@ -230,11 +232,10 @@ impl<T: SnapValue> Writer<T> {
         }
     }
 
-    /// Insert a value, replacing any value already stored for that prefix.
     /// Store `value` under `prefix`, replacing any value already there.
     ///
     /// The prefix must be canonical (`addr() == network()`); a prefix with host
-    /// bits set is a caller error and trips a debug assertion, because silently
+    /// bits set is refused with `Error::BadPrefix` in every build, because silently
     /// storing it under its network address would make the key you asked for and
     /// the key you get back differ.
     pub fn insert(&mut self, prefix: IpNet, mut value: T) -> Result<(), Error> {

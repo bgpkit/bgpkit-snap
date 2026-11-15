@@ -104,7 +104,7 @@ pub struct Opts<'a> {
 pub struct ExtraSection<'a> { pub id: u16, pub kind: [u8;4], pub required: bool, pub bytes: &'a [u8] }
 
 Writer::<T>::new()
-Writer::insert(prefix, value)               // replaces an existing value
+Writer::insert(prefix, value) -> Result<()>  // replaces an existing value; Err on host bits
 Writer::len()
 Writer::finish(&Opts) -> Result<Vec<u8>>    // caller writes the file
 Writer::finish_to(path, &Opts) -> Result<u64>
@@ -184,8 +184,8 @@ the writer lock and the directory, and it recovers on open.
 ```rust
 Journal::<T>::open(dir, tree_id, Option<PayloadSection>) -> Result<Journal<T>>
 journal.insert(prefix, &value)                  // updates the tree and the log
-journal.insert_with_blob(prefix, &value, &blob) // also appends blob to the arena
-journal.withdraw(prefix)
+journal.insert_with_blob(prefix, blob, |off| value) // value is built from the arena offset
+journal.withdraw(prefix) / withdraw_at(prefix, Times)
 journal.sync()                                  // durable on return
 journal.checkpoint(&opts) -> Result<PathBuf>     // verified before pruning, publishes current.snap
 Journal::repair(dir, tree_id, payload) -> Journal<T>  // recover a lost state.json

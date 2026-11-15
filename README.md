@@ -6,8 +6,9 @@ for building one incrementally.
 `bgpkit-snap` stores a map from IP prefixes to arbitrary values in a single
 immutable file that is read once, validated once, and then queried in memory
 without parsing. The same
-data built in any insertion order produces byte-identical files, so an object's
-identity is a hash of its content. A journal turns a live, mutable tree into the
+data built in any insertion order has the same content id, which is a hash of the
+tries and their sections, not of the file: `created_at` and the rest of the
+provenance in the header are deliberately outside it. A journal turns a live, mutable tree into the
 next snapshot without losing updates.
 
 Status: **1.0.0-rc.3**. The layout is frozen for release candidates; see
@@ -75,7 +76,7 @@ impl SnapValue for RoaSet {
 
 // build, then write the bytes yourself
 let mut w: Writer<RoaSet> = Writer::new();
-w.insert("10.0.0.0/8".parse()?, RoaSet(vec![64512]));
+w.insert("10.0.0.0/8".parse()?, RoaSet(vec![64512]))?;
 let bytes = w.finish(&Opts {
     created_at: 1_794_614_400,   // unix seconds; Opts::now() for "now"
     window: None,
@@ -90,8 +91,9 @@ let (prefix, value) = snap.search("10.1.2.3".parse()?).ok_or("not covered")?;
 println!("{prefix} -> {} origins, id {}", value.0.len(), snap.content_id());
 ```
 
-`examples/quickstart.rs` is this code, compiled by `cargo build --examples`, so
-the README cannot drift from the API.
+`examples/quickstart.rs` is the same program, built and run by CI; a change to the
+API that would break this page breaks the build. The prose around it can still
+drift from that example, so the example is the authority.
 
 A reader identifies an object from its first 192 bytes, without touching the
 body:
@@ -104,7 +106,7 @@ println!("{} sections, type {}", header.section_count, header.type_id_str());
 ```
 
 The CLI does the same from a shell (install it with
-`cargo install bgpkit-snap --features cli`). It builds and searches `snap.u32:v1`
+`cargo install bgpkit-snap --version 1.0.0-rc.4 --features cli`). It builds and searches `snap.u32:v1`
 objects only, from a JSONL file of `{"prefix": "10.0.0.0/8", "value": 7}` lines:
 
 ```sh

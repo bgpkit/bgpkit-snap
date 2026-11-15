@@ -945,3 +945,118 @@ fn open_with_sections(path: &str) -> Snapshot<PathRef> {
     }
     Snapshot::open_with(path, &Knows).expect("open with the journal's sections")
 }
+
+#[test]
+fn a_ckp_with_a_caller_sidecar_can_be_reopened() {
+    let dir = std::env::temp_dir().join(format!("snap-extras-reopen-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let tree = [41u8; 16];
+    let side = b"sidecar".to_vec();
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&dir, tree, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 1 })
+            .unwrap();
+        j.checkpoint(&Opts {
+            created_at: 1_794_614_400,
+            extras: &[ExtraSection {
+                id: 32,
+                kind: bgpkit_snap::KIND_PAYLOAD,
+                required: false,
+                bytes: &side,
+            }],
+            ..Opts::now()
+        })
+        .expect("an optional sidecar is the caller's to keep");
+    }
+    // the object carries a section the journal has no validator for; recovery
+    // has to ignore it, or the checkpoint the journal just wrote is unopenable
+    let j: Journal<PathRef> = Journal::open(&dir, tree, Some(PayloadSection::payload(SECTION_ID)))
+        .expect("reopen a journal whose checkpoint has a sidecar");
+    assert_eq!(j.len(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_required_sidecar_is_refused_by_checkpoint() {
+    let dir = std::env::temp_dir().join(format!("snap-extras-required-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let mut j: Journal<PathRef> =
+        Journal::open(&dir, [42u8; 16], Some(PayloadSection::payload(SECTION_ID))).unwrap();
+    j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 1 })
+        .unwrap();
+    let side = b"x".to_vec();
+    let err = j
+        .checkpoint(&Opts {
+            created_at: 1_794_614_400,
+            extras: &[ExtraSection {
+                id: 32,
+                kind: bgpkit_snap::KIND_PAYLOAD,
+                required: true,
+                bytes: &side,
+            }],
+            ..Opts::now()
+        })
+        .expect_err("a journal cannot reopen a required section it does not know");
+    assert!(format!("{err}").contains("required section"), "got {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_removal_and_blob_paths_refuse_a_host_bit_prefix() {
+    let dir = std::env::temp_dir().join(format!("snap-canonical-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let mut j: Journal<PathRef> =
+        Journal::open(&dir, [43u8; 16], Some(PayloadSection::payload(SECTION_ID))).unwrap();
+    j.insert("10.0.0.0/8".parse().unwrap(), &PathRef { off: 0, len: 1 })
+        .unwrap();
+    let blob = b"ab";
+    assert!(j
+        .insert_with_blob("10.1.2.3/8".parse().unwrap(), blob, |off| PathRef {
+            off: off as u32,
+            len: 2
+        })
+        .is_err());
+    assert!(j.withdraw("10.9.8.7/8".parse().unwrap()).is_err());
+    // the canonical key and its value are untouched
+    assert_eq!(
+        j.get_exact("10.0.0.0/8".parse().unwrap()).map(|v| v.len),
+        Some(1)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_journal_that_crosses_the_segment_boundary_reopens_intact() {
+    let dir = std::env::temp_dir().join(format!("snap-rotate-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let tree = [44u8; 16];
+    let big = vec![7u8; 64 * 1024 * 1024];
+    {
+        let mut j: Journal<PathRef> =
+            Journal::open(&dir, tree, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+        j.insert_with_blob("10.0.0.0/8".parse().unwrap(), &big, |off| PathRef {
+            off: off as u32,
+            len: big.len() as u32,
+        })
+        .unwrap();
+        // this append crosses SEGMENT_MAX_BYTES, so the first segment is rotated
+        j.insert("192.0.2.0/24".parse().unwrap(), &PathRef { off: 0, len: 1 })
+            .unwrap();
+        j.sync().unwrap();
+        let segments: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("segment-"))
+            .collect();
+        assert_eq!(
+            segments.len(),
+            2,
+            "the first segment must be closed, not reused"
+        );
+    }
+    let j: Journal<PathRef> =
+        Journal::open(&dir, tree, Some(PayloadSection::payload(SECTION_ID))).unwrap();
+    assert_eq!(j.len(), 2, "both records survive a rotation and a restart");
+    std::fs::remove_dir_all(&dir).ok();
+}

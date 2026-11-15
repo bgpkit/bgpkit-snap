@@ -45,7 +45,6 @@ pub struct BlobInserted {
     pub offset: u64,
 }
 
-/// Where the journal's blob arena lands in a snapshot.
 #[derive(Debug, Clone, Copy)]
 /// Where a journal's blob arena lands in the snapshots it checkpoints: the
 /// section id (16 or higher), its kind tag, and whether a reader must know it.
@@ -217,6 +216,28 @@ where
     /// does not carry every record since start in one file.
     const SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+    /// Close the current segment and start the next one.
+    ///
+    /// `sync` only reaches the open segment, so a rotated one that was never
+    /// flushed would be reported durable while its last records sat in a buffer
+    /// that `drop` discards on failure. Flush and fsync here, and on failure keep
+    /// the segment so the next append can cut back to the last acknowledged byte.
+    fn rotate_segment(&mut self) -> Result<(), Error> {
+        let Some(mut seg) = self.seg.take() else {
+            return Ok(());
+        };
+        if seg.file.flush().is_err() || seg.file.get_ref().sync_all().is_err() {
+            self.seg_dirty_from = Some(seg.bytes);
+            self.seg = Some(seg);
+            return Err(Error::Io(std::io::Error::other(
+                "could not flush the segment being rotated",
+            )));
+        }
+        self.seg_path = None;
+        self.seg_index += 1;
+        self.open_segment()
+    }
+
     fn open_segment(&mut self) -> Result<(), Error> {
         let path = self.dir.join(format!("segment-{:012}.log", self.seg_index));
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -316,19 +337,21 @@ where
                 Some(s) if s.base_seq == base => {}
                 _ => return Err(Error::BadRecord("checkpoint base_seq disagrees with state")),
             }
-            // a section this journal was not opened for would be dropped, and a
-            // payload section is the blob arena, so its absence is data loss
+            // the tries and the arena are what a journal needs back. A caller's
+            // optional sidecar is data for whoever opened the object, not for the
+            // journal, so it is ignored rather than treated as a mismatch. A
+            // required section is different: dropping it would lose data.
             for entry in snap.entries() {
                 if entry.id == crate::header::ID_V4 || entry.id == crate::header::ID_V6 {
                     continue;
                 }
-                match self.payload {
-                    Some(payload) if payload.id == entry.id => {}
-                    _ => {
-                        return Err(Error::BadRecord(
-                            "checkpoint has a section this journal was not configured for",
-                        ))
-                    }
+                let is_payload = self
+                    .payload
+                    .is_some_and(|p| p.id == entry.id && p.kind == entry.kind);
+                if !is_payload && entry.required {
+                    return Err(Error::BadRecord(
+                        "checkpoint has a required section this journal cannot carry",
+                    ));
                 }
             }
             if let Some(payload) = self.payload {
@@ -502,6 +525,9 @@ where
                 "insert_with_blob needs a payload section to carry the blob",
             ));
         }
+        if prefix.addr() != prefix.network() {
+            return Err(Error::BadPrefix(prefix.to_string()));
+        }
         let offset = self.blob.len() as u64;
         let mut value = build(offset);
         value.canonicalize();
@@ -535,6 +561,9 @@ where
 
     /// The same, with the times the feed knows.
     pub fn withdraw_at(&mut self, prefix: IpNet, times: Times) -> Result<u64, Error> {
+        if prefix.addr() != prefix.network() {
+            return Err(Error::BadPrefix(prefix.to_string()));
+        }
         // log first: if the append fails, the tree must still hold what the
         // previous record promised, or a later checkpoint would drop it
         let seq = self.append(KIND_WITHDRAW, prefix, &[], &[], times)?;
@@ -573,21 +602,19 @@ where
         payload.extend_from_slice(&(blob.len() as u32).to_le_bytes());
         payload.extend_from_slice(blob);
 
+        if self.seg.is_none() {
+            self.open_segment()?;
+        }
+        // the recovery offset belongs to the segment it was recorded on, so a torn
+        // tail is cut before any rotation moves the bookkeeping to a new file
+        self.discard_torn_write()?;
         if self
             .seg
             .as_ref()
             .is_some_and(|s| s.bytes >= Self::SEGMENT_MAX_BYTES)
         {
-            // close this segment and start the next one; recovery walks them in
-            // order, so nothing about the sequence changes
-            self.seg = None;
-            self.seg_path = None;
-            self.seg_index += 1;
+            self.rotate_segment()?;
         }
-        if self.seg.is_none() {
-            self.open_segment()?;
-        }
-        self.discard_torn_write()?;
         let start = self.seg.as_ref().expect("segment just opened").bytes;
         let len = (payload.len() + 4) as u32;
         let crc = crc32c::crc32c(&payload);
@@ -717,6 +744,14 @@ where
         // the caller's sections travel with the object; the journal adds the arena
         // it owns. Dropping them silently would produce a checkpoint that is not
         // what the caller asked for.
+        for extra in opts.extras {
+            if extra.required {
+                return Err(Error::BadOpts(
+                    "a checkpoint cannot carry a required section: this journal cannot \
+                     reopen a section it has no validator for",
+                ));
+            }
+        }
         let mut extras: Vec<ExtraSection<'_>> = opts.extras.to_vec();
         if let Some(payload) = self.payload {
             if extras.iter().any(|e| e.id == payload.id) {
