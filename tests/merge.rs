@@ -115,6 +115,9 @@ fn a_merge_takes_the_union_of_the_windows_it_was_given() {
 
 #[test]
 fn a_merge_is_its_inputs_contents_not_their_order() {
+    // both sides fold into one HashMap and then into one Writer, so this pins the
+    // input order only; that the writer's own insertion order does not matter is
+    // tests/golden.rs's job
     let a = object(&[("10.0.0.0/8", 1)], None);
     let b = object(&[("192.0.2.0/24", 2)], None);
     let forward = Snapshot::merge_last_wins(&[&a, &b], &opts()).unwrap();

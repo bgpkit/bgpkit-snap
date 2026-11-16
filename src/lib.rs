@@ -737,12 +737,15 @@ where
         rkyv::deserialize::<T, RkyvError>(value).map_err(|_| Error::BadValue)
     }
 
-    /// How many sections the table has.
+    /// How many prefixes the object holds.
+    ///
+    /// The table's section count is `entries().len()`; this is the same number
+    /// `Snapshot::len` gives, because an owned view holds no sections of its own.
     pub fn len(&self) -> usize {
         self.snap.len()
     }
 
-    /// Whether the table is empty.
+    /// Whether the object holds no prefixes.
     pub fn is_empty(&self) -> bool {
         self.snap.is_empty()
     }

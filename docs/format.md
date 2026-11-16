@@ -202,7 +202,9 @@ journal.len()
 A journal is a directory: `writer.lock`, `state.json`,
 `segment-<12-digit index>.log` and `snapshot-<seq>-<n>.snap`. The
 `type_id` is ASCII, NUL-terminated, zero-filled to 32 bytes; a reader refuses a
-field without a terminator or with non-printable bytes. Reserved and padding
+field without a terminator, with a byte outside `0x21..=0x7e`, or holding a
+double quote or a backslash, because a `type_id` ends up inside `state.json` as a
+JSON string. Reserved and padding
 bytes are zero. Segment names are the
 decimal index zero-padded to twelve digits, so lexicographic order is numeric
 order; a reader that sorted `segment-1.log` and `segment-10.log` as strings would

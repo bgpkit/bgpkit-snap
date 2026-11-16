@@ -52,6 +52,27 @@ fn every_single_byte_mutation_is_a_refusal_not_a_panic() {
 }
 
 #[test]
+fn a_mutated_body_is_refused_not_only_survived() {
+    // the mutation suite above asserts that the readers do not panic, which would
+    // stay green if they started accepting every mutated object: this one asserts the
+    // refusal itself, for bytes the content id covers
+    let base = object();
+    for back in 1..=4 {
+        let i = base.len() - back;
+        let mut bytes = base.clone();
+        bytes[i] ^= 0x01;
+        assert!(
+            bgpkit_snap::verify_bytes(&bytes).is_err(),
+            "byte {i} of the body was mutated and verify_bytes accepted it"
+        );
+        assert!(
+            Snapshot::<V>::from_bytes(&bytes).is_err(),
+            "byte {i} of the body was mutated and from_bytes accepted it"
+        );
+    }
+}
+
+#[test]
 fn every_truncation_is_a_refusal_not_a_panic() {
     let base = object();
     for len in 0..base.len() {
