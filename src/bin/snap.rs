@@ -94,15 +94,18 @@ fn build(
         None => None,
     };
     let entries = w.len();
-    let bytes = w.finish(&bgpkit_snap::Opts {
-        created_at: created_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
-        stream: None,
-        window: parsed_window,
-        extras: &[],
-    })?;
-    let len = bytes.len();
-    std::fs::write(out, bytes)?;
-    Ok((entries, len))
+    // `finish_to` writes beside the target and renames, so a build that fails on a
+    // full disk leaves the object already at `out` untouched instead of truncating it
+    let len = w.finish_to(
+        out,
+        &bgpkit_snap::Opts {
+            created_at: created_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+            stream: None,
+            window: parsed_window,
+            extras: &[],
+        },
+    )?;
+    Ok((entries, len as usize))
 }
 
 /// An epoch second as UTC, which is what a person comparing two objects wants;
