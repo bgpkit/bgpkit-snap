@@ -269,25 +269,21 @@ Recovery order: load the named checkpoint, replay records above its sequence
 number, refuse to hand out a number at or below `next_seq`, and prune a segment
 only when every record in it is covered by a checkpoint.
 
-Test vector, two records and a checkpoint:
+Test vector, two records and a checkpoint. The block below is the output of
+`cargo run --example journal_vector`, verbatim: a reader check is a diff between
+this block and that program, so no field has been re-grouped for display.
 
 ```text
-header  4247504b4c4f47000400000011111111111111111111111111111111
-        2222222222222222222222222222222200000000
-record  3c000000e8faa880 0100000000000000 0000000000000000 0000000000000000
-        01 04 08 00 0a000000 000000000000000000000000 04000000 07000000
-        00000000
-record  4300000037180cdd 0200000000000000 0000000000000000 0000000000000000
-        01 04 18 00 c0000200 000000000000000000000000 04000000 09000000
-        07000000 7061796c6f6164
-state   {"checkpoint":{"file":"snapshot-3.snap","seq":2},
-        "generation":"22222222222222222222222222222222",
-        "next_seq":3,"tree_id":"11111111111111111111111111111111"}
+segment file 183 bytes
+header 4247504b4c4f470004000000111111111111111111111111111111112222222222222222222222222222222200000000
+record 64 bytes: 3c000000e8faa880010000000000000000000000000000000000000000000000010408000a000000000000000000000000000000040000000700000000000000
+record 71 bytes: 430000002d96c18802000000000000000000000000000000000000000000000001041800c00002000000000000000000000000000400000000000000070000007061796c6f6164
+state {"checkpoint":{"file":"snapshot-3-1.snap","seq":2},"generation":"22222222222222222222222222222222","next_seq":3,"payload":{"id":16,"kind":"50415900","required":true},"tree_id":"11111111111111111111111111111111","type_id":"example.vector:v1"}
 ```
 
-`examples/journal_vector.rs` regenerates these bytes; it passes the generation
-explicitly (`Journal::options(..).generation(..).open()`), so the vector is the same on every run rather
-than carrying whatever the journal minted.
+The program passes the generation explicitly (`Journal::options(..).generation(..).open()`),
+so the vector is the same on every run rather than carrying whatever generation the
+journal minted.
 
 ## 4. Conformance
 

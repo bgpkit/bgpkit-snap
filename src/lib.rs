@@ -259,11 +259,7 @@ where
 
 // ---------------------------------------------------------------- writer
 
-/// One section the caller supplies next to the tries: an arena, a sidecar, any
-/// bytes the profile owns. `id` is 16 or higher, `kind` is a four-byte tag, and
-/// `required` makes a reader that does not implement the id refuse the object.
 /// The identity of the tree a journal writes.
-///
 ///
 /// A journal refuses a checkpoint that belongs to another tree, so the id is what
 /// stops two feeds from writing into one directory. `from_name` exists because

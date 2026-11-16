@@ -141,7 +141,6 @@ impl Header {
     }
 
     /// Parse and check everything that can be judged from the header alone.
-    /// Read one table row, refusing an undefined flag or non-zero reserved bytes.
     pub fn parse(raw: &[u8]) -> Result<Self, Error> {
         if raw.len() < HEADER_LEN {
             return Err(Error::Truncated {

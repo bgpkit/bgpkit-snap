@@ -153,9 +153,9 @@ where
     T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
         + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
 {
-    /// Open a journal, recovering the tree from the last checkpoint plus the
-    /// segments. The generation is reused when a journal already exists.
-    /// A journal over a tree with no payload section, which is the common case.
+    /// Open a journal over a tree with no payload section, recovering the tree from
+    /// the last checkpoint plus the segments. The generation is reused when a
+    /// journal already exists.
     pub fn open(dir: impl AsRef<Path>, tree_id: impl Into<crate::TreeId>) -> Result<Self, Error> {
         Self::open_inner(dir, tree_id, None, None)
     }
@@ -170,9 +170,6 @@ where
         Self::open_inner(dir, tree_id, Some(payload), None)
     }
 
-    /// `generation` names the stream incarnation. A caller passes `Some` only to
-    /// reproduce a fixture or to restore a known journal; otherwise it is minted
-    /// on first use and reused from then on.
     /// The two knobs a constructor should not take positionally: an optional payload
     /// section and a caller-minted generation. Both are for the uncommon case, so
     /// they sit behind methods instead of arguments.
@@ -950,8 +947,6 @@ where
         Ok(())
     }
 
-    /// Write and verify a snapshot of the current state, then drop covered
-    /// segments. The object is verified end to end before anything is deleted.
     /// The object this journal would checkpoint, as bytes, without writing or
     /// pruning anything.
     ///
