@@ -16,7 +16,14 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::temp_dir().join(format!("snap-journal-vector-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "snap-journal-vector-{}-{}",
+        std::process::id(),
+        std::time::UNIX_EPOCH
+            .elapsed()
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
     std::fs::remove_dir_all(&dir).ok();
     let log = dir.join("journal");
     // a fixed generation, so the bytes below are the same on every run
