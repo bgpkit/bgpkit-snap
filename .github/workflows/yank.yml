@@ -22,7 +22,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Yank ${{ inputs.version }}
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # CARGO_REGISTRY_TOKEN publishes but is not scoped for yank (crates.io
+          # answers 403 "this token does not have the required permissions"), so a
+          # token created with the yank scope wins when it exists.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_YANK_TOKEN || secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           if [ "${{ inputs.undo }}" = "undo" ]; then
