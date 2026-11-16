@@ -482,13 +482,14 @@ one, because a record is the only place that time is kept.
 - **`lpm` is a longest-prefix match, not an exact one.** For an exact check use `get_exact`,
   or you will compare a value from an ancestor prefix and believe it is the
   child's.
-- **Keep the value small and fixed-size.** A value with a `Vec` or a `String` in it
-  costs the archive an out-of-line buffer per prefix: measured on a real RIB, a
-  two-announcement `Vec` cell came to about 900 bytes per prefix, while an 8-byte
-  handle to the same bytes in a payload section came to about 21. Put variable data in
-  a section and store a handle; that is what `insert_with_blob` is for. Interning also
-  pays: in the same RIB, 3.3 million announcements held only 38,903 distinct AS paths,
-  so a path dictionary is about 70 times smaller than inline copies.
+- **Keep the value small and fixed-size.** A value that carries a `Vec` or a `String`
+  makes the archive build an out-of-line buffer per prefix. Measured on a real RIB:
+  `Cell { Vec<Ann> }` came to 934 bytes per prefix for 37.7 announcements per prefix,
+  which is about 25 bytes per announcement; an 8-byte handle into a payload section
+  kept the value at 8 bytes and the trie at 21 bytes per prefix, with the bytes
+  themselves in one arena. The arena also lets the same bytes be stored once: those
+  3.3 million announcements held only 38,903 distinct AS paths, so a path dictionary
+  is 72 times smaller than inline copies.
 - **`canonicalize` decides the content id.** Two producers of the same logical
   data that sort or dedupe differently produce different objects. Do the sorting
   in the hook, not in your caller.
