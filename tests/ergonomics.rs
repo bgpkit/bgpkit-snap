@@ -400,3 +400,93 @@ fn a_second_checkpoint_after_a_restart_does_not_reuse_a_committed_name() {
     assert!(!committed.is_empty());
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn a_checkpoint_whose_publication_fails_leaves_the_stable_path_openable() {
+    // `current.snap` is what the guide tells a reader to open. A checkpoint that
+    // cannot republish it once returned Ok and then deleted the object the link still
+    // named, so the stable path was dangling until the next open.
+    let d = dir("publish-fail");
+    let tree = TreeId::from_name("publish-fail");
+    let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+    j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+    j.checkpoint(&Opts::now()).unwrap();
+
+    // a foreign entry holding the publication temp name makes the next one fail
+    std::fs::create_dir(d.join(".current.snap.tmp")).unwrap();
+    j.insert("192.0.2.0/24".parse().unwrap(), V(2))
+        .expect("insert");
+    j.checkpoint(&Opts::now())
+        .expect("the checkpoint itself is committed, whatever the link does");
+
+    let link = d.join("current.snap");
+    let target = std::fs::read_link(&link).expect("current.snap must still be a link");
+    assert!(
+        d.join(&target).exists(),
+        "current.snap -> {target:?} names an object the checkpoint deleted"
+    );
+    let through: Snapshot<V> = Snapshot::open(&link).expect("the stable path must open");
+    assert_eq!(through.len(), 1, "the link still serves a complete object");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn repair_without_a_payload_section_leaves_a_payload_checkpoint_alone() {
+    // the section check used to run only when the caller passed a payload, so
+    // `repair(dir, tree, None)` wrote a state file that no open accepts and then
+    // failed, closing the only documented way back
+    let d = dir("repair-none");
+    let tree = TreeId::from_name("repair-none");
+    // optional on purpose: a required section is already refused before the write,
+    // so only the optional one reaches the state-write path
+    let payload = PayloadSection {
+        id: SECTION,
+        kind: *b"PAY\0",
+        required: false,
+    };
+    {
+        let mut j: Journal<V> = Journal::open_with_payload(&d, tree, payload).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+        j.checkpoint(&Opts::now()).unwrap();
+    }
+    std::fs::remove_file(d.join("state.json")).unwrap();
+
+    let err = match Journal::<V>::repair(&d, tree, None) {
+        Ok(_) => panic!("a checkpoint with a payload cannot be repaired without it"),
+        Err(e) => e,
+    };
+    assert!(format!("{err}").contains("section"), "got {err}");
+    assert!(
+        !d.join("state.json").exists(),
+        "a repair that fails must not leave a state file behind"
+    );
+
+    // and the directory is still repairable with the checkpoint's own section
+    let j: Journal<V> = Journal::<V>::repair(&d, tree, Some(payload))
+        .expect("repair with the section the checkpoint carries");
+    assert_eq!(j.len(), 1);
+    drop(j);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn repair_replaces_a_state_file_it_cannot_read() {
+    // a readable but corrupt state.json was treated as a healthy one, so open said
+    // "not json" and repair said "open it instead": neither path could recover
+    let d = dir("repair-corrupt-state");
+    let tree = TreeId::from_name("repair-corrupt");
+    {
+        let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+        j.checkpoint(&Opts::now()).unwrap();
+    }
+    std::fs::write(d.join("state.json"), b"{not json").unwrap();
+
+    let j: Journal<V> = Journal::<V>::repair(&d, tree, None)
+        .expect("an unreadable state file is what repair is for");
+    assert_eq!(j.len(), 1);
+    drop(j);
+    let reopened: Journal<V> = Journal::open(&d, tree).expect("the repaired directory opens");
+    assert_eq!(reopened.len(), 1);
+    std::fs::remove_dir_all(&d).ok();
+}

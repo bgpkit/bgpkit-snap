@@ -380,7 +380,10 @@ where
     /// this, and only for bytes it wrote itself in this session: recovery never
     /// truncates, because there a short segment may mean a lost one.
     fn discard_torn_write(&mut self) -> Result<(), Error> {
-        let Some(offset) = self.seg_dirty_from.take() else {
+        // the offset is the only record of where the acknowledged bytes end. It is
+        // cleared after the cut-back succeeds, never before: a retry on a full disk
+        // fails here too, and the next append must still cut from the same offset
+        let Some(offset) = self.seg_dirty_from else {
             return Ok(());
         };
         if let Some(seg) = self.seg.as_mut() {
@@ -389,6 +392,7 @@ where
             seg.file.get_ref().sync_all()?;
             seg.bytes = offset;
         }
+        self.seg_dirty_from = None;
         Ok(())
     }
 
@@ -823,10 +827,11 @@ where
             .open(dir.join("writer.lock"))?;
         fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Error::Locked)?;
 
-        // repair is for a lost state file. If one is there and readable, opening is
-        // the only correct move: repair would rewrite next_seq and hide the gap that
-        // open reports.
-        if std::fs::read(dir.join("state.json")).is_ok() {
+        // a healthy state file means opening is the only correct move: repair would
+        // rewrite next_seq and hide the gap that open reports. A state file that is
+        // there but does not parse is the case repair exists for, and leaving it in
+        // place made both entries refuse the directory.
+        if matches!(read_state(&dir), Ok(Some(_))) {
             return Err(Error::BadOpts(
                 "state.json exists; open the journal instead of repairing it",
             ));
@@ -872,33 +877,37 @@ where
                 _ => return Err(Error::BadRecord("the checkpoint belongs to another tree")),
             }
         };
-        Snapshot::<T>::from_bytes_with(&raw, &KnownPayload(payload.map(|p| p.id)))?;
+        let snapshot = Snapshot::<T>::from_bytes_with(&raw, &KnownPayload(payload.map(|p| p.id)))?;
 
-        // the state we are about to write must describe the object that exists, not
-        // the configuration the caller happened to pass
-        if let Some(wanted) = payload {
-            let found = Snapshot::<T>::from_bytes_with(&raw, &KnownPayload(Some(wanted.id)))?
-                .entries()
-                .into_iter()
-                .find(|e| e.id == wanted.id);
-            match found {
-                Some(entry) if entry.kind == wanted.kind && entry.required == wanted.required => {}
-                Some(entry) => {
-                    return Err(Error::ConfigMismatch(format!(
-                        "the checkpoint carries section {} as kind {} required {}, not the \
-                         configuration this repair was called with",
-                        entry.id,
-                        crate::header::hex4(&entry.kind),
-                        entry.required
-                    )))
-                }
-                None => {
-                    return Err(Error::ConfigMismatch(format!(
-                        "the checkpoint has no section {}, so repairing with that payload \
-                         would describe a journal that does not exist",
-                        wanted.id
-                    )))
-                }
+        // the state written below must describe the object that exists, not the
+        // configuration the caller happened to pass. Comparing every non-family
+        // section also covers the caller who passes no payload at all: the checkpoint
+        // can still carry one, and a state that omits it makes every later open and
+        // repair refuse the directory.
+        let wanted = payload.map(|p| (p.id, p.kind, p.required));
+        for entry in snapshot.entries() {
+            if entry.id == crate::header::ID_V4 || entry.id == crate::header::ID_V6 {
+                continue;
+            }
+            let matches = wanted.is_some_and(|(id, kind, required)| {
+                entry.id == id && entry.kind == kind && entry.required == required
+            });
+            if !matches {
+                return Err(Error::ConfigMismatch(format!(
+                    "the checkpoint carries section {} as kind {} required {}, not the \
+                     configuration this repair was called with",
+                    entry.id,
+                    crate::header::hex4(&entry.kind),
+                    entry.required
+                )));
+            }
+        }
+        if let Some((id, _, _)) = wanted {
+            if snapshot.section_bytes(id).is_none() {
+                return Err(Error::ConfigMismatch(format!(
+                    "the checkpoint has no section {id}, so repairing with that payload \
+                     would describe a journal that does not exist"
+                )));
             }
         }
 
@@ -912,11 +921,20 @@ where
                 tree_id,
                 checkpoint: Some((base, file.clone())),
                 type_id: Some(T::TYPE_ID.to_string()),
-                payload: payload.map(|p| (p.id, p.kind, p.required)),
+                payload: wanted,
             },
         )?;
         drop(lock);
-        Self::open_inner(dir, tree_id, payload, None)
+        // prove the state describes a journal that opens before leaving it behind: a
+        // repair that cannot be adopted has to leave the directory as repairable as it
+        // was found, or the next attempt is refused for having a state file
+        match Self::open_inner(&dir, tree_id, payload, None) {
+            Ok(journal) => Ok(journal),
+            Err(e) => {
+                let _ = std::fs::remove_file(dir.join("state.json"));
+                Err(e)
+            }
+        }
     }
 
     /// A record is durable once this returns.
@@ -1102,10 +1120,17 @@ where
         let name = format!("snapshot-{}-{}.snap", self.seq, self.checkpoints);
         let path = self.dir.join(&name);
         let tmp = self.dir.join(format!(".{name}.tmp"));
-        {
+        let written = (|| -> Result<(), Error> {
             let mut f = File::create(&tmp)?;
             f.write_all(&bytes)?;
             f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = written {
+            // a failed write must not leave a hidden file behind: the orphan sweep
+            // only knows `snapshot-` names, so nothing would ever reclaim this one
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
         std::fs::rename(&tmp, &path)?;
         File::open(&self.dir)?.sync_all()?;
@@ -1133,14 +1158,19 @@ where
 
         // An older snapshot is dead weight once a newer one is committed. This is
         // reclamation, not correctness, so it never fails a checkpoint that is
-        // already committed; the next one tries again.
+        // already committed; the next one tries again. The object `current.snap`
+        // still names is kept, because a failed publication above would otherwise
+        // leave the documented stable path dangling.
+        let linked = std::fs::read_link(self.dir.join("current.snap"))
+            .ok()
+            .and_then(|target| target.file_name().map(|n| n.to_string_lossy().into_owned()));
         if let Ok(old_snapshots) = snapshot_paths(&self.dir) {
             for old in old_snapshots {
                 let old_name = old
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                if old_name != name {
+                if old_name != name && Some(&old_name) != linked.as_ref() {
                     let _ = std::fs::remove_file(&old);
                 }
             }
@@ -1515,6 +1545,56 @@ mod tests {
 
     impl crate::SnapValue for V {
         const TYPE_ID: &str = "test.v:v1";
+    }
+
+    /// A cut-back whose truncate fails must keep the offset: the next append cuts
+    /// from it, and forgetting it wrote a record behind a partial frame that no open
+    /// can replay (ENOSPC, retry while full, free space, sync Ok, then SequenceGap).
+    #[test]
+    fn a_failed_cut_back_keeps_the_offset_for_the_next_attempt() {
+        let dir = std::env::temp_dir().join(format!("snap-cutback-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let tree_id = [72u8; 16];
+        let mut j: Journal<V> = Journal::open(&dir, tree_id).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+
+        // a half-written frame lands past the acknowledged bytes
+        let (seg_path, acknowledged) = {
+            let seg = j.seg.as_mut().expect("an open segment");
+            seg.file.flush().unwrap();
+            let path = j.seg_path.clone().unwrap();
+            (path, seg.bytes)
+        };
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&seg_path)
+                .unwrap();
+            f.write_all(&[0xAB; 24]).unwrap();
+        }
+
+        // an offset no file can have makes the truncate fail, which stands in for a
+        // full disk or a failing device at the same step
+        j.seg_dirty_from = Some(u64::MAX);
+        assert!(
+            j.discard_torn_write().is_err(),
+            "the cut-back must report the failure"
+        );
+        assert_eq!(
+            j.seg_dirty_from,
+            Some(u64::MAX),
+            "a failed cut-back must keep the offset for the next attempt"
+        );
+
+        // and the next attempt with a real offset still does the job
+        j.seg_dirty_from = Some(acknowledged);
+        j.discard_torn_write().expect("the cut-back must succeed");
+        assert_eq!(j.seg_dirty_from, None);
+        let len = std::fs::metadata(&seg_path).unwrap().len();
+        assert_eq!(len, acknowledged, "the torn bytes must be gone");
+        drop(j);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The bytes the spec fixes inside a record: the flags byte must be zero and

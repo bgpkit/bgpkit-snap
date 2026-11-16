@@ -561,10 +561,16 @@ impl<T: SnapValue> Writer<T> {
         static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("snap.{}.{n}.tmp", std::process::id()));
-        {
+        let written = (|| -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&bytes)?;
-            f.sync_all()?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            // the caller's existing object is still where it was; a temp file left
+            // here would sit beside it forever
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Io(e));
         }
         std::fs::rename(&tmp, path)?;
         if let Some(dir) = path.parent() {

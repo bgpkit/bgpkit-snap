@@ -529,6 +529,49 @@ fn a_hole_in_the_middle_is_an_error_not_a_shorter_tree() {
 }
 
 #[test]
+fn a_committed_record_above_the_checkpoint_is_reported_as_a_gap() {
+    // the checkpoint is the state; a segment holding acknowledged records above it
+    // cannot be replayed. Recovery must say so rather than hand out a sequence number
+    let dir = std::env::temp_dir().join(format!("snap-gap-above-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let log = dir.join("journal");
+    let tree_id = [6u8; 16];
+    let open = || {
+        Journal::<PathRef>::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
+    };
+
+    {
+        let mut j = open().unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 0 })
+            .expect("insert 1");
+        j.checkpoint(&Opts::now()).expect("checkpoint");
+    }
+    // two sessions, because each open appends to a segment of its own
+    for (p, seq) in [("192.0.2.0/24", 2), ("198.51.100.0/24", 3)] {
+        let mut j = open().unwrap();
+        let got = j
+            .insert(p.parse().unwrap(), PathRef { off: 0, len: 0 })
+            .expect("insert above the checkpoint");
+        assert_eq!(got, seq, "sequence {got} where {seq} was expected");
+        j.sync().expect("sync");
+    }
+
+    // lose the segment that held seq 2, the way a pruned or lost file would
+    let lost = log.join("segment-000000000002.log");
+    assert!(lost.exists(), "expected a second segment at {lost:?}");
+    std::fs::remove_file(&lost).expect("remove the segment");
+
+    match open() {
+        Err(e) => assert!(format!("{e}").contains("sequence"), "got {e}"),
+        Ok(j) => panic!(
+            "a lost committed record must not read as {} entries",
+            j.len()
+        ),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_blob_without_a_payload_section_is_refused() {
     let dir = std::env::temp_dir().join(format!("snap-noblob-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
