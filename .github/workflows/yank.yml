@@ -1,0 +1,32 @@
+name: yank
+
+# Yanking is a manual, one-version-at-a-time action: it removes a release from new
+# resolutions without deleting it, and every consumer that already pinned it keeps
+# working. The token lives in the same secret the release workflow publishes with.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to yank, e.g. 1.0.0-rc.3"
+        required: true
+      undo:
+        description: "Set to 'undo' to un-yank instead"
+        required: false
+        default: ""
+
+jobs:
+  yank:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Yank ${{ inputs.version }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.undo }}" = "undo" ]; then
+            cargo yank --version "${{ inputs.version }}" bgpkit-snap --undo
+          else
+            cargo yank --version "${{ inputs.version }}" bgpkit-snap
+          fi
