@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.1.0
 
-The release that makes the surface small enough to describe without a table of
-near-duplicates, and the one that makes the journal's durability claim true.
+The first version under the pre-stable numbering. The crate moved from `1.0.0-rc.4` to
+`0.1.0` on purpose: no service has leaned on this interface for long enough to freeze
+it, and a 1.0 that has to break is worse than a 0.1 that is allowed to. The wire layout
+is unchanged (v4) and is documented as the contract; the Rust API is not.
+
+This is also the release that makes the surface small enough to describe without a
+table of near-duplicates, and the one that makes the journal's durability claim true.
 
 API
 

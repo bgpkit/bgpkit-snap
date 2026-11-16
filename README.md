@@ -11,9 +11,11 @@ tries and their sections, not of the file: `created_at` and the rest of the
 provenance in the header are deliberately outside it. A journal turns a live, mutable tree into the
 next snapshot without losing updates.
 
-Status: **unreleased**, tracks `main`. The published `1.0.0-rc.3` predates the owned
-view, `TreeId`, `to_snapshot` and the journal durability fix; do not pair it with this
-page. The layout is frozen for release candidates; see
+Status: **0.1.0**, pre-stable. The interface is expected to change; `0.1.x` is
+deliberate rather than modesty, because a container format that real services depend on
+needs a year of use before its API can be called settled. The published
+`1.0.0-rc.3` predates the owned view, `TreeId`, `to_snapshot`, merge and the journal
+durability fix; do not pair it with this page. The layout is frozen for release candidates; see
 [Scope](#scope-and-what-this-is-not) and [Known limitations](#known-limitations)
 before depending on it.
 

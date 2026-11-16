@@ -1,6 +1,6 @@
 # snap format 1.0
 
-Status: normative for 1.0.0-rc.3. This document is the byte contract for the
+Status: normative for 0.1.0 (wire layout v4). This document is the byte contract for the
 container and the journal. It replaces the draft that shipped with 1.0.0-rc.1,
 which is kept as [`format-rc1.md`](format-rc1.md) for reference only.
 

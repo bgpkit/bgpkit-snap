@@ -1,8 +1,10 @@
 # bgpkit-snap: developer guide
 
-Status: unreleased, tracks `main`. Do not install `1.0.0-rc.3` from crates.io and
-expect this page to work: rc.3 predates the owned view, `TreeId`, `to_snapshot` and
-the durability fix below, and it has a known checkpoint bug.
+Status: 0.1.0, pre-stable. The API will change between minor versions: this is a
+format and a library that real services have not yet leaned on, so the interface
+follows what those services need rather than a freeze date. Do not install
+`1.0.0-rc.3` from crates.io and expect this page to work: it predates the owned view,
+`TreeId`, `to_snapshot`, merge and the journal durability fixes.
 
 ```toml
 bgpkit-snap = { git = "https://github.com/bgpkit/bgpkit-snap", branch = "main" }
@@ -480,6 +482,13 @@ one, because a record is the only place that time is kept.
 - **`lpm` is a longest-prefix match, not an exact one.** For an exact check use `get_exact`,
   or you will compare a value from an ancestor prefix and believe it is the
   child's.
+- **Keep the value small and fixed-size.** A value with a `Vec` or a `String` in it
+  costs the archive an out-of-line buffer per prefix: measured on a real RIB, a
+  two-announcement `Vec` cell came to about 900 bytes per prefix, while an 8-byte
+  handle to the same bytes in a payload section came to about 21. Put variable data in
+  a section and store a handle; that is what `insert_with_blob` is for. Interning also
+  pays: in the same RIB, 3.3 million announcements held only 38,903 distinct AS paths,
+  so a path dictionary is about 70 times smaller than inline copies.
 - **`canonicalize` decides the content id.** Two producers of the same logical
   data that sort or dedupe differently produce different objects. Do the sorting
   in the hook, not in your caller.
