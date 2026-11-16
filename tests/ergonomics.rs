@@ -470,6 +470,44 @@ fn repair_without_a_payload_section_leaves_a_payload_checkpoint_alone() {
 }
 
 #[test]
+fn a_failed_write_leaves_the_object_that_was_there() {
+    // `finish_to` writes beside the target and renames, which is what keeps a failed
+    // build from truncating the object at that path. A read-only directory is the
+    // portable way to fail the temp write; a root process ignores the mode, so this
+    // reports nothing there rather than a pass it did not earn.
+    use std::os::unix::fs::PermissionsExt;
+
+    let d = dir("atomic-write");
+    let out = d.join("out.snap");
+    let build = |path: &std::path::Path| {
+        let mut w: Writer<V> = Writer::new();
+        w.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+        w.finish_to(path, &Opts::now())
+    };
+    build(&out).expect("the first write");
+    let before = std::fs::read(&out).unwrap();
+
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let root_can_still_write = std::fs::write(d.join(".probe"), b"").is_ok();
+    if root_can_still_write {
+        std::fs::remove_file(d.join(".probe")).ok();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+        return;
+    }
+
+    let failed = build(&out);
+    assert!(failed.is_err(), "a write that cannot happen must report it");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        before,
+        "the object that was already there must be untouched"
+    );
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
 fn repair_replaces_a_state_file_it_cannot_read() {
     // a readable but corrupt state.json was treated as a healthy one, so open said
     // "not json" and repair said "open it instead": neither path could recover
