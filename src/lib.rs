@@ -21,6 +21,10 @@ use rkyv::rancor::Error as RkyvError;
 /// archive re-export this one is complete: no macro expands `::ipnet::` paths.
 pub use ipnet;
 
+/// The archived trie types `Snapshot::v4`/`v6` return, re-exported so a caller that
+/// names them does not have to pin this crate's `prefix-trie` version itself.
+pub use prefix_trie;
+
 /// The archive library this crate builds value types on, re-exported so a
 /// caller can name the same version in a signature.
 ///
@@ -325,9 +329,9 @@ pub struct Opts<'a> {
     /// unix seconds UTC, written into the header. `created_at` is deliberately
     /// outside the content id, so this is provenance rather than identity.
     pub created_at: i64,
-    /// Set by a journal, which owns the stream coordinates; ignored if a caller sets
-    /// it, because the journal's own `tree_id`, `generation` and `base_seq` are the
-    /// ones the checkpoint is written under.
+    /// Stream coordinates, written as given: `Writer::finish` sets the flag and stores
+    /// the `tree_id`, `generation` and `base_seq` the caller passed. A journal
+    /// overwrites them with its own, because a checkpoint belongs to that stream.
     pub stream: Option<StreamRef>,
     /// Coverage claim, `(first_ts, last_ts)` in unix seconds.
     pub window: Option<(i64, i64)>,
@@ -577,35 +581,69 @@ impl<T: SnapValue> Writer<T> {
 // ---------------------------------------------------------------- merge
 
 impl<T: SnapValue> Snapshot<T> {
-    /// Merge several objects into one, later inputs winning where they overlap.
+    /// Merge several objects into one, later inputs winning where they hold the same
+    /// prefix.
     ///
     /// This is what a daily merge is: build one object per collector or per hour,
-    /// then fold them. Order matters only for overlaps; the bytes do not depend on
-    /// it, because the writer sorts by prefix like any other build.
+    /// then fold them. "Overlap" means the same key: a later `/8` and an earlier
+    /// `/16` are different entries and both survive, because a merge cannot know
+    /// whether you meant one to cover the other.
     ///
-    /// The stream coordinates are dropped: a merge of several streams is not one
-    /// stream. `opts.window` left as `None` becomes the union of the inputs'
-    /// windows when every input declares one, and stays absent otherwise.
+    /// What a merge refuses, and why:
+    ///
+    /// - an input carrying a section of its own (id 16 or above). The values may
+    ///   point into that section, and a merged object that drops it would open
+    ///   cleanly while its handles pointed at nothing.
+    /// - `opts.extras`, for the same reason; a profile builds its own object.
+    ///
+    /// The stream coordinates are dropped: several streams are not one stream. A
+    /// window is claimed only when every input declares one and the intervals form a
+    /// continuous chain; disjoint inputs claim nothing, because a single `window`
+    /// is a validity claim over its whole span.
     pub fn merge_last_wins(inputs: &[&Snapshot<T>], opts: &Opts<'_>) -> Result<Vec<u8>, Error>
     where
         T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
     {
-        Self::merge_with(inputs, opts, |_, later| Some(later))
+        Self::merge_with(inputs, opts, |_, _, later| Some(later))
     }
 
-    /// The same, with `combine` deciding an overlap. Returning `None` drops the
-    /// prefix from the result, which is how a withdrawal is expressed.
+    /// The same, with `combine` deciding a collision on the same prefix.
+    ///
+    /// `combine(prefix, earlier, later)` returns the value to keep, or `None` to
+    /// leave the prefix out of the result *of this fold*. That is not a withdrawal:
+    /// absence in a later input never reaches `combine`, and a third input holding
+    /// the prefix puts it back. A tombstone would have to be a value the caller
+    /// understands, which is what a value type is for.
     ///
     /// Both values are owned: a merge that has to look at two archived values and
-    /// then write one cannot avoid building at least one of them.
+    /// then write one cannot avoid building at least one of them. The prefix is
+    /// passed because a resolution that depends on the key (interning a handle into
+    /// a rebuilt arena, say) cannot be written without it.
     pub fn merge_with(
         inputs: &[&Snapshot<T>],
         opts: &Opts<'_>,
-        mut combine: impl FnMut(T, T) -> Option<T>,
+        mut combine: impl FnMut(IpNet, T, T) -> Option<T>,
     ) -> Result<Vec<u8>, Error>
     where
         T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
     {
+        if !opts.extras.is_empty() {
+            return Err(Error::BadOpts(
+                "a merge cannot carry a caller section: merge refuses inputs that hold \
+                 sections of their own, so there is nothing to keep it consistent with",
+            ));
+        }
+        for snap in inputs {
+            for entry in snap.entries() {
+                if entry.id >= crate::header::FIRST_PROFILE_ID {
+                    return Err(Error::BadOpts(
+                        "a merge cannot take an object that carries its own section: the \
+                         values may point into it, and the merged object would not have it",
+                    ));
+                }
+            }
+        }
+
         let mut merged: std::collections::HashMap<IpNet, T> = std::collections::HashMap::new();
         for snap in inputs {
             for (prefix, value) in snap.iter() {
@@ -616,7 +654,7 @@ impl<T: SnapValue> Snapshot<T> {
                         merged.insert(prefix, value);
                     }
                     Some(earlier) => {
-                        if let Some(next) = combine(earlier, value) {
+                        if let Some(next) = combine(prefix, earlier, value) {
                             merged.insert(prefix, next);
                         }
                     }
@@ -626,31 +664,7 @@ impl<T: SnapValue> Snapshot<T> {
 
         let window = match opts.window {
             Some(w) => Some(w),
-            None => {
-                let mut from: Option<i64> = None;
-                let mut to: Option<i64> = None;
-                let mut all = !inputs.is_empty();
-                for snap in inputs {
-                    match snap.header().window() {
-                        Some((a, b)) => {
-                            from = Some(from.map_or(a, |f: i64| f.min(a)));
-                            to = Some(to.map_or(b, |t: i64| t.max(b)));
-                        }
-                        None => {
-                            all = false;
-                            break;
-                        }
-                    }
-                }
-                if all {
-                    match (from, to) {
-                        (Some(a), Some(b)) => Some((a, b)),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
+            None => Self::covers_one_span(inputs),
         };
 
         let mut writer = Writer::<T>::new();
@@ -662,6 +676,32 @@ impl<T: SnapValue> Snapshot<T> {
             extras: &[],
         };
         writer.finish(&opts)
+    }
+
+    /// The union of the inputs' windows, or `None` when they do not form one
+    /// continuous span.
+    ///
+    /// `window` says "this value is valid across this range", so two inputs covering
+    /// `(100,200)` and `(300,400)` cannot claim `(100,400)`: nobody observed the
+    /// hole between them.
+    fn covers_one_span(inputs: &[&Snapshot<T>]) -> Option<(i64, i64)> {
+        if inputs.is_empty() {
+            return None;
+        }
+        let mut spans = Vec::with_capacity(inputs.len());
+        for snap in inputs {
+            spans.push(snap.header().window()?);
+        }
+        spans.sort_unstable();
+        let (mut from, mut to) = spans[0];
+        for (a, b) in spans.into_iter().skip(1) {
+            if a > to {
+                return None;
+            }
+            to = to.max(b);
+            from = from.min(a);
+        }
+        Some((from, to))
     }
 }
 

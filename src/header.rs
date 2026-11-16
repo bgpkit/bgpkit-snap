@@ -324,6 +324,28 @@ impl Entry {
     }
 }
 
+/// Lower-case hex of a four-byte tag, the form `state.json` stores.
+pub fn hex4(bytes: &[u8; 4]) -> String {
+    let mut s = String::with_capacity(8);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// The inverse of `hex4`; exactly eight hex characters or nothing.
+pub fn hex4_to_bytes(text: &str) -> Option<[u8; 4]> {
+    if text.len() != 8 {
+        return None;
+    }
+    let mut out = [0u8; 4];
+    for (i, chunk) in text.as_bytes().chunks(2).enumerate() {
+        let pair = std::str::from_utf8(chunk).ok()?;
+        out[i] = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Lower-case hex of a 32-byte id.
 pub fn hex32(bytes: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);

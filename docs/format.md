@@ -200,7 +200,7 @@ journal.len()
 ### Journal bytes
 
 A journal is a directory: `writer.lock`, `state.json`,
-`segment-<12-digit index>.log` and `snapshot-<seq>.snap`. The
+`segment-<12-digit index>.log` and `snapshot-<seq>-<n>.snap`. The
 `type_id` is ASCII, NUL-terminated, zero-filled to 32 bytes; a reader refuses a
 field without a terminator or with non-printable bytes. Reserved and padding
 bytes are zero. Segment names are the
@@ -286,7 +286,7 @@ state   {"checkpoint":{"file":"snapshot-3.snap","seq":2},
 ```
 
 `examples/journal_vector.rs` regenerates these bytes; it passes the generation
-explicitly (`Journal::open_with`), so the vector is the same on every run rather
+explicitly (`Journal::options(..).generation(..).open()`), so the vector is the same on every run rather
 than carrying whatever the journal minted.
 
 ## 4. Conformance

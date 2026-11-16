@@ -93,8 +93,8 @@ let (prefix, value) = snap.search("10.1.2.3".parse()?).ok_or("not covered")?;
 println!("{prefix} -> {} origins, id {}", value.0.len(), snap.content_id());
 ```
 
-`examples/quickstart.rs` is the same program, built and run by CI; a change to the
-API that would break this page breaks the build. The prose around it can still
+`examples/quickstart.rs` is the same program, and CI builds every example; a change
+to the API that would break this page breaks the build. The prose around it can still
 drift from that example, so the example is the authority.
 
 A reader identifies an object from its first 192 bytes, without touching the
@@ -147,7 +147,7 @@ sections         packed in ascending id order, 16-byte aligned
 segments   segment-<12-digit index>.log, 48-byte header with tree_id + generation,
            length + crc32c framed records, dense sequence numbers
 state      state.json: next sequence, identity, and the checkpoint it belongs to
-checkpoint snapshot-<seq>.snap, verified against the live tree before it is named
+checkpoint `snapshot-<seq>-<n>.snap`, verified against the live tree before it is named
 ```
 
 `sync` makes a record durable. `checkpoint` builds an ordinary object, verifies it

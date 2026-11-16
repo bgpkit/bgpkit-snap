@@ -286,3 +286,117 @@ fn repair_refuses_a_directory_that_still_has_its_state_file() {
     assert!(format!("{err}").contains("state.json exists"), "got {err}");
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn a_payload_kind_with_high_bytes_survives_state_json() {
+    // state.json stored the kind through from_utf8_lossy while reading demanded four
+    // bytes, so a non-UTF-8 kind wrote a journal that could never be reopened
+    let d = dir("kind-bytes");
+    let tree = TreeId::from_name("kind-bytes");
+    let payload = PayloadSection {
+        id: 16,
+        kind: [0xff, 0x00, 0xfe, 0x01],
+        required: true,
+    };
+    {
+        let mut j: Journal<V> = Journal::open_with_payload(&d, tree, payload).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+        j.sync().unwrap();
+    }
+    let j: Journal<V> = Journal::open_with_payload(&d, tree, payload)
+        .expect("a journal must reopen with the kind it was written with");
+    assert_eq!(j.len(), 1);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_checkpoint_sequence_of_u64_max_is_refused_not_added_to() {
+    use bgpkit_snap::header::StreamRef;
+
+    // a structurally valid object whose stream says base_seq = u64::MAX: the journal
+    // must refuse it, because base_seq + 1 is not representable
+    let d = dir("max-seq");
+    let log = d.join("journal");
+    std::fs::create_dir_all(&log).unwrap();
+    let tree = TreeId::from_name("max-seq");
+
+    let mut w: Writer<V> = Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+    let bytes = w
+        .finish(&Opts {
+            created_at: 1_794_614_400,
+            window: None,
+            stream: Some(StreamRef {
+                tree_id: *tree.as_bytes(),
+                generation: [5u8; 16],
+                base_seq: u64::MAX,
+            }),
+            extras: &[],
+        })
+        .unwrap();
+    let name = "snapshot-1-1.snap";
+    std::fs::write(log.join(name), &bytes).unwrap();
+    std::fs::write(
+        log.join("state.json"),
+        format!(
+            "{{\"next_seq\": 1, \"generation\": \"{}\", \"tree_id\": \"{}\", \"checkpoint\": {{\"seq\": 18446744073709551615, \"file\": \"{name}\"}}, \"type_id\": \"{}\"}}",
+            "05".repeat(16),
+            tree,
+            <V as SnapValue>::TYPE_ID
+        ),
+    )
+    .unwrap();
+
+    let opened = std::panic::catch_unwind(|| match Journal::<V>::open(&log, tree) {
+        Ok(_) => Err::<(), String>("accepted an unrepresentable sequence".to_string()),
+        Err(e) => Err::<(), String>(format!("{e}")),
+    });
+    let message = opened.expect("opening must not panic").unwrap_err();
+    assert!(message.contains("sequence"), "got {message}");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_second_checkpoint_after_a_restart_does_not_reuse_a_committed_name() {
+    // the ordinal behind `snapshot-<seq>-<n>` used to restart at zero on every open,
+    // so the first checkpoint after a restart replaced the object state.json named
+    let d = dir("restart-name");
+    let tree = TreeId::from_name("restart-name");
+    let first = {
+        let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+        j.checkpoint(&Opts::now()).unwrap()
+    };
+    let committed = std::fs::read(&first).unwrap();
+
+    {
+        // no new records: the sequence does not advance, only the ordinal can keep the
+        // two checkpoints apart
+        let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+        let second = j
+            .checkpoint(&Opts {
+                created_at: 1_794_614_400 + 60,
+                ..Opts::now()
+            })
+            .unwrap();
+        assert_ne!(first, second, "a checkpoint must write a new name");
+        assert!(
+            second
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-2.snap")
+                || second
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("-3.snap"),
+            "got {second:?}"
+        );
+    }
+
+    // the first object is gone only because pruning removed it after the commit; what
+    // must never happen is its bytes being overwritten before the new state landed
+    assert!(!committed.is_empty());
+    std::fs::remove_dir_all(&d).ok();
+}

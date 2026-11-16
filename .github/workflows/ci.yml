@@ -15,6 +15,20 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --features cli -- -D warnings
+      # this also runs the developer guide's ten doctests, so a page that stops
+      # matching the code fails the build
       - run: cargo test --features cli
+      - name: Build every example
+        run: cargo build --examples --features cli
       - name: Build the out-of-crate consumer
         run: cargo test --manifest-path tests/downstream/Cargo.toml
+
+  msrv:
+    # rust-version in Cargo.toml is a promise; without this job nothing keeps it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - run: cargo check --all-targets --features cli

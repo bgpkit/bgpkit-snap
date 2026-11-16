@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_b: Snapshot<Peers> = Snapshot::from_bytes(&as_b.finish(&Opts::now())?)?;
 
     // two sources, one prefix in common: keep the larger peer count
-    let daily = Snapshot::merge_with(&[&source_a, &source_b], &Opts::now(), |a, b| {
+    let daily = Snapshot::merge_with(&[&source_a, &source_b], &Opts::now(), |_, a, b| {
         Some(Peers(a.0.max(b.0)))
     })?;
     std::fs::write(dir.join("daily.snap"), &daily)?;

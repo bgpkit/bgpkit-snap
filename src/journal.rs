@@ -97,6 +97,10 @@ where
     }
 
     /// Reuse a known incarnation id instead of minting one.
+    ///
+    /// Only a directory that has none yet accepts it: a journal that already holds a
+    /// generation is opened with that one, and asking for a different one is an
+    /// error rather than a silent no-op.
     pub fn generation(mut self, generation: [u8; 16]) -> Self {
         self.generation = Some(generation);
         self
@@ -241,12 +245,20 @@ where
                 }
             }
         }
-        let generation = state
+        let existing = state
             .as_ref()
             .map(|s| s.generation)
-            .or(existing_generation(&dir)?)
-            .or(generation)
-            .unwrap_or_else(random_generation);
+            .or(existing_generation(&dir)?);
+        if let (Some(existing), Some(wanted)) = (existing, generation) {
+            if existing != wanted {
+                return Err(Error::ConfigMismatch(format!(
+                    "this journal was minted as generation {}, not {}",
+                    crate::header::hex16(&existing),
+                    crate::header::hex16(&wanted)
+                )));
+            }
+        }
+        let generation = existing.or(generation).unwrap_or_else(random_generation);
         // a new segment, never the existing ones: reopening must not truncate
         let index = segment_paths(&dir)?
             .iter()
@@ -290,6 +302,9 @@ where
             ));
         }
         let keep = journal.recover(state)?;
+        // the snapshot name carries a per-sequence ordinal; seeding it from disk keeps
+        // the first checkpoint after a restart from reusing a committed name
+        journal.checkpoints = highest_checkpoint_ordinal(&journal.dir, journal.seq);
         // a snapshot written just before a crash is not named by the state file,
         // so it is an orphan: recovery already came from the segments
         for path in snapshot_paths(&journal.dir)? {
@@ -502,13 +517,15 @@ where
                 }
             }
             self.base_seq = base;
-            self.seq = base + 1;
+            self.seq = base
+                .checked_add(1)
+                .ok_or(Error::BadRecord("checkpoint sequence is not representable"))?;
             self.checkpoint = Some((base, file.clone()));
         }
 
         let mut paths = segment_paths(&self.dir)?;
         paths.sort();
-        let mut expected: Option<u64> = Some(self.base_seq + 1);
+        let mut expected: Option<u64> = self.base_seq.checked_add(1);
         for path in paths {
             let mut raw = Vec::new();
             File::open(&path)?.read_to_end(&mut raw)?;
@@ -574,7 +591,7 @@ where
             // a record the state file committed to must be on disk; only the
             // last unacknowledged one may be missing after a tear
             let last = self.seq.saturating_sub(1);
-            if committed > self.base_seq + 1 && last < committed - 1 {
+            if committed > self.base_seq.saturating_add(1) && last < committed - 1 {
                 return Err(Error::SequenceGap {
                     expected: last + 1,
                     found: committed,
@@ -860,10 +877,40 @@ where
         };
         Snapshot::<T>::from_bytes_with(&raw, &KnownPayload(payload.map(|p| p.id)))?;
 
+        // the state we are about to write must describe the object that exists, not
+        // the configuration the caller happened to pass
+        if let Some(wanted) = payload {
+            let found = Snapshot::<T>::from_bytes_with(&raw, &KnownPayload(Some(wanted.id)))?
+                .entries()
+                .into_iter()
+                .find(|e| e.id == wanted.id);
+            match found {
+                Some(entry) if entry.kind == wanted.kind && entry.required == wanted.required => {}
+                Some(entry) => {
+                    return Err(Error::ConfigMismatch(format!(
+                        "the checkpoint carries section {} as kind {} required {}, not the \
+                         configuration this repair was called with",
+                        entry.id,
+                        crate::header::hex4(&entry.kind),
+                        entry.required
+                    )))
+                }
+                None => {
+                    return Err(Error::ConfigMismatch(format!(
+                        "the checkpoint has no section {}, so repairing with that payload \
+                         would describe a journal that does not exist",
+                        wanted.id
+                    )))
+                }
+            }
+        }
+
         write_state(
             &dir,
             &State {
-                next_seq: base + 1,
+                next_seq: base
+                    .checked_add(1)
+                    .ok_or(Error::BadRecord("checkpoint sequence is not representable"))?,
                 generation,
                 tree_id,
                 checkpoint: Some((base, file.clone())),
@@ -1312,7 +1359,7 @@ fn read_state(dir: &Path) -> Result<Option<State>, Error> {
             let kind = p
                 .get("kind")
                 .and_then(|x| x.as_str())
-                .and_then(|s| <[u8; 4]>::try_from(s.as_bytes()).ok());
+                .and_then(crate::header::hex4_to_bytes);
             match (id, kind, required) {
                 (Some(id), Some(kind), Some(required)) => Some((id, kind, required)),
                 _ => return Err(Error::BadRecord("state.json payload is malformed")),
@@ -1345,7 +1392,8 @@ fn write_state(dir: &Path, state: &State) -> Result<(), Error> {
     if let Some((id, kind, required)) = &state.payload {
         v["payload"] = serde_json::json!({
             "id": id,
-            "kind": String::from_utf8_lossy(kind),
+            // hex: four arbitrary bytes do not survive a JSON string round trip
+            "kind": crate::header::hex4(kind),
             "required": required,
         });
     }
@@ -1389,6 +1437,22 @@ fn segment_max_seq(path: &Path) -> Result<Option<u64>, Error> {
         off += 4 + len;
     }
     Ok(max)
+}
+
+/// The highest ordinal already on disk for `seq`, so a fresh process does not reuse a
+/// checkpoint name that `state.json` still points at.
+fn highest_checkpoint_ordinal(dir: &Path, seq: u64) -> u64 {
+    let prefix = format!("snapshot-{seq}-");
+    snapshot_paths(dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?.to_string();
+            let rest = name.strip_prefix(&prefix)?.strip_suffix(".snap")?;
+            rest.parse::<u64>().ok()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn snapshot_paths(dir: &Path) -> Result<Vec<PathBuf>, Error> {

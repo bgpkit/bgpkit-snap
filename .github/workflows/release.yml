@@ -22,7 +22,7 @@ jobs:
         run: cargo clippy --all-targets --features cli -- -D warnings
       - name: Run tests
         run: cargo test --features cli --verbose
-      - name: Check the published contents build on their own
+      - name: Build the package tarball (the publish step verifies it)
         run: cargo package --no-verify
 
   cargo-publish:

@@ -1,6 +1,6 @@
 [package]
 name = "bgpkit-snap"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 edition = "2021"
 rust-version = "1.88.0"
 license = "MIT"
@@ -15,6 +15,11 @@ exclude = ["tests/downstream"]
 default = []
 # The `snap` CLI. Library users never pay for clap.
 cli = ["dep:clap"]
+
+[dev-dependencies]
+# the mutation suite reseals a mutated object so the reader reaches its archive checks
+blake3 = "1"
+crc32c = "0.6"
 
 [dependencies]
 prefix-trie = { version = "0.10", features = ["rkyv", "ipnet"] }
