@@ -104,6 +104,127 @@ fn a_build_through_a_symlink_updates_its_target() {
 }
 
 #[test]
+fn json_output_is_one_object_per_command() {
+    // the CLI is also a tool for programs: every command has to answer in one JSON
+    // object, not in prose a caller would have to scrape
+    let d = dir("json");
+    let out = d.join("out.snap");
+    let built = Command::new(bin())
+        .arg("build")
+        .arg(input(&d))
+        .arg("--out")
+        .arg(&out)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(built.status.success());
+    let built_json: serde_json::Value =
+        serde_json::from_slice(&built.stdout).expect("build --json is one object");
+    assert_eq!(built_json["entries"], 8);
+
+    let info = Command::new(bin())
+        .args(["--json", "info"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    let info_json: serde_json::Value =
+        serde_json::from_slice(&info.stdout).expect("info --json is one object");
+    assert_eq!(info_json["type_id"], "snap.u32:v1");
+    assert_eq!(info_json["consistent"], true);
+    // the input is all IPv4, so the object carries one family section
+    assert_eq!(info_json["sections"], 1);
+
+    let verify = Command::new(bin())
+        .args(["--json", "verify"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    let verify_json: serde_json::Value =
+        serde_json::from_slice(&verify.stdout).expect("verify --json is one object");
+    assert_eq!(verify_json["ok"], true);
+    assert_eq!(verify_json["bodies_checked"], true);
+    assert_eq!(verify_json["entries"], 8);
+
+    let search = Command::new(bin())
+        .args(["--json", "search"])
+        .arg(&out)
+        .arg("10.0.1.1")
+        .output()
+        .unwrap();
+    let search_json: serde_json::Value =
+        serde_json::from_slice(&search.stdout).expect("search --json is one object");
+    assert_eq!(search_json["match"]["prefix"], "10.0.1.0/24");
+    assert_eq!(search_json["match"]["value"], 1);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_u64_object_can_be_built_and_searched() {
+    // the CLI used to speak only snap.u32:v1, so an object built with u64 could be
+    // verified but never queried
+    let d = dir("u64");
+    let path = d.join("in.jsonl");
+    std::fs::write(&path, "{\"prefix\":\"10.0.0.0/8\",\"value\":4294967296}\n").unwrap();
+    let out = d.join("out.snap");
+    let built = Command::new(bin())
+        .arg("build")
+        .arg(&path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--value")
+        .arg("u64")
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let found = Command::new(bin())
+        .arg("search")
+        .arg(&out)
+        .arg("10.1.2.3")
+        .output()
+        .unwrap();
+    assert!(found.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&found.stdout).trim(),
+        "10.0.0.0/8 -> 4294967296"
+    );
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_foreign_value_type_says_what_to_do() {
+    // the object's value type is the caller's: the CLI cannot decode it, and the
+    // error has to say so and name both ways out instead of only the mismatch
+    #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct Origin(u32);
+    impl bgpkit_snap::SnapValue for Origin {
+        const TYPE_ID: &str = "cli-test.origin:v1";
+    }
+
+    let d = dir("foreign");
+    let out = d.join("origin.snap");
+    let mut w: bgpkit_snap::Writer<Origin> = bgpkit_snap::Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), Origin(64512))
+        .unwrap();
+    w.finish_to(&out, &bgpkit_snap::Opts::now()).unwrap();
+
+    let search = Command::new(bin())
+        .arg("search")
+        .arg(&out)
+        .arg("10.1.2.3")
+        .output()
+        .unwrap();
+    assert!(!search.status.success());
+    let err = String::from_utf8_lossy(&search.stderr);
+    assert!(err.contains("cli-test.origin:v1"), "got {err}");
+    assert!(err.contains("snap build"), "the error must name a way out");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
 fn a_failed_build_leaves_no_temporary_object() {
     // an output path that is a directory cannot be replaced: the build must fail and
     // must not leave the complete temp object beside it

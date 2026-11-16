@@ -590,3 +590,34 @@ fn repair_replaces_a_state_file_it_cannot_read() {
     assert_eq!(reopened.len(), 1);
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn a_count_prints_and_converts() {
+    // the demo printed `v4 All v6 All`, which is Debug output: a caller showing a user
+    // how much of the space an object covers wants text, and a program wants a number
+    assert_eq!(bgpkit_snap::Count::NoEntries.to_string(), "0");
+    assert_eq!(bgpkit_snap::Count::Exact(42).to_string(), "42");
+    assert_eq!(bgpkit_snap::Count::All.to_string(), "all");
+    assert_eq!(bgpkit_snap::Count::NoEntries.exact(), Some(0));
+    assert_eq!(bgpkit_snap::Count::Exact(42).exact(), Some(42));
+    assert_eq!(bgpkit_snap::Count::All.exact(), None);
+}
+
+#[test]
+fn a_journal_reports_the_next_sequence() {
+    let d = dir("seq-accessor");
+    let tree = TreeId::from_name("seq-accessor");
+    let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+    let first = j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+    assert_eq!(j.seq(), first + 1, "one record in, one sequence consumed");
+    j.sync().unwrap();
+    drop(j);
+
+    let j: Journal<V> = Journal::open(&d, tree).unwrap();
+    assert_eq!(
+        j.seq(),
+        first + 1,
+        "the sequence is the journal's, not the process's"
+    );
+    std::fs::remove_dir_all(&d).ok();
+}

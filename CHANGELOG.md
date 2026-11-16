@@ -37,7 +37,12 @@ API
   `#[non_exhaustive]`, so a new refusal does not break a caller's match.
 - `AddressCounts` / `Count { NoEntries, All, Exact(u128) }`: the old pair of options
   could not tell "no entries in this family" from "this family is covered end to end"
-  (`::/0` covers 2^128 addresses, which does not fit in the count).
+  (`::/0` covers 2^128 addresses, which does not fit in the count). `Count` prints
+  (`all`, `0`, the number) and `Count::exact()` gives the number when there is one.
+- `Journal::seq()`: the sequence the next record will carry, so a caller shipping
+  records elsewhere can say how far the journal has got.
+- `Snapshot::lpm` takes a prefix and `Snapshot::search` takes an address; both are
+  documented as the same lookup, one with the host prefix built for you.
 - `Journal::open(dir, tree)` and `open_with_payload(dir, tree, payload)` replace the
   positional `Option<PayloadSection>`; `checkpoint_with(&opts, &validator)` runs a
   profile's own check before the object is committed; `Snapshot::view()` is public so
@@ -171,7 +176,11 @@ Library and tooling
   verify an object whose type belongs to another binary.
 - `Writer::finish` refuses headers a reader would reject; a value that is missing
   or too wide is refused by `snap build` instead of becoming zero.
-- `snap` CLI: build, info, verify, search; `info` still reads 192 bytes.
+- `snap` CLI: build, info, verify, search; `info` still reads 192 bytes. Every
+  command takes `--json` and answers in one object, `build` and `search` handle
+  `snap.u64:v1` as well as `snap.u32:v1` (`--value u64`), and `search` on an object
+  whose value type belongs to another program names that type and both ways out
+  instead of only reporting a mismatch.
 
 Review
 

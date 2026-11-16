@@ -110,15 +110,29 @@ println!("{} sections, type {}", header.section_count, header.type_id_str());
 ```
 
 The CLI does the same from a shell (install it with
-`cargo install --git https://github.com/bgpkit/bgpkit-snap --features cli`). It builds and searches `snap.u32:v1`
-objects only, from a JSONL file of `{"prefix": "10.0.0.0/8", "value": 7}` lines:
+`cargo install --git https://github.com/bgpkit/bgpkit-snap --features cli`). It builds
+and searches `snap.u32:v1` and `snap.u64:v1` objects, from a JSONL file of
+`{"prefix": "10.0.0.0/8", "value": 7}` lines:
 
 ```sh
 snap build prefixes.jsonl --out example.snap --created-at 1794614400
+snap build counters.jsonl --out counters.snap --value u64
 snap info example.snap      # reads 192 bytes only
-snap verify example.snap    # container, and bodies when the type is this binary's
+snap verify example.snap    # container, and bodies for the two types above
 snap search example.snap 10.1.2.3
 ```
+
+Every command takes `--json` and prints one object instead of text, so a script or an
+agent can read the answer without parsing prose:
+
+```sh
+snap --json search example.snap 10.1.2.3
+{"match":{"prefix":"10.1.2.0/24","value":1},"query":"10.1.2.3","type_id":"snap.u32:v1"}
+```
+
+An object whose value type is a caller's own `SnapValue` opens, verifies its container
+and reports its type here; `search` says so and names both ways out, because decoding
+that value needs the program that defines it.
 
 ## The format
 

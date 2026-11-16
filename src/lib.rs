@@ -198,6 +198,28 @@ pub enum Count {
     Exact(u128),
 }
 
+impl Count {
+    /// The number of addresses covered, when it is a number. `All` is the whole
+    /// space, which no `u128` holds for IPv6; `NoEntries` is zero.
+    pub fn exact(self) -> Option<u128> {
+        match self {
+            Count::NoEntries => Some(0),
+            Count::Exact(n) => Some(n),
+            Count::All => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Count {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Count::NoEntries => f.write_str("0"),
+            Count::Exact(n) => write!(f, "{n}"),
+            Count::All => f.write_str("all"),
+        }
+    }
+}
+
 /// The answer to `Snapshot::address_counts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddressCounts {
@@ -1270,6 +1292,9 @@ impl<T: SnapValue> Snapshot<T> {
     }
 
     /// Longest prefix that covers `prefix`, and its value.
+    ///
+    /// `prefix` is a prefix, not an address: for one address use `search`, which
+    /// builds the `/32` or `/128` for you.
     pub fn lpm(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
         match prefix {
             IpNet::V4(p) => {

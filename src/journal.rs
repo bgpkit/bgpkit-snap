@@ -1287,6 +1287,15 @@ where
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// The sequence number the next record will carry.
+    ///
+    /// A caller that ships records somewhere else uses this to say how far the
+    /// journal has got; it survives a reopen, so the number is the journal's, not the
+    /// process's.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
 }
 
 struct Record {
