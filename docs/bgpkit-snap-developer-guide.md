@@ -104,7 +104,7 @@ let bytes = w.finish(&Opts {
 // ...or let the crate write it atomically
 let mut w: Writer<PeerCount> = Writer::new();
 w.insert("10.0.0.0/8".parse()?, PeerCount(3))?;
-# let peers_path = std::env::temp_dir().join(format!("guide-peers-{}.snap", std::process::id()));
+# let peers_path = std::env::temp_dir().join(format!("guide-peers-{}-{}.snap", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
 w.finish_to(&peers_path, &Opts::now())?;
 # Ok(())
 # }
@@ -126,7 +126,7 @@ use bgpkit_snap::Snapshot;
 # struct PeerCount(u32);
 # impl SnapValue for PeerCount { const TYPE_ID: &str = "example.peer-count:v1"; }
 
-# let peers_path = std::env::temp_dir().join(format!("guide-peers-open-{}.snap", std::process::id()));
+# let peers_path = std::env::temp_dir().join(format!("guide-peers-open-{}-{}.snap", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
 # let _ = &peers_path;
 let snap: Snapshot<PeerCount> = Snapshot::open(&peers_path)?;   // any AsRef<Path>
 assert_eq!(snap.len(), 1);
@@ -254,7 +254,7 @@ let bytes = w.finish(&Opts {
     extras: &[ExtraSection { id: 16, kind: KIND_PAYLOAD, required: true, bytes: &arena }],
     ..Opts::now()
 })?;
-# let peers_path = std::env::temp_dir().join(format!("guide-sections-{}.snap", std::process::id()));
+# let peers_path = std::env::temp_dir().join(format!("guide-sections-{}-{}.snap", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
 std::fs::write(&peers_path, &bytes)?;
 # Ok(())
 # }
@@ -305,7 +305,7 @@ impl Validator for MySections {
     }
 }
 
-# let peers_path = std::env::temp_dir().join(format!("guide-validator-{}.snap", std::process::id()));
+# let peers_path = std::env::temp_dir().join(format!("guide-validator-{}-{}.snap", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
 # let snap: bgpkit_snap::Snapshot<PeerCount> = bgpkit_snap::Snapshot::from_bytes_with(
 #     &{
 #         let mut w = bgpkit_snap::Writer::<PeerCount>::new();
@@ -347,7 +347,7 @@ use bgpkit_snap::{Opts, TreeId};
 
 // the id names this tree: the same name reopens the same journal, and a typo
 // gives a different journal instead of adopting this one
-# let feed_dir = std::env::temp_dir().join(format!("guide-feed-{}", std::process::id()));
+# let feed_dir = std::env::temp_dir().join(format!("guide-feed-{}-{}", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
 # std::fs::remove_dir_all(&feed_dir).ok();
 let mut journal: Journal<PeerCount> =
     Journal::open(&feed_dir, TreeId::from_name("peer-counts"))?;
@@ -412,7 +412,7 @@ touching the disk:
 # #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 # struct PeerCount(u32);
 # impl SnapValue for PeerCount { const TYPE_ID: &str = "example.peer-count:v1"; }
-# let d = std::env::temp_dir().join(format!("guide-to-snapshot-{}", std::process::id()));
+# let d = std::env::temp_dir().join(format!("guide-to-snapshot-{}-{}", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
 # std::fs::remove_dir_all(&d).ok();
 # let mut journal: Journal<PeerCount> = Journal::open(&d, TreeId::from_name("guide-to-snapshot"))?;
 let snap = journal.to_snapshot(&Opts::now())?;   // every Snapshot query, no file
@@ -442,7 +442,7 @@ use bgpkit_snap::{SnapValue, TreeId};
 struct PathRef { off: u64, len: u64 }     // u64: an arena may pass 4 GiB
 impl SnapValue for PathRef { const TYPE_ID: &str = "example.path-ref:v1"; }
 
-# let journal_path = std::env::temp_dir().join(format!("guide-aspaths-{}.journal", std::process::id()));
+# let journal_path = std::env::temp_dir().join(format!("guide-aspaths-{}-{}.journal", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
 # std::fs::remove_dir_all(&journal_path).ok();
 let mut journal: Journal<PathRef> = Journal::open_with_payload(
     &journal_path,
