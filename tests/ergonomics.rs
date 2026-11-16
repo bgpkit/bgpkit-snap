@@ -508,6 +508,61 @@ fn a_failed_write_leaves_the_object_that_was_there() {
 }
 
 #[test]
+fn an_exhausted_sequence_space_is_refused_instead_of_wrapped() {
+    use bgpkit_snap::header::StreamRef;
+
+    // a checkpoint whose stream says base_seq = u64::MAX - 1 opens with seq =
+    // u64::MAX. The next insert used to panic in a debug build and reuse a sequence
+    // number in a release one; it has to refuse before the bytes exist.
+    let d = dir("seq-exhausted");
+    let log = d.join("journal");
+    std::fs::create_dir_all(&log).unwrap();
+    let tree = TreeId::from_name("seq-exhausted");
+
+    let mut w: Writer<V> = Writer::new();
+    w.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
+    let bytes = w
+        .finish(&Opts {
+            created_at: 1_794_614_400,
+            window: None,
+            stream: Some(StreamRef {
+                tree_id: *tree.as_bytes(),
+                generation: [6u8; 16],
+                base_seq: u64::MAX - 1,
+            }),
+            extras: &[],
+        })
+        .unwrap();
+    let name = "snapshot-18446744073709551614-1.snap";
+    std::fs::write(log.join(name), &bytes).unwrap();
+    std::fs::write(
+        log.join("state.json"),
+        format!(
+            "{{\"next_seq\": 18446744073709551615, \"generation\": \"{}\", \"tree_id\": \"{}\", \
+             \"checkpoint\": {{\"seq\": 18446744073709551614, \"file\": \"{name}\"}}, \
+             \"type_id\": \"{}\"}}",
+            "06".repeat(16),
+            tree,
+            <V as SnapValue>::TYPE_ID
+        ),
+    )
+    .unwrap();
+
+    let opened = std::panic::catch_unwind(|| Journal::<V>::open(&log, tree).map(|j| j.len()));
+    let mut j = match opened.expect("opening must not panic") {
+        Ok(_) => Journal::<V>::open(&log, tree).expect("the directory opens"),
+        Err(e) => panic!("the directory must open with seq = u64::MAX: {e}"),
+    };
+    let err = match j.insert("192.0.2.0/24".parse().unwrap(), V(2)) {
+        Ok(seq) => panic!("an exhausted sequence space handed out {seq}"),
+        Err(e) => e,
+    };
+    assert!(format!("{err}").contains("sequence"), "got {err}");
+    drop(j);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
 fn repair_replaces_a_state_file_it_cannot_read() {
     // a readable but corrupt state.json was treated as a healthy one, so open said
     // "not json" and repair said "open it instead": neither path could recover

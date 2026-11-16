@@ -578,9 +578,15 @@ where
                         });
                     }
                 }
-                expected = Some(record.seq + 1);
+                expected = Some(
+                    record
+                        .seq
+                        .checked_add(1)
+                        .ok_or(Error::BadRecord("record sequence is not representable"))?,
+                );
                 self.apply(&record)?;
-                self.seq = record.seq + 1;
+                self.seq =
+                    expected.ok_or(Error::BadRecord("record sequence is not representable"))?;
             }
         }
         if self.payload.is_none() && !self.blob.is_empty() {
@@ -749,6 +755,12 @@ where
         times: Times,
     ) -> Result<u64, Error> {
         let seq = self.seq;
+        // the record about to be written has to be acknowledgeable: refuse before the
+        // bytes exist rather than after, where a failed increment would leave a record
+        // nobody was told about
+        let next_seq = seq
+            .checked_add(1)
+            .ok_or(Error::BadRecord("sequence space is exhausted"))?;
         let (family, plen, addr) = prefix_fields(prefix);
         let mut payload = Vec::with_capacity(RECORD_FIXED_LEN + value.len() + blob.len());
         payload.extend_from_slice(&seq.to_le_bytes());
@@ -799,7 +811,7 @@ where
             return Err(Error::Io(e));
         }
         seg.bytes += 8 + payload.len() as u64;
-        self.seq += 1;
+        self.seq = next_seq;
         Ok(seq)
     }
 
