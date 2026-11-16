@@ -4,6 +4,11 @@
 //! what a trie holds beyond the value type's `TYPE_ID`, and nothing about what a
 //! client section means. See `docs/format.md`.
 
+#![deny(missing_docs)]
+// The only unsafe in this crate is the two archived-trie accessors, which read bytes
+// `open` already byte-checked; everything else must stay safe.
+#![deny(unsafe_code)]
+
 use std::fmt;
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
@@ -38,6 +43,12 @@ pub use header::{
 pub type HighSer<'a> =
     rkyv::api::high::HighSerializer<AlignedVec, rkyv::ser::allocator::ArenaHandle<'a>, RkyvError>;
 
+/// The developer guide ships inside the crate so its examples are doctests: a
+/// signature change breaks `cargo test --doc` instead of leaving the page wrong.
+/// The module is private, so the guide is not rendered in the API docs.
+#[doc = include_str!("../docs/bgpkit-snap-developer-guide.md")]
+mod guide {}
+
 // ---------------------------------------------------------------- errors
 
 /// Every way this crate refuses.
@@ -47,23 +58,39 @@ pub type HighSer<'a> =
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// An operating-system call failed; `source()` gives the original.
     Io(std::io::Error),
+    /// The first eight bytes are not this container's magic.
     BadMagic,
+    /// The layout version in the header is not one this build reads.
     BadVersion(u16),
+    /// A header field is out of range or contradicts another.
     BadHeader(&'static str),
+    /// The header's checksum does not match its contents.
     BadHeaderCrc,
+    /// The file ends before the structure it declares.
     Truncated {
+        /// Bytes the structure needs.
         need: usize,
+        /// Bytes present.
         have: usize,
     },
+    /// The section table is not a table this format allows.
     BadSectionTable(&'static str),
+    /// Section ids are not strictly ascending, or a section is missing.
     SectionOrder,
+    /// The object carries a required section this reader does not implement.
     UnknownRequiredSection(u16),
+    /// A section's four-byte kind tag does not belong to its id.
     BadSectionKind(u16),
+    /// The object holds another value type than the one this reader asked for.
     TypeMismatch {
+        /// `TYPE_ID` recorded in the header.
         expected: String,
+        /// `TYPE_ID` of the reader.
         found: String,
     },
+    /// The content id in the header does not match the bytes.
     ContentId,
     /// Another writer holds this journal's lock. Retry later; this is not damage.
     Locked,
@@ -78,11 +105,15 @@ pub enum Error {
     /// The directory or object was written under a different configuration than the
     /// one this call was made with, and adopting it would reinterpret the bytes.
     ConfigMismatch(String),
+    /// A value could not be encoded, or an archived value could not be decoded.
     BadValue,
-    // journal
+    /// A journal record or its state is not a record this build can act on.
     BadRecord(&'static str),
+    /// Records were lost: the next sequence number on disk is not the expected one.
     SequenceGap {
+        /// The sequence number the journal expected next.
         expected: u64,
+        /// The sequence number the segment holds.
         found: u64,
     },
 }
@@ -166,7 +197,9 @@ pub enum Count {
 /// The answer to `Snapshot::address_counts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddressCounts {
+    /// Coverage of the IPv4 tree.
     pub v4: Count,
+    /// Coverage of the IPv6 tree.
     pub v6: Count,
 }
 
@@ -197,7 +230,9 @@ impl SnapValue for u64 {
 
 /// Decode a value from archived bytes, used by the journal.
 pub trait Codec: SnapValue + Sized {
+    /// Encode a value the way this container stores it.
     fn encode(value: &Self) -> Result<Vec<u8>, Error>;
+    /// Decode a value that was stored this way.
     fn decode(bytes: &[u8]) -> Result<Self, Error>;
 }
 
@@ -233,6 +268,7 @@ where
 pub struct TreeId([u8; 16]);
 
 impl TreeId {
+    /// The id as the sixteen bytes a header carries.
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
@@ -248,6 +284,7 @@ impl TreeId {
         Self(out)
     }
 
+    /// The same sixteen bytes, for a caller comparing it with a header.
     pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
@@ -273,9 +310,13 @@ impl std::fmt::Display for TreeId {
 /// `required` makes a reader that does not implement the id refuse the object.
 #[derive(Clone, Copy)]
 pub struct ExtraSection<'a> {
+    /// Section id; 16 or higher for a profile section.
     pub id: u16,
+    /// Four-byte kind tag a validator can branch on.
     pub kind: [u8; 4],
+    /// A reader that does not implement this id must refuse the object.
     pub required: bool,
+    /// The section body, exactly as it will be written.
     pub bytes: &'a [u8],
 }
 
@@ -288,7 +329,9 @@ pub struct Opts<'a> {
     /// it, because the journal's own `tree_id`, `generation` and `base_seq` are the
     /// ones the checkpoint is written under.
     pub stream: Option<StreamRef>,
+    /// Coverage claim, `(first_ts, last_ts)` in unix seconds.
     pub window: Option<(i64, i64)>,
+    /// Sections your profile owns; the tries and the id are the writer's.
     pub extras: &'a [ExtraSection<'a>],
 }
 
@@ -307,6 +350,10 @@ impl Opts<'_> {
     }
 }
 
+/// Builds one object in memory, then writes it in one piece.
+///
+/// A writer is not a store: it holds the whole tree, so a build larger than RAM is
+/// out of scope by design.
 pub struct Writer<T: SnapValue> {
     v4: PrefixMap<Ipv4Net, T>,
     v6: PrefixMap<Ipv6Net, T>,
@@ -319,6 +366,7 @@ impl<T: SnapValue> Default for Writer<T> {
 }
 
 impl<T: SnapValue> Writer<T> {
+    /// An empty writer.
     pub fn new() -> Self {
         Self {
             v4: PrefixMap::new(),
@@ -364,10 +412,12 @@ impl<T: SnapValue> Writer<T> {
         Ok(())
     }
 
+    /// How many prefixes the writer holds.
     pub fn len(&self) -> usize {
         self.v4.len() + self.v6.len()
     }
 
+    /// Whether the writer holds nothing.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -645,10 +695,12 @@ where
         rkyv::deserialize::<T, RkyvError>(value).map_err(|_| Error::BadValue)
     }
 
+    /// How many sections the table has.
     pub fn len(&self) -> usize {
         self.snap.len()
     }
 
+    /// Whether the table is empty.
     pub fn is_empty(&self) -> bool {
         self.snap.is_empty()
     }
@@ -733,6 +785,7 @@ where
 /// One section as a validator sees it: the table row and where its bytes are.
 #[derive(Debug, Clone, Copy)]
 pub struct SectionRef {
+    /// The table row: id, kind, required flag and body length.
     pub entry: Entry,
     /// Byte offset of the section body in the whole object.
     pub offset: usize,
@@ -876,6 +929,11 @@ pub trait Validator {
 struct NoValidator;
 impl Validator for NoValidator {}
 
+/// An immutable object, validated once and then queried in memory.
+///
+/// The bytes are owned, not mapped: `open` reads the file, checks the container and
+/// both trie archives, and hands back something that answers lookups without further
+/// parsing.
 pub struct Snapshot<T: SnapValue> {
     bytes: AlignedVec,
     header: Header,
@@ -894,6 +952,7 @@ impl<T: SnapValue> fmt::Debug for Snapshot<T> {
 }
 
 impl<T: SnapValue> Snapshot<T> {
+    /// Read and validate an object from a path.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, Error>
     where
         T::Archived:
@@ -902,6 +961,7 @@ impl<T: SnapValue> Snapshot<T> {
         Self::from_bytes(&std::fs::read(path.as_ref())?)
     }
 
+    /// The same, for a profile whose sections this reader implements.
     pub fn open_with(
         path: impl AsRef<std::path::Path>,
         validator: &dyn Validator,
@@ -913,6 +973,7 @@ impl<T: SnapValue> Snapshot<T> {
         Self::from_bytes_with(&std::fs::read(path.as_ref())?, validator)
     }
 
+    /// Validate an object already in memory.
     pub fn from_bytes(raw: &[u8]) -> Result<Self, Error>
     where
         T::Archived:
@@ -921,6 +982,7 @@ impl<T: SnapValue> Snapshot<T> {
         Self::from_bytes_with(raw, &NoValidator)
     }
 
+    /// The same, for a profile whose sections this reader implements.
     pub fn from_bytes_with(raw: &[u8], validator: &dyn Validator) -> Result<Self, Error>
     where
         T::Archived:
@@ -1046,18 +1108,22 @@ impl<T: SnapValue> Snapshot<T> {
         &self.bytes[self.table_range.0..self.table_range.1]
     }
 
+    /// The section table, in file order.
     pub fn entries(&self) -> Vec<Entry> {
         self.sections.iter().map(|s| s.entry).collect()
     }
 
+    /// The parsed header, including the claims `open` verified.
     pub fn header(&self) -> &Header {
         &self.header
     }
 
+    /// The content id as hex: what names this object's content, not its provenance.
     pub fn content_id(&self) -> String {
         self.header.content_id_hex()
     }
 
+    /// The raw bytes of a section, exactly as written.
     pub fn section_bytes(&self, id: u16) -> Option<&[u8]> {
         self.sections
             .iter()
@@ -1104,21 +1170,34 @@ impl<T: SnapValue> Snapshot<T> {
     }
 
     /// The IPv4 trie, if the object has one.
+    ///
+    /// # Safety of the unchecked access
+    ///
+    /// The bytes were checked by `validate_archives` during `from_bytes`, and this
+    /// method is only reachable through a value that construction produced. Doing the
+    /// checked access here instead would re-validate the whole archive on every
+    /// lookup.
+    #[allow(unsafe_code)]
     pub fn v4(&self) -> Option<&ArchivedPrefixMap<Ipv4Net, T>> {
+        // SAFETY: see the doc comment; the archive was byte-checked at open.
         self.section_bytes(ID_V4)
             .map(|s| unsafe { rkyv::access_unchecked::<ArchivedPrefixMap<Ipv4Net, T>>(s) })
     }
 
-    /// The IPv6 trie, if the object has one.
+    /// The IPv6 trie, if the object has one. Same unchecked access as `v4`.
+    #[allow(unsafe_code)]
     pub fn v6(&self) -> Option<&ArchivedPrefixMap<Ipv6Net, T>> {
+        // SAFETY: see `v4`; the archive was byte-checked at open.
         self.section_bytes(ID_V6)
             .map(|s| unsafe { rkyv::access_unchecked::<ArchivedPrefixMap<Ipv6Net, T>>(s) })
     }
 
+    /// How many prefixes the object holds.
     pub fn len(&self) -> usize {
         self.v4().map(|m| m.len()).unwrap_or(0) + self.v6().map(|m| m.len()).unwrap_or(0)
     }
 
+    /// Whether the object holds nothing.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1171,6 +1250,7 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
+    /// Whether an entry is stored exactly at `prefix`.
     pub fn contains_key(&self, prefix: IpNet) -> bool {
         match prefix {
             IpNet::V4(p) => self.v4().is_some_and(|m| m.contains_key(&p)),
@@ -1178,6 +1258,7 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
+    /// The least specific stored entry covering `prefix`.
     pub fn spm(&self, prefix: IpNet) -> Option<(IpNet, &T::Archived)> {
         match prefix {
             IpNet::V4(p) => self
@@ -1191,6 +1272,7 @@ impl<T: SnapValue> Snapshot<T> {
         }
     }
 
+    /// Whether any stored entry covers `prefix`.
     pub fn is_covered(&self, prefix: IpNet) -> bool {
         match prefix {
             IpNet::V4(p) => self.v4().is_some_and(|m| m.is_covered(&p)),
@@ -1261,6 +1343,7 @@ impl<T: SnapValue> Snapshot<T> {
         Box::new(v4.chain(v6))
     }
 
+    /// How many addresses the entries cover, per family.
     pub fn address_counts(&self) -> AddressCounts {
         let count = |m: Option<Option<u128>>| match m {
             None => Count::NoEntries,

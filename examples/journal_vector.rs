@@ -20,12 +20,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::remove_dir_all(&dir).ok();
     let log = dir.join("journal");
     // a fixed generation, so the bytes below are the same on every run
-    let mut j: Journal<V> = Journal::open_with(
-        &log,
-        [0x11; 16],
-        Some(PayloadSection::payload(16)),
-        Some([0x22; 16]),
-    )?;
+    let mut j: Journal<V> = Journal::options(&log, [0x11; 16])
+        .payload(PayloadSection::payload(16))
+        .generation([0x22; 16])
+        .open()?;
     j.insert("10.0.0.0/8".parse()?, V(7))?;
     j.insert_with_blob("192.0.2.0/24".parse()?, b"payload", |off| V(off as u32))?;
     j.sync()?;

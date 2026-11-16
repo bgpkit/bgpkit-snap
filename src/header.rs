@@ -15,50 +15,81 @@
 
 use crate::Error;
 
+/// The first eight bytes of every object.
 pub const MAGIC: &[u8; 8] = b"BGPKSNAP";
+/// Size of the fixed header.
 pub const HEADER_LEN: usize = 192;
+/// Bytes `0..HASH_END` are what the content id hashes; the provenance fields follow.
 pub const HASH_END: usize = 148;
+/// Layout version this build writes and reads.
 pub const VERSION: u16 = 4;
 
 /// One section table entry: 64 bytes.
 pub const ENTRY_LEN: usize = 64;
 
+/// The object records which journal stream it came from.
 pub const FLAG_STREAM: u16 = 1 << 0;
+/// The object claims a coverage window; without this flag the fields mean nothing.
 pub const FLAG_WINDOW: u16 = 1 << 1;
 const FLAG_KNOWN: u16 = FLAG_STREAM | FLAG_WINDOW;
 
+/// Kind tag of the IPv4 trie section.
 pub const KIND_V4: [u8; 4] = *b"V4\0\0";
+/// Kind tag of the IPv6 trie section.
 pub const KIND_V6: [u8; 4] = *b"V6\0\0";
+/// Kind tag of a blob arena a profile carries.
 pub const KIND_PAYLOAD: [u8; 4] = *b"PAY\0";
 
+/// Section id of the IPv4 trie.
 pub const ID_V4: u16 = 2;
+/// Section id of the IPv6 trie.
 pub const ID_V6: u16 = 3;
 /// Profile sections use ids 16 and above.
 pub const FIRST_PROFILE_ID: u16 = 16;
 
+/// Which journal stream an object came from, and where in it the object starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StreamRef {
+    /// The tree this object is an instance of.
     pub tree_id: [u8; 16],
+    /// The journal incarnation that wrote it.
     pub generation: [u8; 16],
+    /// The sequence number of the last record the object covers.
     pub base_seq: u64,
 }
 
+/// What the first 192 bytes of an object say about the rest of it.
+///
+/// Every field here is a claim by the writer; `verify_bytes` and `Snapshot::open`
+/// check the ones that can be checked against the bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
+    /// See `FLAG_STREAM` and `FLAG_WINDOW`.
     pub flags: u16,
+    /// The tree this object is an instance of; zero unless it came from a journal.
     pub tree_id: [u8; 16],
+    /// The journal incarnation that wrote it; zero outside a journal.
     pub generation: [u8; 16],
+    /// The last record the object covers; zero outside a journal.
     pub base_seq: u64,
+    /// The value type, as NUL-padded `TYPE_ID`.
     pub type_id: [u8; 32],
+    /// Total file size; the reader refuses a file that disagrees.
     pub file_len: u64,
+    /// Number of rows in the section table.
     pub section_count: u32,
+    /// Length of the section table in bytes.
     pub section_table_len: u32,
+    /// Coverage claim, `(first, last)`, only meaningful with `FLAG_WINDOW`.
     pub window: [i64; 2],
+    /// Unix seconds when the object was written; outside the content id.
     pub created_at: i64,
+    /// BLAKE3 over the hashed range and the section bodies; identity, not provenance.
     pub content_id: [u8; 32],
 }
 
 impl Header {
+    /// The value type as text, up to its first NUL.
     pub fn type_id_str(&self) -> String {
         let end = self
             .type_id
@@ -68,10 +99,12 @@ impl Header {
         String::from_utf8_lossy(&self.type_id[..end]).into_owned()
     }
 
+    /// The content id as lower-case hex, which is how it is written in logs.
     pub fn content_id_hex(&self) -> String {
         hex32(&self.content_id)
     }
 
+    /// The stream coordinates, when the object came from a journal.
     pub fn stream(&self) -> Option<StreamRef> {
         (self.flags & FLAG_STREAM != 0).then_some(StreamRef {
             tree_id: self.tree_id,
@@ -80,10 +113,12 @@ impl Header {
         })
     }
 
+    /// The coverage claim, when the writer made one.
     pub fn window(&self) -> Option<(i64, i64)> {
         (self.flags & FLAG_WINDOW != 0).then_some((self.window[0], self.window[1]))
     }
 
+    /// The header as the 192 bytes it is stored as.
     pub fn encode(&self) -> [u8; HEADER_LEN] {
         let mut b = [0u8; HEADER_LEN];
         b[0..8].copy_from_slice(MAGIC);
@@ -106,6 +141,7 @@ impl Header {
     }
 
     /// Parse and check everything that can be judged from the header alone.
+    /// Read one table row, refusing an undefined flag or non-zero reserved bytes.
     pub fn parse(raw: &[u8]) -> Result<Self, Error> {
         if raw.len() < HEADER_LEN {
             return Err(Error::Truncated {
@@ -211,6 +247,8 @@ impl Header {
         Ok(header)
     }
 
+    /// Cross-check the fields against the real length of the object: the claims a
+    /// peek cannot verify and the reader must.
     pub fn check_layout(&self, actual_len: usize) -> Result<(), Error> {
         if self.file_len as usize != actual_len {
             return Err(Error::Truncated {
@@ -237,13 +275,18 @@ impl Header {
 /// One section table entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
+    /// Section id, strictly ascending across the table.
     pub id: u16,
+    /// Four-byte kind tag; the id and the tag must agree.
     pub kind: [u8; 4],
+    /// A reader that does not implement this section must refuse the object.
     pub required: bool,
+    /// Length of the section body, excluding the padding before it.
     pub len: u64,
 }
 
 impl Entry {
+    /// The table row as 64 bytes.
     pub fn encode(&self) -> [u8; ENTRY_LEN] {
         let mut b = [0u8; ENTRY_LEN];
         b[0..2].copy_from_slice(&self.id.to_le_bytes());
@@ -253,6 +296,7 @@ impl Entry {
         b
     }
 
+    /// Read one table row, refusing an undefined flag or non-zero reserved bytes.
     pub fn parse(raw: &[u8]) -> Result<Self, Error> {
         if raw.len() < ENTRY_LEN {
             return Err(Error::Truncated {
@@ -280,6 +324,7 @@ impl Entry {
     }
 }
 
+/// Lower-case hex of a 32-byte id.
 pub fn hex32(bytes: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for b in bytes {

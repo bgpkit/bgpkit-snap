@@ -203,11 +203,13 @@ fn a_value_whose_deserialize_refuses_is_an_error_not_a_miss() {
 #[test]
 fn a_zero_generation_is_refused_rather_than_breaking_every_checkpoint() {
     let d = dir("zero-generation");
-    let err =
-        match Journal::<V>::open_with(&d, TreeId::from_name("zero-gen"), None, Some([0u8; 16])) {
-            Ok(_) => panic!("a zero generation cannot be committed"),
-            Err(e) => e,
-        };
+    let err = match Journal::<V>::options(&d, TreeId::from_name("zero-gen"))
+        .generation([0u8; 16])
+        .open()
+    {
+        Ok(_) => panic!("a zero generation cannot be committed"),
+        Err(e) => e,
+    };
     assert!(format!("{err}").contains("generation"), "got {err}");
     std::fs::remove_dir_all(&d).ok();
 }

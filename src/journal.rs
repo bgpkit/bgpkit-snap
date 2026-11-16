@@ -24,7 +24,9 @@ const SEGMENT_HEADER_LEN: usize = 48;
 const SEGMENT_VERSION: u16 = 4;
 const RECORD_FIXED_LEN: usize = 56;
 
+/// Record kind: a value was inserted or replaced.
 pub const KIND_INSERT: u8 = 1;
+/// Record kind: a value was removed.
 pub const KIND_WITHDRAW: u8 = 2;
 
 /// When a record happened. Both fields are unix seconds; leave them zero when the
@@ -41,7 +43,9 @@ pub struct Times {
 /// its blob landed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobInserted {
+    /// The sequence number this record was written with.
     pub seq: u64,
+    /// Byte offset the blob landed at in the journal's arena.
     pub offset: u64,
 }
 
@@ -49,8 +53,11 @@ pub struct BlobInserted {
 /// Where a journal's blob arena lands in the snapshots it checkpoints: the
 /// section id (16 or higher), its kind tag, and whether a reader must know it.
 pub struct PayloadSection {
+    /// Section id the arena is written as; 16 or higher.
     pub id: u16,
+    /// Four-byte kind tag of that section.
     pub kind: [u8; 4],
+    /// Whether a reader that does not implement the section must refuse the object.
     pub required: bool,
 }
 
@@ -65,11 +72,52 @@ impl PayloadSection {
     }
 }
 
+/// A journal constructor with the uncommon knobs as methods.
+///
+/// `Journal::open` and `Journal::open_with_payload` cover the two cases a service
+/// meets; this covers a caller that mints its own generation, which is normally a
+/// fixture rather than a deployment.
+pub struct JournalOptions<T: Codec> {
+    dir: std::path::PathBuf,
+    tree_id: crate::TreeId,
+    payload: Option<PayloadSection>,
+    generation: Option<[u8; 16]>,
+    _t: std::marker::PhantomData<T>,
+}
+
+impl<T: Codec> JournalOptions<T>
+where
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
+        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
+{
+    /// Values point into a blob arena, carried by this section.
+    pub fn payload(mut self, section: PayloadSection) -> Self {
+        self.payload = Some(section);
+        self
+    }
+
+    /// Reuse a known incarnation id instead of minting one.
+    pub fn generation(mut self, generation: [u8; 16]) -> Self {
+        self.generation = Some(generation);
+        self
+    }
+
+    /// Open with these options.
+    pub fn open(self) -> Result<Journal<T>, Error> {
+        Journal::<T>::open_inner(self.dir, self.tree_id, self.payload, self.generation)
+    }
+}
+
 struct Segment {
     file: BufWriter<File>,
     bytes: u64,
 }
 
+/// An append-only log plus the tree it describes, and the only writer of both.
+///
+/// One journal owns one directory: the tree, the arena, the segment writer and the
+/// writer lock all live here, so a caller cannot append without the tree following
+/// and cannot open a second writer by accident.
 pub struct Journal<T: Codec> {
     /// Advisory lock, held until the journal is dropped: one writer per tree.
     _lock: File,
@@ -105,7 +153,7 @@ where
     /// segments. The generation is reused when a journal already exists.
     /// A journal over a tree with no payload section, which is the common case.
     pub fn open(dir: impl AsRef<Path>, tree_id: impl Into<crate::TreeId>) -> Result<Self, Error> {
-        Self::open_with(dir, tree_id, None, None)
+        Self::open_inner(dir, tree_id, None, None)
     }
 
     /// A journal whose values point into a blob arena. The section has to be the one
@@ -115,13 +163,26 @@ where
         tree_id: impl Into<crate::TreeId>,
         payload: PayloadSection,
     ) -> Result<Self, Error> {
-        Self::open_with(dir, tree_id, Some(payload), None)
+        Self::open_inner(dir, tree_id, Some(payload), None)
     }
 
     /// `generation` names the stream incarnation. A caller passes `Some` only to
     /// reproduce a fixture or to restore a known journal; otherwise it is minted
     /// on first use and reused from then on.
-    pub fn open_with(
+    /// The two knobs a constructor should not take positionally: an optional payload
+    /// section and a caller-minted generation. Both are for the uncommon case, so
+    /// they sit behind methods instead of arguments.
+    pub fn options(dir: impl AsRef<Path>, tree_id: impl Into<crate::TreeId>) -> JournalOptions<T> {
+        JournalOptions {
+            dir: dir.as_ref().to_path_buf(),
+            tree_id: tree_id.into(),
+            payload: None,
+            generation: None,
+            _t: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn open_inner(
         dir: impl AsRef<Path>,
         tree_id: impl Into<crate::TreeId>,
         payload: Option<PayloadSection>,
@@ -560,6 +621,8 @@ where
         Ok(())
     }
 
+    /// Append a value, replacing whatever the prefix held, and return its sequence
+    /// number. Durable only once `sync` returns.
     pub fn insert(&mut self, prefix: IpNet, value: T) -> Result<u64, Error> {
         self.insert_at(prefix, value, Times::default())
     }
@@ -809,7 +872,7 @@ where
             },
         )?;
         drop(lock);
-        Self::open_with(dir, tree_id, payload, None)
+        Self::open_inner(dir, tree_id, payload, None)
     }
 
     /// A record is durable once this returns.
@@ -1096,10 +1159,12 @@ where
         }
     }
 
+    /// How many prefixes the journal holds right now.
     pub fn len(&self) -> usize {
         self.v4.len() + self.v6.len()
     }
 
+    /// Whether the journal holds nothing.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
