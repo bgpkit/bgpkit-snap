@@ -572,7 +572,11 @@ impl<T: SnapValue> Writer<T> {
             let _ = std::fs::remove_file(&tmp);
             return Err(Error::Io(e));
         }
-        std::fs::rename(&tmp, path)?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            // a complete object left beside the target would sit there forever
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Io(e));
+        }
         if let Some(dir) = path.parent() {
             let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
         }

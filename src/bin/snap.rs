@@ -3,6 +3,7 @@
 //! `info` reads the 192-byte header and nothing else, which is the point of the
 //! fixed header: identification is one small read.
 
+use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use bgpkit_snap::{header::HEADER_LEN, Header, SnapValue, Snapshot, Writer};
@@ -94,10 +95,14 @@ fn build(
         None => None,
     };
     let entries = w.len();
+    // `fs::write`, the previous writer, followed a symlink at the output path; renaming
+    // into place would replace the link instead, so resolve one level and update the
+    // object the link names
+    let target = resolve_symlink(Path::new(out));
     // `finish_to` writes beside the target and renames, so a build that fails on a
     // full disk leaves the object already at `out` untouched instead of truncating it
     let len = w.finish_to(
-        out,
+        &target,
         &bgpkit_snap::Opts {
             created_at: created_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
             stream: None,
@@ -106,6 +111,22 @@ fn build(
         },
     )?;
     Ok((entries, len as usize))
+}
+
+/// One level of symlink at `path`, so an atomic replace updates the target a caller
+/// linked to instead of replacing the link itself.
+fn resolve_symlink(path: &Path) -> PathBuf {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return path.to_path_buf();
+    };
+    if !meta.file_type().is_symlink() {
+        return path.to_path_buf();
+    }
+    match std::fs::read_link(path) {
+        Ok(target) if target.is_absolute() => target,
+        Ok(target) => path.parent().unwrap_or(Path::new(".")).join(target),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// An epoch second as UTC, which is what a person comparing two objects wants;

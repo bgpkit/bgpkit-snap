@@ -55,5 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         off += 4 + len;
     }
     println!("state {}", std::fs::read_to_string(log.join("state.json"))?);
+    // this run's directory, so repeated runs do not leave a journal tree each
+    std::fs::remove_dir_all(&dir).ok();
     Ok(())
 }

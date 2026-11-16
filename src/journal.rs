@@ -189,6 +189,34 @@ where
         payload: Option<PayloadSection>,
         generation: Option<[u8; 16]>,
     ) -> Result<Self, Error> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+        let lock = Self::take_writer_lock(&dir)?;
+        Self::open_locked(dir, tree_id, payload, generation, lock)
+    }
+
+    /// The writer lock for this directory, or `Locked` when another journal has it.
+    fn take_writer_lock(dir: &Path) -> Result<File, Error> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("writer.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Error::Locked)?;
+        Ok(lock)
+    }
+
+    /// Open with a writer lock the caller already holds. `repair` uses this so the
+    /// lock covers its state write and the check that the state can be adopted:
+    /// releasing it in between lets another writer commit a state file that this
+    /// call would then delete.
+    fn open_locked(
+        dir: impl AsRef<Path>,
+        tree_id: impl Into<crate::TreeId>,
+        payload: Option<PayloadSection>,
+        generation: Option<[u8; 16]>,
+        lock: File,
+    ) -> Result<Self, Error> {
         let tree_id = *tree_id.into().as_bytes();
         let dir = dir.as_ref().to_path_buf();
         // reject here what a checkpoint would reject later, after data was written
@@ -209,13 +237,6 @@ where
             }
         }
         std::fs::create_dir_all(&dir)?;
-
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join("writer.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Error::Locked)?;
 
         let state = read_state(&dir)?;
         // the directory records what wrote it; a reopen with another value type or
@@ -302,6 +323,14 @@ where
         // the snapshot name carries a per-sequence ordinal; seeding it from disk keeps
         // the first checkpoint after a restart from reusing a committed name
         journal.checkpoints = highest_checkpoint_ordinal(&journal.dir, journal.seq);
+        // the stable name is published before anything is reclaimed: a publication
+        // that fails must not leave it pointing at an object this open deleted
+        match keep.as_ref() {
+            Some(name) => journal.publish_current(name)?,
+            None => {
+                let _ = std::fs::remove_file(journal.dir.join("current.snap"));
+            }
+        }
         // a snapshot written just before a crash is not named by the state file,
         // so it is an orphan: recovery already came from the segments
         for path in snapshot_paths(&journal.dir)? {
@@ -312,13 +341,6 @@ where
                 .to_string();
             if Some(&name) != keep.as_ref() {
                 let _ = std::fs::remove_file(&path);
-            }
-        }
-        // the stable name must never point at an object this open just removed
-        match keep.as_ref() {
-            Some(name) => journal.publish_current(name)?,
-            None => {
-                let _ = std::fs::remove_file(journal.dir.join("current.snap"));
             }
         }
         Ok(journal)
@@ -936,14 +958,22 @@ where
                 payload: wanted,
             },
         )?;
-        drop(lock);
-        // prove the state describes a journal that opens before leaving it behind: a
-        // repair that cannot be adopted has to leave the directory as repairable as it
-        // was found, or the next attempt is refused for having a state file
-        match Self::open_inner(&dir, tree_id, payload, None) {
-            Ok(journal) => Ok(journal),
+        // prove the state describes a journal that opens before leaving it behind, and
+        // do it under the lock this call already holds: releasing the lock first lets
+        // another writer commit a state file that the cleanup below would then delete
+        let adopted = lock
+            .try_clone()
+            .map_err(Error::Io)
+            .and_then(|held| Self::open_locked(&dir, tree_id, payload, None, held));
+        match adopted {
+            Ok(journal) => {
+                drop(lock);
+                Ok(journal)
+            }
             Err(e) => {
+                // we still hold the lock, so this state file is the one this call wrote
                 let _ = std::fs::remove_file(dir.join("state.json"));
+                drop(lock);
                 Err(e)
             }
         }
@@ -1144,7 +1174,12 @@ where
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        std::fs::rename(&tmp, &path)?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            // the write succeeded, so the temp file is a complete object: it still must
+            // not survive a rename that could not put it in place
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Io(e));
+        }
         File::open(&self.dir)?.sync_all()?;
 
         // commit the checkpoint first: from here on, recovery starts from this

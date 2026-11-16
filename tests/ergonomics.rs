@@ -455,10 +455,17 @@ fn repair_without_a_payload_section_leaves_a_payload_checkpoint_alone() {
         Ok(_) => panic!("a checkpoint with a payload cannot be repaired without it"),
         Err(e) => e,
     };
-    assert!(format!("{err}").contains("section"), "got {err}");
+    // the section comparison has to be what refuses this, not the later open: the
+    // test used to pass with the comparison removed, because recovery refused the same
+    // mismatch and the rollback cleaned up after it
+    assert!(
+        matches!(err, bgpkit_snap::Error::ConfigMismatch(_)),
+        "the section comparison must decide this, got {err}"
+    );
+    assert!(format!("{err}").contains("section 16"), "got {err}");
     assert!(
         !d.join("state.json").exists(),
-        "a repair that fails must not leave a state file behind"
+        "a repair that fails before the write must not leave a state file behind"
     );
 
     // and the directory is still repairable with the checkpoint's own section

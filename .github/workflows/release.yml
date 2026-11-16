@@ -39,14 +39,31 @@ jobs:
         run: |
           name=$(sed -n 's/^name = "\(.*\)"/\1/p' Cargo.toml | head -1)
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: bgpkit-release' \
-            "https://crates.io/api/v1/crates/${name}/${version}")
-          if [ "$code" = "200" ]; then
-            echo "already=yes" >> "$GITHUB_OUTPUT"
-            echo "${name} ${version} is already on the registry, skipping the publish"
-          else
-            echo "already=no" >> "$GITHUB_OUTPUT"
-          fi
+          url="https://crates.io/api/v1/crates/${name}/${version}"
+          code=$(curl -s -o /tmp/crate.json -w '%{http_code}' -H 'User-Agent: bgpkit-release' "$url")
+          case "$code" in
+            404)
+              echo "already=no" >> "$GITHUB_OUTPUT"
+              echo "${name} ${version} is not on the registry yet"
+              ;;
+            200)
+              # a retry must not attach a release to code the registry never received:
+              # compare the published crate with the one this tag builds
+              cargo package --no-verify --quiet
+              local_sum=$(sha256sum "target/package/${name}-${version}.crate" | cut -d' ' -f1)
+              published_sum=$(python3 -c 'import json;print(json.load(open("/tmp/crate.json"))["version"]["checksum"])')
+              if [ "$local_sum" != "$published_sum" ]; then
+                echo "the registry holds a different ${name} ${version} (registry ${published_sum}, this tag ${local_sum})" >&2
+                exit 1
+              fi
+              echo "already=yes" >> "$GITHUB_OUTPUT"
+              echo "${name} ${version} is already published with this content; skipping the publish"
+              ;;
+            *)
+              echo "crates.io answered ${code} for ${url}; refusing to guess whether to publish" >&2
+              exit 1
+              ;;
+          esac
       - name: Guard the secret
         if: steps.check.outputs.already == 'no'
         run: |

@@ -256,6 +256,7 @@ let bytes = w.finish(&Opts {
 })?;
 # let peers_path = std::env::temp_dir().join(format!("guide-sections-{}-{}.snap", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
 std::fs::write(&peers_path, &bytes)?;
+# std::fs::remove_file(&peers_path).ok();
 # Ok(())
 # }
 ```
@@ -417,6 +418,7 @@ touching the disk:
 # let mut journal: Journal<PeerCount> = Journal::open(&d, TreeId::from_name("guide-to-snapshot"))?;
 let snap = journal.to_snapshot(&Opts::now())?;   // every Snapshot query, no file
 let under = snap.children("10.0.0.0/8".parse()?);
+# std::fs::remove_dir_all(&d).ok();
 # Ok(())
 # }
 ```
@@ -455,6 +457,7 @@ let inserted = journal.insert_with_blob("10.0.0.0/8".parse()?, arena_bytes, |off
     len: arena_bytes.len() as u64,
 })?;
 assert_eq!(inserted.offset, 0);   // the first blob in an empty arena
+# std::fs::remove_dir_all(&journal_path).ok();
 # Ok(())
 # }
 ```
