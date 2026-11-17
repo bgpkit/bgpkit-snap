@@ -184,9 +184,11 @@ Library and tooling
 - `Writer::finish` refuses headers a reader would reject; a value that is missing
   or too wide is refused by `bgpkit-snap build` instead of becoming zero.
 - `bgpkit-snap` CLI: `build`, `info`, `stats`, `verify`, `fold`. It is a container tool
-  and answers no domain queries: `info` reads the header, `stats` adds the section table
-  and the prefix count when the value type is one it decodes, `verify` checks the
+  and answers no domain queries: `info` reads the header, `stats` reports the section
+  table and the prefix count when the value type is one it decodes, `verify` checks the
   container (and the bodies for an integer type), `build` and `fold` produce objects.
+  The two do not overlap: a header claim (content id, creation time, coverage window) is
+  `info`'s, and what the body holds is `stats`'.
   A query needs the value's meaning, which belongs to the program that declares the
   type, so `search` was removed rather than taught to refuse other people's objects.
   Every command takes `--json` and answers in one object.

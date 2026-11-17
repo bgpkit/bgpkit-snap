@@ -327,9 +327,10 @@ fn verify(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// What the object holds. Everything here is readable without knowing the value type:
-/// the header, and the section table. Counts need the type, so they appear only when
-/// this binary decodes it.
+/// What the object holds, as opposed to what its header claims: the section table and,
+/// when this binary decodes the value type, the number of prefixes. The header's own
+/// fields (content id, creation time, coverage window) belong to `info`, and printing
+/// them here as well would make two commands answer the same question.
 fn stats(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::fs::read(file)?;
     let header = bgpkit_snap::verify_bytes(&raw)?;
@@ -339,8 +340,8 @@ fn stats(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         let entry = bgpkit_snap::header::Entry::parse(&raw[at..at + ENTRY_LEN])?;
         sections.push(entry);
     }
-    let typed = ValueType::from_type_id(&header.type_id_str());
-    let counts = match typed {
+    // the count needs the value type; the section table does not
+    let counts = match ValueType::from_type_id(&header.type_id_str()) {
         Some(ValueType::U8) => Some(Snapshot::<u8>::from_bytes(&raw)?.len()),
         Some(ValueType::U16) => Some(Snapshot::<u16>::from_bytes(&raw)?.len()),
         Some(ValueType::U32) => Some(Snapshot::<u32>::from_bytes(&raw)?.len()),
@@ -348,7 +349,7 @@ fn stats(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         Some(ValueType::U128) => Some(Snapshot::<u128>::from_bytes(&raw)?.len()),
         None => None,
     };
-    let total: u64 = sections.iter().map(|s| s.len).sum();
+    let section_bytes: u64 = sections.iter().map(|s| s.len).sum();
     if json {
         let table: Vec<_> = sections
             .iter()
@@ -366,28 +367,16 @@ fn stats(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
             serde_json::json!({
                 "file": file,
                 "type_id": header.type_id_str(),
-                "content_id": header.content_id_hex(),
-                "file_len": header.file_len,
-                "file_len_on_disk": raw.len(),
-                "created_at": stamp(header.created_at),
-                "window": header.window().map(|(a, b)| serde_json::json!([a, b])),
                 "sections": table,
-                "section_bytes": total,
+                "section_bytes": section_bytes,
                 "entries": counts,
             })
         );
         return Ok(());
     }
-    println!("file       {file}");
-    println!("type_id    {}", header.type_id_str());
-    println!("content_id {}", header.content_id_hex());
-    println!("file_len   {}", header.file_len);
-    println!("created_at {}", stamp(header.created_at));
-    match header.window() {
-        Some((a, b)) => println!("window     {}..{}", stamp(a), stamp(b)),
-        None => println!("window     none"),
-    }
-    println!("sections   {}", sections.len());
+    println!("file          {file}");
+    println!("type_id       {}", header.type_id_str());
+    println!("sections      {}", sections.len());
     for s in &sections {
         println!(
             "  id {:>3}  kind {}{}  {:>12} bytes",
@@ -397,10 +386,11 @@ fn stats(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
             s.len
         );
     }
+    println!("section_bytes {section_bytes}");
     match counts {
-        Some(n) => println!("entries    {n}"),
+        Some(n) => println!("entries       {n}"),
         None => println!(
-            "entries    not counted (type {} is not one this binary decodes)",
+            "entries       not counted (type {} is not one this binary decodes)",
             header.type_id_str()
         ),
     }
