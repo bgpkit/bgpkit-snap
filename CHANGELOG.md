@@ -200,6 +200,10 @@ Library and tooling
   build, verify, search and fold all of them.
 - `docs/usage.md`: the whole crate and CLI in one place, including the JSON fields and
   exit codes a caller programs against.
+- `examples/wayback.rs`: a downstream tool over a real `.snap` object, with its own value
+  type (`bgpkit.roa-set:v1`), answering "which ROA covers this netblock" and "which one
+  was valid on this day" against the 219 MB wayback dump. It is the pattern for every
+  project whose values are not integers.
 
 Review
 

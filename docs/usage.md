@@ -209,6 +209,16 @@ An object written by another program for its own value type can be `info`'d and
 value needs the program that declares the type, because the bytes only mean something to
 the `rkyv` layout that wrote them.
 
+That is not a gap to work around: it is the shape of the thing. A project with its own
+value type ships a small binary next to it. `examples/wayback.rs` is that binary for the
+wayback ROA archive, in 120 lines, and it opens the real 219 MB dump:
+
+```sh
+cargo run --example wayback -- roas.snap 8.8.8.8
+cargo run --example wayback -- roas.snap 8.8.8.8 --date 2023-06-24
+```
+
+
 ### For agents
 
 The CLI is meant to be driven by a program: one JSON object per invocation, stable
