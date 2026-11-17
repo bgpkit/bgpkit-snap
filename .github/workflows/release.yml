@@ -2,6 +2,8 @@ name: Release
 
 permissions:
   contents: write
+  # the publish job asks whether ci passed for this commit before it publishes
+  actions: read
 
 on:
   push:
@@ -22,6 +24,11 @@ jobs:
         run: cargo clippy --all-targets --features cli,derive -- -D warnings
       - name: Run tests
         run: cargo test --features cli,derive --verbose
+      # every check ci runs, because a tag can point at a commit ci never saw
+      - name: Build every example
+        run: cargo build --examples --features cli,derive
+      - name: Build the out-of-crate consumer
+        run: cargo test --manifest-path tests/downstream/Cargo.toml
       # the main crate depends on bgpkit-snap-derive by version, so its tarball cannot
       # be built until that crate is on the registry: `cargo publish` is where it gets
       # built for the first time, and a dry run here would only test the registry
@@ -37,6 +44,25 @@ jobs:
       already: ${{ steps.check.outputs.already }}
     steps:
       - uses: actions/checkout@v4
+      # a tag can point at a commit that ci never ran or that failed it. publishing is
+      # irreversible, so this refuses instead of assuming, and the message says what to do
+      - name: Require ci to be green on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+                   --commit "$GITHUB_SHA" --limit 20 --json status,conclusion)
+          python3 - "$runs" <<'PY'
+          import json, sys
+          runs = json.loads(sys.argv[1])
+          if not runs:
+              sys.exit("no ci run for this commit: push it to main and wait for ci before tagging")
+          bad = [r for r in runs if r.get("status") != "completed" or r.get("conclusion") != "success"]
+          if bad:
+              sys.exit(f"ci is not green on this commit: {[(r.get('status'), r.get('conclusion')) for r in bad]}")
+          print(f"ci green on {len(runs)} run(s) for this commit")
+          PY
       # a tag whose publish succeeded but whose release step failed must be
       # retryable: publishing twice is not possible, so ask the registry first
       - name: Is this version already published?
