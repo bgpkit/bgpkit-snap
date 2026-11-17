@@ -189,6 +189,10 @@ Library and tooling
   container (and the bodies for an integer type), `build` and `fold` produce objects.
   The two do not overlap: a header claim (content id, creation time, coverage window) is
   `info`'s, and what the body holds is `stats`'.
+- the writer records the entry counts in the object (section id 4, kind `CNT`, 32 bytes,
+  optional for readers), so `stats` reports how many prefixes an object holds without
+  knowing its value type. `verify` compares the recorded counts with the decoded ones
+  when it can decode them, and an object whose halves disagree is refused.
   A query needs the value's meaning, which belongs to the program that declares the
   type, so `search` was removed rather than taught to refuse other people's objects.
   Every command takes `--json` and answers in one object.

@@ -171,11 +171,35 @@ tool that only inspects objects is unaffected.
 | --- | --- | --- |
 | 2 | `V4` | the IPv4 trie archive |
 | 3 | `V6` | the IPv6 trie archive |
+| 4 | `CNT` | how many entries the tries hold, 32 bytes |
 | 16 and up | caller | this profile's own sections |
 
 A section whose kind is `V4` is at id 2 and a section whose kind is `V6` is at
 id 3. A reader rejects any other pairing rather than ignoring the section,
 because ignoring it turns a disagreement into an empty answer.
+
+The `CNT` section is `required = false` on purpose, and it carries no data the
+tries need. A reader that does not implement id 4 skips it and loses nothing; a
+reader that does can report the entry count without knowing the value type,
+because a trie's node layout depends on the value type while four little-endian
+integers do not. Writers that implement the counts section emit it on every
+object, including an empty one.
+
+Its body, 32 bytes:
+
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 2 | version, 1 |
+| 2 | 2 | reserved, zero |
+| 4 | 4 | reserved, zero |
+| 8 | 8 | entries, both families |
+| 16 | 8 | entries in the IPv4 trie |
+| 24 | 8 | entries in the IPv6 trie |
+
+A reader that implements the section refuses a body that is not 32 bytes, a
+version it does not know, or non-zero reserved bytes. The counts are a claim
+about the body: a reader that can decode the value type compares them with the
+decoded count and refuses an object whose two halves disagree.
 
 ## 3. Journal
 

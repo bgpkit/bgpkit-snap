@@ -178,8 +178,8 @@ bgpkit-snap fold <journal-dir> --out <file> [--tree NAME] [--value-type u8|u16|u
 - `info` reads the 192-byte header and nothing else: type id, content id, length,
   sections, creation time, coverage window, stream coordinates.
 - `stats` reports the contents instead: the section table (id, kind, required, bytes),
-  their total, and the number of prefixes when the object's value type is one this binary
-  decodes.
+  their total, and the number of entries and per-family counts, which the writer records
+  in the object itself so they are available whatever the value type is.
 - `verify` checks the container (header, layout, table, content id); for an integer value
   type it also checks every body.
 - `fold` turns a journal directory into one object, atomically and read-only. Writing a
@@ -192,15 +192,21 @@ Everything works on an object whose value type belongs to another program. `info
 available rather than guessing it.
 
 ```sh
-bgpkit-snap stats /data/wayback/roas.snap
-# file          /data/wayback/roas.snap
-# type_id       bgpkit.roa-set:v1
-# sections      2
-#   id   2  kind 56340000              156012248 bytes
-#   id   3  kind 56360000               63449536 bytes
-# section_bytes 219461784
-# entries       not counted (type bgpkit.roa-set:v1 is not one this binary decodes)
+bgpkit-snap stats /data/regions.snap
+# file          /data/regions.snap
+# type_id       example.region-set:v1
+# sections      3
+#   id   2  kind 56340000                     52 bytes
+#   id   3  kind 56360000                    132 bytes
+#   id   4  kind 434e5400                     32 bytes
+# section_bytes 216
+# entries       1042 (v4 918, v6 124)
 ```
+
+The count comes from section 4, which the writer fills in: it is the one number a
+reader can report without knowing the value type, because a trie's node layout depends
+on the value type while four little-endian integers do not. An object written before
+that section existed reports `entries not recorded`.
 
 `stats` answers "what is in it"; `info` answers "what does its header claim". The
 coverage window, creation time and content id are header claims, so they live in `info`
@@ -219,7 +225,7 @@ Every command takes `--json` and prints exactly one JSON object:
 | --- | --- |
 | `build --json` | `out`, `entries`, `bytes` |
 | `info --json` | `type_id`, `content_id`, `file_len`, `file_len_on_disk`, `consistent`, `sections`, `created_at`, `created_at_unix`, `window`, `stream` |
-| `stats --json` | `file`, `type_id`, `sections` (`id`, `kind`, `required`, `bytes`), `section_bytes`, `entries` (null when the type is not ours) |
+| `stats --json` | `file`, `type_id`, `sections` (`id`, `kind`, `required`, `bytes`), `section_bytes`, `entries`, `v4_entries`, `v6_entries` (null only for an object that predates the counts section) |
 | `verify --json` | `ok`, `type_id`, `sections`, `bodies_checked`, `entries` |
 | `fold --json` | `journal`, `out`, `entries`, `seq`, `type_id`, `bytes` |
 

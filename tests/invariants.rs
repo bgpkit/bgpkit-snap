@@ -33,7 +33,8 @@ fn header_is_self_sufficient() {
     let bytes = build(&[]);
     let h = Header::parse(&bytes[..192]).expect("header");
     assert_eq!(h.type_id_str(), "test.n:v1");
-    assert_eq!(h.section_count, 2);
+    // the two families in this object, plus the counts section the writer records
+    assert_eq!(h.section_count, 3);
     assert_eq!(h.window(), Some((1_790_000_000, 1_794_355_200)));
     assert_eq!(h.file_len as usize, bytes.len());
     assert_eq!(h.stream(), None);
@@ -45,8 +46,9 @@ fn table_alone_enumerates_sections() {
     let bytes = build(&[]);
     let h = Header::parse(&bytes[..192]).unwrap();
     let table_end = 192 + h.section_table_len as usize;
-    // a reader that wants the layout reads 192 + 128 bytes and stops
-    assert_eq!(h.section_table_len, 128);
+    // a reader that wants the layout reads 192 + 192 bytes and stops: three sections,
+    // 64 bytes a row
+    assert_eq!(h.section_table_len, 192);
     assert!(table_end < bytes.len());
 }
 
@@ -182,7 +184,7 @@ fn verify_bytes_checks_the_container_without_the_value_type() {
     let bytes = w.finish(&Opts::now()).unwrap();
 
     let header = bgpkit_snap::verify_bytes(&bytes).expect("a good object verifies");
-    assert_eq!(header.section_count, 2);
+    assert_eq!(header.section_count, 3);
 
     let mut flipped = bytes.clone();
     let last = flipped.len() - 1;
@@ -422,8 +424,8 @@ fn a_journal_checkpoint_carries_its_arena_and_nothing_else() {
     let raw = std::fs::read(&object).unwrap();
     let header = Header::parse(&raw[..192]).unwrap();
     assert_eq!(
-        header.section_count, 2,
-        "the IPv4 trie plus the arena, and nothing else"
+        header.section_count, 3,
+        "the IPv4 trie, the arena, and the records' counts; nothing else"
     );
     let snap: Snapshot<u32> = Snapshot::from_bytes_with(&raw, &{
         struct Knows;

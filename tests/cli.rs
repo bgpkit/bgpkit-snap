@@ -132,8 +132,8 @@ fn json_output_is_one_object_per_command() {
         serde_json::from_slice(&info.stdout).expect("info --json is one object");
     assert_eq!(info_json["type_id"], "snap.u32:v1");
     assert_eq!(info_json["consistent"], true);
-    // the input is all IPv4, so the object carries one family section
-    assert_eq!(info_json["sections"], 1);
+    // the input is all IPv4: one family section plus the recorded counts
+    assert_eq!(info_json["sections"], 2);
 
     let verify = Command::new(bin())
         .args(["--json", "verify"])
@@ -194,9 +194,9 @@ fn a_u64_object_can_be_built_and_counted() {
 }
 
 #[test]
-fn a_foreign_value_type_is_inspected_but_not_counted() {
-    // the container is readable whatever the value type is; the count is not, because
-    // only the program that declares the type can walk those values
+fn a_foreign_value_type_is_counted_from_the_recorded_section() {
+    // the count lives in the object, not in the reader: a trie's layout depends on the
+    // value type, but three u64s written beside it do not
     #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     struct Origin(u32);
     impl bgpkit_snap::SnapValue for Origin {
@@ -207,6 +207,8 @@ fn a_foreign_value_type_is_inspected_but_not_counted() {
     let out = d.join("origin.snap");
     let mut w: bgpkit_snap::Writer<Origin> = bgpkit_snap::Writer::new();
     w.insert("10.0.0.0/8".parse().unwrap(), Origin(64512))
+        .unwrap();
+    w.insert("192.0.2.0/24".parse().unwrap(), Origin(64513))
         .unwrap();
     w.finish_to(&out, &bgpkit_snap::Opts::now()).unwrap();
 
@@ -222,11 +224,86 @@ fn a_foreign_value_type_is_inspected_but_not_counted() {
     );
     let stats: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
     assert_eq!(stats["type_id"], "cli-test.origin:v1");
+    assert_eq!(stats["entries"], 2, "the recorded count works for any type");
+    assert_eq!(stats["v4_entries"], 2);
+    assert_eq!(stats["v6_entries"], 0);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_recorded_count_that_disagrees_with_the_body_fails_verify() {
+    // the count is a claim about the body, so verify compares it to the decoded count;
+    // an object whose two halves disagree is broken, not merely odd
+    let d = dir("count-mismatch");
+    let path = d.join("in.jsonl");
+    std::fs::write(&path, "{\"prefix\":\"10.0.0.0/8\",\"value\":1}\n").unwrap();
+    let out = d.join("out.snap");
+    let built = Command::new(bin())
+        .arg("build")
+        .arg(&path)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(built.status.success());
+
+    // the counts section is the last section, so its body ends the file: rewrite the
+    // entries field, then reseal the content id so the container check cannot be what
+    // catches this. Without the reseal the object is refused one layer earlier, which is
+    // its own proof that the container is self-checking.
+    let mut raw = std::fs::read(&out).unwrap();
+    let entries_at = raw.len() - 32 + 8;
+    raw[entries_at..entries_at + 8].copy_from_slice(&9u64.to_le_bytes());
+    std::fs::write(&out, &raw).unwrap();
+    let caught_by_content_id = Command::new(bin())
+        .arg("verify")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(!caught_by_content_id.status.success());
     assert!(
-        stats["entries"].is_null(),
-        "a foreign type must not be counted"
+        String::from_utf8_lossy(&caught_by_content_id.stderr).contains("content id"),
+        "the container check should be the first to notice"
     );
-    assert!(stats["sections"].as_array().is_some_and(|s| !s.is_empty()));
+
+    // reseal: the same hash the writer computes, over the header prefix, the table and
+    // every section body, written back into the content-id bytes
+    let mut raw = std::fs::read(&out).unwrap();
+    // section_count is a u32 at offset 92 in the v4 header
+    let section_count = u32::from_le_bytes(raw[92..96].try_into().unwrap()) as usize;
+    let mut h = blake3::Hasher::new();
+    h.update(b"bgpkit-snap-v4\0");
+    h.update(&raw[..bgpkit_snap::header::HASH_END]);
+    let table_end =
+        bgpkit_snap::header::HEADER_LEN + section_count * bgpkit_snap::header::ENTRY_LEN;
+    h.update(&raw[bgpkit_snap::header::HEADER_LEN..table_end]);
+    let mut cursor = table_end;
+    for i in 0..section_count {
+        let at = bgpkit_snap::header::HEADER_LEN + i * bgpkit_snap::header::ENTRY_LEN;
+        let len = u64::from_le_bytes(raw[at + 8..at + 16].try_into().unwrap()) as usize;
+        while !cursor.is_multiple_of(16) {
+            cursor += 1;
+        }
+        h.update(&raw[cursor..cursor + len]);
+        cursor += len;
+    }
+    raw[156..188].copy_from_slice(h.finalize().as_bytes());
+    // and the header's own crc32c, which covers bytes 0..188
+    let crc = crc32c::crc32c(&raw[..188]);
+    raw[188..192].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&out, &raw).unwrap();
+
+    let verified = Command::new(bin())
+        .arg("verify")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        !verified.status.success(),
+        "verify accepted an object whose count contradicts its body"
+    );
+    let err = String::from_utf8_lossy(&verified.stderr);
+    assert!(err.contains("the body holds 1 entries"), "got {err}");
     std::fs::remove_dir_all(&d).ok();
 }
 

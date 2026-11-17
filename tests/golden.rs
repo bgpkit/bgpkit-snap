@@ -12,9 +12,10 @@ impl SnapValue for V {
     const TYPE_ID: &str = "golden.v:v1";
 }
 
-const WANT_LEN: usize = 612;
-const WANT_SHA256: &str = "d0ed63727b2d9212492b09f78bb652b9eba754b004815e0c792f1b238a9b9925";
-const WANT_CONTENT_ID: &str = "1a808769533d26aca6d24c918e21094e0842cfc7f14ebf270c71f58d1538224f";
+// Regenerated when the counts section (id 4, 32 bytes plus its padding) was added.
+const WANT_LEN: usize = 720;
+const WANT_SHA256: &str = "33e9c1e8451674685bc908cf6c9a6a852224ff557d15f94c2e663f5538c28a86";
+const WANT_CONTENT_ID: &str = "0cf2460413a20a01943eab441fcf069e9a87b1a734e58483461cf4b178921172";
 
 fn build() -> Vec<u8> {
     let mut w: Writer<V> = Writer::new();

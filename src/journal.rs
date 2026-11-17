@@ -518,7 +518,12 @@ where
             // directory was written under a different configuration, and opening it
             // anyway would drop the arena that the handles point into.
             for entry in snap.entries() {
-                if entry.id == crate::header::ID_V4 || entry.id == crate::header::ID_V6 {
+                if entry.id == crate::header::ID_V4
+                    || entry.id == crate::header::ID_V6
+                    || entry.id == crate::header::ID_STATS
+                {
+                    // the family tries are the journal's own, and the counts section is
+                    // one this crate writes: neither says anything about the payload
                     continue;
                 }
                 let is_payload = self.payload.is_some_and(|p| {
@@ -930,7 +935,10 @@ where
         // repair refuse the directory.
         let wanted = payload.map(|p| (p.id, p.kind, p.required));
         for entry in snapshot.entries() {
-            if entry.id == crate::header::ID_V4 || entry.id == crate::header::ID_V6 {
+            if entry.id == crate::header::ID_V4
+                || entry.id == crate::header::ID_V6
+                || entry.id == crate::header::ID_STATS
+            {
                 continue;
             }
             let matches = wanted.is_some_and(|(id, kind, required)| {

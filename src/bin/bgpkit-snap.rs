@@ -316,6 +316,15 @@ fn verify(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    if let (Some(decoded), Some(recorded)) = (entries, bgpkit_snap::recorded_counts(&raw)?) {
+        if decoded as u64 != recorded.entries {
+            return Err(std::io::Error::other(format!(
+                "the body holds {decoded} entries, the object records {}",
+                recorded.entries
+            ))
+            .into());
+        }
+    }
     match entries {
         Some(n) => println!("ok: {n} entries, bodies checked"),
         None => println!(
@@ -340,15 +349,9 @@ fn stats(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         let entry = bgpkit_snap::header::Entry::parse(&raw[at..at + ENTRY_LEN])?;
         sections.push(entry);
     }
-    // the count needs the value type; the section table does not
-    let counts = match ValueType::from_type_id(&header.type_id_str()) {
-        Some(ValueType::U8) => Some(Snapshot::<u8>::from_bytes(&raw)?.len()),
-        Some(ValueType::U16) => Some(Snapshot::<u16>::from_bytes(&raw)?.len()),
-        Some(ValueType::U32) => Some(Snapshot::<u32>::from_bytes(&raw)?.len()),
-        Some(ValueType::U64) => Some(Snapshot::<u64>::from_bytes(&raw)?.len()),
-        Some(ValueType::U128) => Some(Snapshot::<u128>::from_bytes(&raw)?.len()),
-        None => None,
-    };
+    // the writer records the count in the object, so it is available whatever the value
+    // type is; an object written before that section existed has none
+    let counts = bgpkit_snap::recorded_counts(&raw)?;
     let section_bytes: u64 = sections.iter().map(|s| s.len).sum();
     if json {
         let table: Vec<_> = sections
@@ -369,7 +372,9 @@ fn stats(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 "type_id": header.type_id_str(),
                 "sections": table,
                 "section_bytes": section_bytes,
-                "entries": counts,
+                "entries": counts.map(|c| c.entries),
+                "v4_entries": counts.map(|c| c.v4),
+                "v6_entries": counts.map(|c| c.v6),
             })
         );
         return Ok(());
@@ -388,10 +393,12 @@ fn stats(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("section_bytes {section_bytes}");
     match counts {
-        Some(n) => println!("entries       {n}"),
+        Some(c) => {
+            println!("entries       {} (v4 {}, v6 {})", c.entries, c.v4, c.v6);
+        }
         None => println!(
-            "entries       not counted (type {} is not one this binary decodes)",
-            header.type_id_str()
+            "entries       not recorded (written before section 4 existed, or by another \
+             writer)"
         ),
     }
     Ok(())

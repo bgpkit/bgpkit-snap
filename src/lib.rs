@@ -504,6 +504,25 @@ impl<T: SnapValue> Writer<T> {
                 &v6_bytes,
             ));
         }
+        // the counts section carries no data the tries need, so it stays optional: a
+        // reader that does not know it skips it, and one that does can report the entry
+        // count without decoding a value
+        let counts = header::Counts {
+            entries: self.len() as u64,
+            v4: self.v4.len() as u64,
+            v6: self.v6.len() as u64,
+        };
+        let counts_bytes = counts.encode();
+        sections.push((
+            Entry {
+                id: header::ID_STATS,
+                kind: header::KIND_STATS,
+                required: false,
+                len: header::STATS_LEN as u64,
+            },
+            &counts_bytes,
+        ));
+
         let mut extras: Vec<&ExtraSection<'_>> = opts.extras.iter().collect();
         extras.sort_by_key(|e| e.id);
         for extra in extras {
@@ -636,6 +655,107 @@ impl<T: SnapValue> Writer<T> {
 }
 
 // ---------------------------------------------------------------- merge
+
+/// How many entries an object records, without naming a value type.
+///
+/// The writer records this in section 4 precisely so the number survives a reader that
+/// does not know `T`: a trie's node layout depends on the value type, so counting from the
+/// bytes needs the type, while reading three `u64`s does not. An object written before the
+/// section existed answers `None`.
+pub fn recorded_counts(raw: &[u8]) -> Result<Option<header::Counts>, Error> {
+    let header = Header::parse(raw)?;
+    header.check_layout(raw.len())?;
+    let table_end = HEADER_LEN + header.section_table_len as usize;
+    let sections = parse_sections(raw, &header, table_end)?;
+    Ok(sections
+        .iter()
+        .find(|s| s.entry.id == header::ID_STATS)
+        .and_then(|s| header::Counts::parse(&raw[s.offset..s.offset + s.len])))
+}
+
+/// The section table and each section's range in the file.
+///
+/// Split out of the typed reader because nothing here needs the value type: the layout,
+/// the padding and the id/kind pairing are properties of the container, and a caller that
+/// only wants the counts should not have to name a value type to get them.
+fn parse_sections(raw: &[u8], header: &Header, table_end: usize) -> Result<Vec<SectionRef>, Error> {
+    let table = &raw[HEADER_LEN..table_end];
+    let mut sections: Vec<SectionRef> = Vec::new();
+    let mut cursor = table_end;
+    let mut prev_id = 0u16;
+    for i in 0..header.section_count as usize {
+        let entry = Entry::parse(&table[i * ENTRY_LEN..(i + 1) * ENTRY_LEN])?;
+        if entry.id <= prev_id && i > 0 {
+            return Err(Error::SectionOrder);
+        }
+        // every section starts at the next 16-byte boundary at or after the
+        // previous end, so the offset is computed and never stored
+        while !cursor.is_multiple_of(16) {
+            let Some(byte) = raw.get(cursor) else {
+                return Err(Error::Truncated {
+                    need: cursor + 1,
+                    have: raw.len(),
+                });
+            };
+            if *byte != 0 {
+                return Err(Error::BadSectionTable("padding is not zero"));
+            }
+            cursor += 1;
+        }
+        let len = entry.len as usize;
+        let Some(end) = cursor.checked_add(len) else {
+            return Err(Error::BadSectionTable("section length overflows"));
+        };
+        if end > raw.len() {
+            return Err(Error::Truncated {
+                need: end,
+                have: raw.len(),
+            });
+        }
+        sections.push(SectionRef {
+            entry,
+            offset: cursor,
+            len,
+        });
+        prev_id = entry.id;
+        cursor = end;
+    }
+    if cursor != raw.len() {
+        return Err(Error::BadSectionTable("sections do not end the file"));
+    }
+
+    for SectionRef { entry, len, .. } in &sections {
+        if entry.id == header::ID_STATS && *len != header::STATS_LEN {
+            return Err(Error::BadSectionTable(
+                "count section is not the fixed 32 bytes",
+            ));
+        }
+    }
+
+    // the family sections must be the kind they claim, which is the guard
+    // against reading an IPv4 archive as IPv6
+    for SectionRef { entry, .. } in &sections {
+        match entry.id {
+            ID_V4 if entry.kind != KIND_V4 => return Err(Error::BadSectionKind(entry.id)),
+            ID_V6 if entry.kind != KIND_V6 => return Err(Error::BadSectionKind(entry.id)),
+            header::ID_STATS if entry.kind != header::KIND_STATS => {
+                return Err(Error::BadSectionKind(entry.id))
+            }
+            _ => {}
+        }
+        // and the reverse: a family kind lives at its normative id, so an
+        // object cannot dodge a reader by putting it somewhere else
+        match entry.kind {
+            KIND_V4 if entry.id != ID_V4 => return Err(Error::BadSectionKind(entry.id)),
+            KIND_V6 if entry.id != ID_V6 => return Err(Error::BadSectionKind(entry.id)),
+            header::KIND_STATS if entry.id != header::ID_STATS => {
+                return Err(Error::BadSectionKind(entry.id))
+            }
+            _ => {}
+        }
+    }
+    Ok(sections)
+}
 
 impl<T: SnapValue> Snapshot<T> {
     /// Merge several objects into one, later inputs winning where they hold the same
@@ -1098,66 +1218,7 @@ impl<T: SnapValue> Snapshot<T> {
         let table_end = table_start + header.section_table_len as usize;
         let table = &aligned[table_start..table_end];
 
-        let mut sections: Vec<SectionRef> = Vec::new();
-        let mut cursor = table_end;
-        let mut prev_id = 0u16;
-        for i in 0..header.section_count as usize {
-            let entry = Entry::parse(&table[i * ENTRY_LEN..(i + 1) * ENTRY_LEN])?;
-            if entry.id <= prev_id && i > 0 {
-                return Err(Error::SectionOrder);
-            }
-            // every section starts at the next 16-byte boundary at or after the
-            // previous end, so the offset is computed and never stored
-            while !cursor.is_multiple_of(16) {
-                let Some(byte) = raw.get(cursor) else {
-                    return Err(Error::Truncated {
-                        need: cursor + 1,
-                        have: raw.len(),
-                    });
-                };
-                if *byte != 0 {
-                    return Err(Error::BadSectionTable("padding is not zero"));
-                }
-                cursor += 1;
-            }
-            let len = entry.len as usize;
-            let Some(end) = cursor.checked_add(len) else {
-                return Err(Error::BadSectionTable("section length overflows"));
-            };
-            if end > raw.len() {
-                return Err(Error::Truncated {
-                    need: end,
-                    have: raw.len(),
-                });
-            }
-            sections.push(SectionRef {
-                entry,
-                offset: cursor,
-                len,
-            });
-            prev_id = entry.id;
-            cursor = end;
-        }
-        if cursor != raw.len() {
-            return Err(Error::BadSectionTable("sections do not end the file"));
-        }
-
-        // the family sections must be the kind they claim, which is the guard
-        // against reading an IPv4 archive as IPv6
-        for SectionRef { entry, .. } in &sections {
-            match entry.id {
-                ID_V4 if entry.kind != KIND_V4 => return Err(Error::BadSectionKind(entry.id)),
-                ID_V6 if entry.kind != KIND_V6 => return Err(Error::BadSectionKind(entry.id)),
-                _ => {}
-            }
-            // and the reverse: a family kind lives at its normative id, so an
-            // object cannot dodge a reader by putting it somewhere else
-            match entry.kind {
-                KIND_V4 if entry.id != ID_V4 => return Err(Error::BadSectionKind(entry.id)),
-                KIND_V6 if entry.id != ID_V6 => return Err(Error::BadSectionKind(entry.id)),
-                _ => {}
-            }
-        }
+        let sections = parse_sections(&aligned, &header, table_end)?;
 
         // identity: header prefix, table, every section
         let mut h = blake3::Hasher::new();
@@ -1192,7 +1253,7 @@ impl<T: SnapValue> Snapshot<T> {
 
         let view = snap.view();
         for SectionRef { entry, .. } in &snap.sections {
-            let known = matches!(entry.id, ID_V4 | ID_V6);
+            let known = matches!(entry.id, ID_V4 | ID_V6 | header::ID_STATS);
             if entry.required && !known && !validator.knows(entry) {
                 return Err(Error::UnknownRequiredSection(entry.id));
             }

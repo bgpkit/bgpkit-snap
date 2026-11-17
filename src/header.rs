@@ -44,8 +44,63 @@ pub const KIND_PAYLOAD: [u8; 4] = *b"PAY\0";
 pub const ID_V4: u16 = 2;
 /// Section id of the IPv6 trie.
 pub const ID_V6: u16 = 3;
+/// Kind tag of the optional counts section.
+pub const KIND_STATS: [u8; 4] = *b"CNT\0";
+/// Section id of the optional counts section: how many entries the tries hold, written
+/// so a reader that does not know the value type can still report the number.
+pub const ID_STATS: u16 = 4;
+/// Length of the counts section body: version, reserved, and three u64 counts.
+pub const STATS_LEN: usize = 32;
+/// Version of the counts body this crate writes and reads.
+const STATS_VERSION: u16 = 1;
 /// Profile sections use ids 16 and above.
 pub const FIRST_PROFILE_ID: u16 = 16;
+
+/// How many entries the object's tries hold, per family and in total.
+///
+/// The writer records this so that the number is available without decoding a value: a
+/// trie's node layout depends on the value type, so counting entries from the bytes needs
+/// the type, while reading four `u64`s does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Counts {
+    /// Entries in both families.
+    pub entries: u64,
+    /// Entries in the IPv4 trie.
+    pub v4: u64,
+    /// Entries in the IPv6 trie.
+    pub v6: u64,
+}
+
+impl Counts {
+    /// The section body.
+    pub fn encode(&self) -> [u8; STATS_LEN] {
+        let mut b = [0u8; STATS_LEN];
+        b[0..2].copy_from_slice(&STATS_VERSION.to_le_bytes());
+        // bytes 2..4 stay zero: reserved, and a reader refuses them otherwise
+        b[8..16].copy_from_slice(&self.entries.to_le_bytes());
+        b[16..24].copy_from_slice(&self.v4.to_le_bytes());
+        b[24..32].copy_from_slice(&self.v6.to_le_bytes());
+        b
+    }
+
+    /// Read the body, or `None` when it is not a body this crate writes.
+    pub fn parse(raw: &[u8]) -> Option<Self> {
+        if raw.len() != STATS_LEN {
+            return None;
+        }
+        if u16::from_le_bytes(raw[0..2].try_into().ok()?) != STATS_VERSION {
+            return None;
+        }
+        if raw[2..4] != [0, 0] || raw[4..8] != [0, 0, 0, 0] {
+            return None;
+        }
+        Some(Self {
+            entries: u64::from_le_bytes(raw[8..16].try_into().ok()?),
+            v4: u64::from_le_bytes(raw[16..24].try_into().ok()?),
+            v6: u64::from_le_bytes(raw[24..32].try_into().ok()?),
+        })
+    }
+}
 
 /// Which journal stream an object came from, and where in it the object starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
