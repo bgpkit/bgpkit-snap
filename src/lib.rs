@@ -238,6 +238,17 @@ pub struct AddressCounts {
 pub use bgpkit_snap_derive::SnapValue;
 
 /// A value type that can live in a trie.
+///
+/// `#[derive(SnapValue)]` only writes the id; the archive impls come from `rkyv`. The
+/// diagnostics below say that once, where the compiler would otherwise print rkyv's
+/// strategy types.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be stored in a snapshot",
+    label = "not a value type",
+    note = "a value type needs `Clone`, rkyv's `Archive` and `Serialize`, and `SnapValue` for its id:",
+    note = "#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, bgpkit_snap::SnapValue)]",
+    note = "#[snap(type_id = \"your.type:v1\")]"
+)]
 pub trait SnapValue: rkyv::Archive + Clone + for<'a> rkyv::Serialize<HighSer<'a>> {
     /// Stable identifier, e.g. `snap.u32:v1`.
     ///

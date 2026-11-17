@@ -59,6 +59,12 @@ impl SnapValue for PeerCount {
 }
 ```
 
+`SnapValue` supplies only that id. A type that forgets rkyv's three derives does not
+compile: the error names the missing `Serialize<Strategy<...>>` bound at the type, and
+`cannot be stored in a snapshot` where it is used. Nothing about a value type involves
+`serde`: the stored bytes are rkyv's, and `serde` in this crate is only for the
+journal's `state.json` and the CLI's JSON.
+
 The id is at most 31 bytes of printable ASCII, no space, quote or backslash, and never
 empty. A value that cannot fit is refused when the object is written, not when it is
 read. `u32` (`snap.u32:v1`) and `u64` (`snap.u64:v1`) are implemented by the crate, so a
