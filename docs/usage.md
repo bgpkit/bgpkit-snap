@@ -268,6 +268,69 @@ newest checkpoint, proves the result opens, and leaves the directory untouched i
 cannot. A state file that is present but unreadable is also repair's case; a healthy one
 is not, because rewriting it would hide a gap.
 
+## A loaded snapshot and an incoming feed
+
+This is the shape most services end up in: one object is being served, and changes keep
+arriving. The two sides are separate handles on the same lineage.
+
+```rust
+use bgpkit_snap::journal::Journal;
+use bgpkit_snap::{Opts, Snapshot};
+
+// read side: one validated open, then queries that never touch the disk
+let mut current: Snapshot<Origin> = Snapshot::open("table.snap")?;
+
+// write side: one journal over that same object
+let mut log: Journal<Origin> = Journal::attach("table.snap", "table.journal")?;
+
+// the feed arrives
+log.insert("192.0.2.0/24".parse()?, Origin(64512))?;
+log.withdraw("10.0.0.0/8".parse()?)?;
+log.sync()?;                                   // durable from here
+
+// the loaded object has not changed: readers keep the answers they had
+assert!(current.owned().lpm("192.0.2.1/32".parse()?)?.is_none());
+
+// the writer sees base plus log through the same queries
+let seen = log.lpm("192.0.2.1/32".parse()?);
+
+// a consistent object that includes the pending changes, without publishing anything
+let with_pending: Snapshot<Origin> = log.to_snapshot(&Opts::now())?;
+
+// publish: a new object inside the journal directory, named by state.json
+let next = log.checkpoint(&Opts::now())?;
+current = Snapshot::open(&next)?;              // the reader moves by reopening
+```
+
+Rules this buys, and the costs that come with them:
+
+- **A snapshot is immutable.** The object a process opened keeps answering from the bytes
+  it opened, whatever the writer does in the meantime. That is why several processes can
+  read one file with no lock and no coordination.
+- **The journal is the writer's view.** `log.lpm(..)`, `log.get_exact(..)` and
+  `log.to_snapshot(&opts)` answer from base plus the records so far. A service that must
+  answer with the newest data either queries the journal or swaps to a new snapshot.
+- **Only a checkpoint moves the reader.** `checkpoint` writes a complete object, verifies
+  it against the live tree, records it in `state.json`, and republishes `current.snap`.
+  Readers pick it up by reopening; nothing updates in place, and an object already open
+  stays valid.
+- **Costs.** The writer holds the tree in memory, so a process that serves a snapshot and
+  writes its journal pays for both: the object's bytes plus the writer's map. Reopening is
+  cheap (a validated pass, tens of milliseconds for a RIB-sized table), so swapping on
+  every checkpoint is reasonable; swapping per record is not.
+- **One writer per directory.** The second writer gets `Error::Locked`. Readers never take
+  the lock.
+
+Two patterns fit this:
+
+- **long-lived journal**: keep appending and checkpointing in place, and treat
+  `<dir>/current.snap` as the service's read path.
+- **publish and roll**: checkpoint, copy the new object to wherever objects live, then
+  attach a fresh journal to it. The old journal directory can be dropped once no reader
+  needs it, and the base of the new one is the object you just published.
+
+`examples/live.rs` in the crate is this whole flow, runnable.
+
 ## CLI
 
 The binary is `bgpkit-snap` (not `snap`: Ubuntu owns that name). It is a **container**
