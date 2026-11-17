@@ -31,11 +31,11 @@ With `#[derive(SnapValue)]` (brings `syn` and `quote` into your build):
 bgpkit-snap = { version = "0.1", features = ["derive"] }
 ```
 
-The CLI:
+The CLI (binary `bgpkit-snap`: `snap` is Ubuntu's):
 
 ```sh
 cargo install --git https://github.com/bgpkit/bgpkit-snap --features cli
-snap --help
+bgpkit-snap --help
 ```
 
 ## Your value type
@@ -161,11 +161,11 @@ is not, because rewriting it would hide a gap.
 ## CLI
 
 ```
-snap build <in.jsonl> --out <file> [--value u8|u16|u32|u64|u128] [--created-at T] [--window A,B]
-snap info <file>
-snap verify <file>
-snap search <file> <address-or-prefix>
-snap fold <journal-dir> --out <file> [--tree NAME] [--value-type u8|u16|u32|u64|u128]
+bgpkit-snap build <in.jsonl> --out <file> [--value u8|u16|u32|u64|u128] [--created-at T] [--window A,B]
+bgpkit-snap info <file>
+bgpkit-snap verify <file>
+bgpkit-snap search <file> <address-or-prefix>
+bgpkit-snap fold <journal-dir> --out <file> [--tree NAME] [--value-type u8|u16|u32|u64|u128]
 ```
 
 `build` reads one JSON object per line, `{"prefix": "10.0.0.0/8", "value": 7}`. A value
@@ -183,8 +183,8 @@ needs afterwards is one file it can ship and query.
 
 ```sh
 # a program appended to ./tbl; turn it into something everyone can read
-snap --json fold ./tbl --out tbl.snap
-snap --json search tbl.snap 8.8.8.8
+bgpkit-snap --json fold ./tbl --out tbl.snap
+bgpkit-snap --json search tbl.snap 8.8.8.8
 ```
 
 A journal is single-writer, so `fold` fails with `another writer holds this journal`
@@ -216,13 +216,13 @@ field names, exit code `0`/`1`, and no interactive prompts. Some recipes:
 
 ```sh
 # does this file hold what I think, and is it intact?
-snap --json verify big.snap | jq -e '.ok and .bodies_checked'
+bgpkit-snap --json verify big.snap | jq -e '.ok and .bodies_checked'
 
 # which prefix covers this address, and what is its value?
-snap --json search big.snap 8.8.8.8 | jq -r '.match.prefix, .match.value'
+bgpkit-snap --json search big.snap 8.8.8.8 | jq -r '.match.prefix, .match.value'
 
 # a journal your program writes, folded into one object for everyone else
-snap --json fold ./tbl --out tbl.snap | jq '.entries, .seq, .bytes'
+bgpkit-snap --json fold ./tbl --out tbl.snap | jq '.entries, .seq, .bytes'
 ```
 
 ## What it does not do

@@ -1,5 +1,6 @@
 //! The CLI as a caller meets it: an object built from JSON lines, a symlink the
-//! caller already had in place, and a failure that must not leave debris.
+//! caller already had in place, and a failure that must not leave debris. The binary
+//! is `bgpkit-snap`, not `snap`, which is Ubuntu's.
 //!
 //! Gated on the `cli` feature, because the binary only exists with it. `snap build`
 //! used to write with `fs::write`; round 9 found that the atomic replacement had
@@ -11,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_snap")
+    env!("CARGO_BIN_EXE_bgpkit-snap")
 }
 
 fn dir(name: &str) -> PathBuf {

@@ -182,13 +182,16 @@ Library and tooling
 - `verify_bytes` checks the container without the value type, so the CLI can
   verify an object whose type belongs to another binary.
 - `Writer::finish` refuses headers a reader would reject; a value that is missing
-  or too wide is refused by `snap build` instead of becoming zero.
-- `snap` CLI: build, info, verify, search; `info` still reads 192 bytes. Every
+  or too wide is refused by `bgpkit-snap build` instead of becoming zero.
+- `bgpkit-snap` CLI: build, info, verify, search; `info` still reads 192 bytes. Every
   command takes `--json` and answers in one object, `build` and `search` handle
   `snap.u64:v1` as well as `snap.u32:v1` (`--value u64`), and `search` on an object
   whose value type belongs to another program names that type and both ways out
   instead of only reporting a mismatch.
-- `snap fold <journal-dir> --out <file>`: read a journal and write the object its
+- the CLI binary is `bgpkit-snap`, not `snap`: Ubuntu's package manager owns that name,
+  so `cargo install` would have put a second `snap` on the path. Every command keeps its
+  flags, and the error prefix changed with it.
+- `bgpkit-snap fold <journal-dir> --out <file>`: read a journal and write the object its
   records describe, atomically. Writing a journal is the application's job; the CLI's
   job is the readable artifact, so there is one read-only command instead of a shell API
   for `insert`/`sync`/`checkpoint`.
@@ -220,5 +223,5 @@ First release candidate. The layout is frozen; the items in the README's
 - Journal with 48-byte segment headers, crc32c framed records, dense sequences,
   a writer lock, a generation per incarnation, checkpoint verification, and
   `state.json` for restart-safe sequence numbering.
-- `snap` CLI: build, verify, search, info.
+- `snap` CLI: build, verify, search, info (renamed to `bgpkit-snap` in 0.1.0).
 - Golden object test that fails on any archived-layout drift.

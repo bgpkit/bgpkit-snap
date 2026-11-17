@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use ipnet::IpNet;
 
 #[derive(Parser)]
-#[command(name = "snap", version, about = "bgpkit-snap object tool")]
+#[command(name = "bgpkit-snap", version, about = "bgpkit-snap object tool")]
 struct Cli {
     /// Print one JSON object instead of text
     #[arg(long, global = true)]
@@ -145,7 +145,7 @@ fn main() {
 }
 
 fn fail(msg: &str) -> ! {
-    eprintln!("snap: {msg}");
+    eprintln!("bgpkit-snap: {msg}");
     exit(1)
 }
 

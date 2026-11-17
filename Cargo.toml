@@ -42,8 +42,9 @@ clap = { version = "4", features = ["derive"], optional = true }
 bgpkit-snap-derive = { version = "0.1.0", path = "derive", optional = true }
 
 [[bin]]
-name = "snap"
-path = "src/bin/snap.rs"
+# not `snap`: that name belongs to the Ubuntu package manager's client
+name = "bgpkit-snap"
+path = "src/bin/bgpkit-snap.rs"
 required-features = ["cli"]
 
 [profile.release]
