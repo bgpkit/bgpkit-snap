@@ -19,9 +19,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run clippy
-        run: cargo clippy --all-targets --features cli -- -D warnings
+        run: cargo clippy --all-targets --features cli,derive -- -D warnings
       - name: Run tests
-        run: cargo test --features cli --verbose
+        run: cargo test --features cli,derive --verbose
       # the main crate depends on bgpkit-snap-derive by version, so its tarball cannot
       # be built until that crate is on the registry: `cargo publish` is where it gets
       # built for the first time, and a dry run here would only test the registry
