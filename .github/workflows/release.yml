@@ -22,8 +22,13 @@ jobs:
         run: cargo clippy --all-targets --features cli -- -D warnings
       - name: Run tests
         run: cargo test --features cli --verbose
-      - name: Build the package tarball (the publish step verifies it)
-        run: cargo package --no-verify
+      # the main crate depends on bgpkit-snap-derive by version, so its tarball cannot
+      # be built until that crate is on the registry: `cargo publish` is where it gets
+      # built for the first time, and a dry run here would only test the registry
+      - name: Check the derive crate packages on its own
+        run: cargo package --package bgpkit-snap-derive --no-verify
+      - name: Check every manifest resolves
+        run: cargo metadata --format-version 1 --no-deps > /dev/null
 
   cargo-publish:
     needs: build-test
