@@ -75,7 +75,7 @@ instead (both forms are described in `docs/usage.md`).
 ```rust
 use bgpkit_snap::snap_value;
 
-#[snap_value(type_id = "example.roa-set:v1", canonicalize = sort_entries)]
+#[snap_value("example.roa-set:v1", canonicalize = sort_entries)]
 #[derive(Clone)]
 struct RoaSet(Vec<u32>);
 

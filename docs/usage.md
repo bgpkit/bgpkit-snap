@@ -50,7 +50,7 @@ derive form below:
 ```rust
 use bgpkit_snap::snap_value;
 
-#[snap_value(type_id = "demo.peer-count:v1")]
+#[snap_value("demo.peer-count:v1")]
 #[derive(Clone, Debug)]
 struct PeerCount(u32);
 ```
@@ -60,7 +60,7 @@ That expands to `rkyv`'s three derives, the `rkyv` crate path, and the `SnapValu
 already fixed:
 
 ```rust
-#[snap_value(type_id = "demo.roa-set:v1", canonicalize = sort_entries)]
+#[snap_value("demo.roa-set:v1", canonicalize = sort_entries)]
 #[derive(Clone)]
 struct RoaSet(Vec<u32>);
 
