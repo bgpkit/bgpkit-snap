@@ -119,6 +119,8 @@ Queries. `search` takes an address, everything else takes a prefix:
 | every entry covering a prefix, least specific first | `cover(prefix)` | `Vec<(IpNet, T)>` |
 | every entry | `iter()` | `Vec<(IpNet, T)>` |
 | how much of the space is covered | `address_counts()` | `AddressCounts { v4, v6 }` |
+| every entry from a prefix upward | `iter_from(prefix, inclusive)` | `Vec<(IpNet, T)>` |
+| just the values | `values()` | `Vec<T>` |
 
 `Snapshot` answers with archived values (`&T::Archived`); `snap.owned()` answers with
 `T`. Both are views over the same bytes, so `owned()` costs nothing until a value is
@@ -140,22 +142,59 @@ A merge refuses an input that carries a profile section of its own, and claims a
 `window` only when every input has one and the spans join (two disjoint spans claim
 nothing, because one window is a validity claim over its whole range).
 
+## A second trie in the same object
+
+One object holds one value type, because a reader has to know what a value is before it
+touches the body. A profile that needs a second table with other values (prefix to path
+attributes, prefix to a first-seen time) puts it in a section of its own:
+
+```rust
+use bgpkit_snap::profile::TrieSection;
+use bgpkit_snap::ExtraSection;
+
+let mut side = TrieSection::<FirstSeen>::new();
+side.insert("10.0.0.0/8".parse()?, FirstSeen(1_763_164_800))?;
+let body = side.to_bytes()?;
+
+let extras = [ExtraSection { id: 16, kind: *b"SEEN", required: false, bytes: &body }];
+let bytes = w.finish(&Opts { created_at: 1_763_164_800, stream: None, window: None, extras: &extras })?;
+
+// later, on the reading side
+let seen = snap.section_trie::<FirstSeen>(16)?.expect("the section exists");
+let (prefix, first) = seen.lpm("10.1.2.3/32".parse()?)?;
+```
+
+The same queries as the main trie are there: `len`, `get_exact`, `lpm`, `iter`. The body
+records the value type id, so reading a section as the wrong type is `ConfigMismatch`
+instead of a reinterpretation of its bytes.
+
 ## Journals
 
-A journal is a directory: `state.json`, segments, checkpoints, `writer.lock`, and
-`current.snap` (a link to the newest checkpoint).
+A journal is a log of changes over **one object**. It is never a tree of its own: it
+starts from a base object, records what changed, and folds base plus log into the next
+object when you checkpoint. The directory holds `state.json`, segments, checkpoints,
+`writer.lock`, and `current.snap` (a link to the newest checkpoint).
 
 ```rust
 use bgpkit_snap::journal::Journal;
-use bgpkit_snap::TreeId;
 
-let tree = TreeId::from_name("peers");          // the same name is the same journal
-let mut j: Journal<PeerCount> = Journal::open("peers.journal", tree)?;
-j.insert("10.0.0.0/8".parse()?, PeerCount(3))?;  // buffered
-j.sync()?;                                       // durable from here
-let path = j.checkpoint(&Opts::now())?;           // snapshot + prune, verified first
+// `table.snap` is the object this log keeps current
+let mut j: Journal<PeerCount> = Journal::attach("table.snap", "table.journal")?;
+j.insert("10.0.0.0/8".parse()?, PeerCount(3))?;   // buffered
+j.sync()?;                                        // durable from here
 println!("{} entries, next sequence {}", j.len(), j.seq());
+let next = j.checkpoint(&Opts::now())?;           // base + log, verified first
 ```
+
+Three ways in, one meaning each:
+
+- `Journal::attach(base, dir)` adopts an existing object. The base is recorded by content
+  id; until the first checkpoint the journal cannot be opened without it, and a base
+  that was replaced is `Error::BaseLost` rather than silently adopted.
+- `Journal::open(dir)` reopens a journal that exists.
+- `Journal::start(dir, tree_id)` is the empty-base case, for a stream that has no object
+  yet. Calling it on a directory that already holds a journal resumes it, so a service
+  can call it on every start; a different tree id is refused.
 
 - `insert` returns the sequence number the record got; `seq()` is the next one.
 - `sync` is the durability point. A record that was never synced may be lost after a
@@ -170,8 +209,9 @@ println!("{} entries, next sequence {}", j.len(), j.seq());
   second writer on one directory gets `Error::Locked` rather than a corrupted log.
 
 Payload sections (values that point into a blob arena) are supported:
-`Journal::options(dir, tree).payload(section).open()`, and the section has to match the
-directory exactly or the open is refused. `insert_with_blob` and `blobs()` are on the
+`Journal::options(dir).attach(base).payload(section).open()` (or `.start(tree)` for an
+empty base), and the section has to match the base or the directory exactly or the open
+is refused. `insert_with_blob` and `blobs()` are on the
 journal, `section_bytes` and `payload_arena` on the snapshot.
 
 If `state.json` is lost, `Journal::repair(dir, tree, payload)` rebuilds it from the

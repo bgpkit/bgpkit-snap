@@ -37,6 +37,7 @@ use std::io::Write;
 
 pub mod header;
 pub mod journal;
+pub mod profile;
 
 pub use header::{
     Entry, Header, StreamRef, ENTRY_LEN, FLAG_STREAM, FLAG_WINDOW, HEADER_LEN, ID_V4, ID_V6,

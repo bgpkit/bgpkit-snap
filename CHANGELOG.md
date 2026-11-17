@@ -2,6 +2,53 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.2.0 - 2026-11-17
+
+The release that makes a journal a log over one object, and makes a value type one
+attribute. Nothing depends on the 0.1 interface yet, so both breaks are taken now
+rather than carried.
+
+Journal (breaking)
+
+- `Journal::attach(base, dir)` adopts an existing object as the base of the log, and
+  `Journal::open(dir)` reopens. `Journal::start(dir, tree_id)` is the empty-base case
+  and resumes a directory that already holds a journal, so a service calls it on every
+  start.
+- The base is recorded by content id. Before the first checkpoint the tree is the base
+  plus the replayed records, and a base that is missing or was replaced is
+  `Error::BaseLost`. After the first checkpoint the tree comes from that checkpoint and
+  the base is provenance.
+- `Journal::open(dir, tree_id)`, `Journal::create` and the `tree_id` argument on
+  `Journal::options` are gone. Identity comes from the base: a plain object's tree id is
+  derived from its content id, a checkpoint keeps the id of the stream it belongs to.
+- `Journal::base()`, `Journal::last_checkpoint()` and `journal::recorded_type_id(dir)`
+  exist so a tool can report what a directory is without opening it as a value type.
+
+CLI (breaking)
+
+- `fold` is removed. The journal's product is the checkpoint it writes itself.
+- New: `journal init <base.snap> <dir>`, `journal append <dir> <records.jsonl>`,
+  `journal checkpoint <dir>`, `journal status <dir>`, all with `--json`. Append takes
+  `{"prefix": .., "value": n}` to insert and `{"prefix": .., "withdraw": true}` to
+  remove; the value type comes from the directory, not a flag.
+
+Value types
+
+- `#[snap_value("id")]` is the one-attribute form: the id is positional, `Clone` is
+  derived unless the caller already derives it, and `rkyv(...)` options pass through.
+  `#[derive(SnapValue)]` remains for a type that already derives `rkyv` itself.
+- the attribute refuses a type that already derives `rkyv`'s traits, naming both ways
+  out, and refuses `rkyv(crate = ...)`, which it sets itself.
+
+A second trie with its own value type
+
+- `profile::TrieSection<U>` builds the body of a profile section holding a trie of
+  another value type, and `Snapshot::section_trie::<U>(id)` returns a queryable view
+  (`len`, `get_exact`, `lpm`, `iter`) whose values come back by value. The body records
+  the value type id, so a section read as the wrong type is `ConfigMismatch` rather than
+  reinterpreted bytes, and both archives are 16-byte aligned because an unaligned rkyv
+  archive is not valid.
+
 ## v0.1.0 - 2026-11-17
 
 The first version under the pre-stable numbering. The crate moved from `1.0.0-rc.4` to

@@ -169,10 +169,17 @@ sections         packed in ascending id order, 16-byte aligned
 
 ## Journal
 
+A journal is a log of changes over **one object**, never a tree of its own.
+`Journal::attach("table.snap", "table.journal")` adopts that object as the base,
+`insert`/`withdraw` record what changed since, and `checkpoint` folds base plus log into
+the next object. `Journal::start(dir, tree_id)` is the empty-base case for a stream that
+has no object yet.
+
 ```text
+base       the object the log is attached to, recorded by content id in state.json
 segments   segment-<12-digit index>.log, 48-byte header with tree_id + generation,
            length + crc32c framed records, dense sequence numbers
-state      state.json: next sequence, identity, and the checkpoint it belongs to
+state      state.json: next sequence, identity, the base, and the checkpoint it belongs to
 checkpoint `snapshot-<seq>-<n>.snap`, verified against the live tree before it is named
 ```
 
