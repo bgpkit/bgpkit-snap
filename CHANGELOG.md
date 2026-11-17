@@ -39,8 +39,15 @@ API
   could not tell "no entries in this family" from "this family is covered end to end"
   (`::/0` covers 2^128 addresses, which does not fit in the count). `Count` prints
   (`all`, `0`, the number) and `Count::exact()` gives the number when there is one.
-- `Journal::seq()`: the sequence the next record will carry, so a caller shipping
-  records elsewhere can say how far the journal has got.
+- `#[derive(SnapValue)]` from the new `bgpkit-snap-derive` crate (feature
+  `derive`): `#[snap(type_id = "...")]` replaces the hand-written `impl`, and the
+  id is checked where it is written rather than when an object is finished.
+- `Journal::seq()` and `Journal::generation()`: the sequence the next record will
+  carry and the stream incarnation, so a caller shipping records elsewhere can say
+  how far the journal has got and which stream wrote it.
+- a journal's value type is now pinned by its first record, not by its first sync: a
+  directory whose records were never synced had no `state.json`, so a reader of
+  another type could open it and decode those bytes as its own.
 - `Snapshot::lpm` takes a prefix and `Snapshot::search` takes an address; both are
   documented as the same lookup, one with the host prefix built for you.
 - `Journal::open(dir, tree)` and `open_with_payload(dir, tree, payload)` replace the
@@ -181,6 +188,11 @@ Library and tooling
   `snap.u64:v1` as well as `snap.u32:v1` (`--value u64`), and `search` on an object
   whose value type belongs to another program names that type and both ways out
   instead of only reporting a mismatch.
+- `snap journal info|insert|sync|checkpoint`: the writable half of the format from a
+  shell, so a program that keeps a live table needs no Rust. Every command answers in
+  JSON with `--json`.
+- `docs/usage.md`: the whole crate and CLI in one place, including the JSON fields and
+  exit codes a caller programs against.
 
 Review
 

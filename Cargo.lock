@@ -83,6 +83,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "bgpkit-snap"
 version = "0.1.0"
 dependencies = [
+ "bgpkit-snap-derive",
  "blake3",
  "chrono",
  "clap",
@@ -93,6 +94,15 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bgpkit-snap-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

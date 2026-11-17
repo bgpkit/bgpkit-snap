@@ -604,6 +604,28 @@ fn a_count_prints_and_converts() {
 }
 
 #[test]
+fn the_first_record_pins_the_value_type() {
+    // a journal whose records were never synced had no state.json, so a reader of
+    // another value type could open it and decode u64 bytes as its own type
+    let d = dir("type-pinned");
+    let tree = TreeId::from_name("type-pinned");
+    {
+        let mut j: Journal<u64> = Journal::open(&d, tree).unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), 7u64).unwrap();
+        // deliberately no sync: the record exists, the state has to exist with it
+    }
+    let err = match Journal::<V>::open(&d, tree) {
+        Ok(_) => panic!("another value type must not adopt this directory"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err}").contains("snap.u64:v1"),
+        "the refusal has to name what wrote it: {err}"
+    );
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
 fn a_journal_reports_the_next_sequence() {
     let d = dir("seq-accessor");
     let tree = TreeId::from_name("seq-accessor");

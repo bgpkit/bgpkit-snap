@@ -10,7 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use bgpkit_snap::{header::HEADER_LEN, Header, Snapshot, Writer};
+use bgpkit_snap::journal::Journal;
+use bgpkit_snap::{header::HEADER_LEN, Header, Opts, SnapValue, Snapshot, TreeId, Writer};
 use clap::{Parser, Subcommand, ValueEnum};
 use ipnet::IpNet;
 
@@ -65,6 +66,58 @@ enum Cmd {
     Verify { file: String },
     /// Longest-prefix match for an address or prefix, in a u32 or u64 object
     Search { file: String, query: String },
+    /// Read and append to a journal directory
+    Journal {
+        #[command(subcommand)]
+        cmd: JournalCmd,
+    },
+}
+
+/// The four calls a program that keeps a live table needs.
+#[derive(Subcommand)]
+enum JournalCmd {
+    /// What the directory holds: entries, next sequence, value type
+    Info {
+        dir: String,
+        /// Tree name; the journal id is its hash, so the same name is the same journal
+        #[arg(long, default_value = "snap")]
+        tree: String,
+        /// Value type this binary opens the journal with
+        #[arg(long, value_enum, default_value = "u32")]
+        value_type: ValueType,
+    },
+    /// Append one record and optionally make it durable
+    Insert {
+        dir: String,
+        #[arg(long)]
+        prefix: String,
+        #[arg(long)]
+        value: u64,
+        #[arg(long, default_value = "snap")]
+        tree: String,
+        /// Value type the journal stores
+        #[arg(long, value_enum, default_value = "u32")]
+        value_type: ValueType,
+        /// fsync the record before returning
+        #[arg(long)]
+        sync: bool,
+    },
+    /// Make every appended record durable
+    Sync {
+        dir: String,
+        #[arg(long, default_value = "snap")]
+        tree: String,
+        #[arg(long, value_enum, default_value = "u32")]
+        value_type: ValueType,
+    },
+    /// Write a checkpoint and prune what it covers
+    Checkpoint {
+        dir: String,
+        #[arg(long, default_value = "snap")]
+        tree: String,
+        #[arg(long, value_enum, default_value = "u32")]
+        value_type: ValueType,
+    },
 }
 
 fn main() {
@@ -99,6 +152,10 @@ fn main() {
             Err(e) => fail(&format!("{e}")),
         },
         Cmd::Search { file, query } => match search(&file, &query, json) {
+            Ok(()) => {}
+            Err(e) => fail(&format!("{e}")),
+        },
+        Cmd::Journal { cmd } => match journal(cmd, json) {
             Ok(()) => {}
             Err(e) => fail(&format!("{e}")),
         },
@@ -345,6 +402,170 @@ fn search(file: &str, query: &str, json: bool) -> Result<(), Box<dyn std::error:
             } else {
                 println!("no match");
             }
+        }
+    }
+    Ok(())
+}
+
+/// Read and append to a journal directory. A journal is the writable half of the
+/// format, so a program that keeps a live table needs these four calls and nothing
+/// else, and `--json` makes each of them one object.
+fn journal(cmd: JournalCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (dir, tree, ty) = match &cmd {
+        JournalCmd::Info {
+            dir,
+            tree,
+            value_type,
+        } => (dir.clone(), tree.clone(), *value_type),
+        JournalCmd::Insert {
+            dir,
+            tree,
+            value_type,
+            ..
+        } => (dir.clone(), tree.clone(), *value_type),
+        JournalCmd::Sync {
+            dir,
+            tree,
+            value_type,
+        } => (dir.clone(), tree.clone(), *value_type),
+        JournalCmd::Checkpoint {
+            dir,
+            tree,
+            value_type,
+        } => (dir.clone(), tree.clone(), *value_type),
+    };
+
+    // declared here rather than inside the match arm: a macro body resolves names where
+    // it is defined, so an arm-local would not be visible to it. Only the insert path
+    // assigns them.
+    let prefix: IpNet;
+    let value: u64;
+    let sync: bool;
+
+    // the value type is part of the directory, so the width is a run-time choice: each
+    // command writes its body once here and the macro expands it for u32 and u64
+    macro_rules! info {
+        ($t:ty) => {{
+            let j: Journal<$t> = Journal::open(&dir, TreeId::from_name(&tree))?;
+            let out = serde_json::json!({
+                "dir": dir,
+                "tree": tree,
+                "entries": j.len(),
+                "seq": j.seq(),
+                "type_id": <$t as SnapValue>::TYPE_ID,
+                "generation": bgpkit_snap::header::hex16(&j.generation()),
+            });
+            drop(j);
+            out
+        }};
+    }
+    macro_rules! insert {
+        ($t:ty) => {{
+            let record: $t = value.try_into().map_err(|_| {
+                std::io::Error::other(format!("{value} does not fit in {}", stringify!($t)))
+            })?;
+            let mut j: Journal<$t> = Journal::open(&dir, TreeId::from_name(&tree))?;
+            let seq = j.insert(prefix, record)?;
+            if sync {
+                j.sync()?;
+            }
+            let out = serde_json::json!({
+                "dir": dir,
+                "tree": tree,
+                "seq": seq,
+                "entries": j.len(),
+                "synced": sync,
+                "type_id": <$t as SnapValue>::TYPE_ID,
+            });
+            drop(j);
+            out
+        }};
+    }
+    macro_rules! sync_now {
+        ($t:ty) => {{
+            let mut j: Journal<$t> = Journal::open(&dir, TreeId::from_name(&tree))?;
+            j.sync()?;
+            let out = serde_json::json!({
+                "dir": dir,
+                "tree": tree,
+                "seq": j.seq(),
+                "entries": j.len(),
+                "type_id": <$t as SnapValue>::TYPE_ID,
+            });
+            drop(j);
+            out
+        }};
+    }
+    macro_rules! checkpoint {
+        ($t:ty) => {{
+            let mut j: Journal<$t> = Journal::open(&dir, TreeId::from_name(&tree))?;
+            let path = j.checkpoint(&Opts::now())?;
+            let out = serde_json::json!({
+                "dir": dir,
+                "tree": tree,
+                "file": path.file_name().map(|n| n.to_string_lossy().into_owned()),
+                "entries": j.len(),
+                "seq": j.seq(),
+                "type_id": <$t as SnapValue>::TYPE_ID,
+            });
+            drop(j);
+            out
+        }};
+    }
+    macro_rules! both {
+        ($body:ident) => {
+            match ty {
+                ValueType::U32 => $body!(u32),
+                ValueType::U64 => $body!(u64),
+            }
+        };
+    }
+
+    let out = match &cmd {
+        JournalCmd::Info { .. } => both!(info),
+        JournalCmd::Insert {
+            prefix: p,
+            value: v,
+            sync: s,
+            ..
+        } => {
+            prefix = p
+                .parse()
+                .map_err(|e: ipnet::AddrParseError| std::io::Error::other(e.to_string()))?;
+            value = *v;
+            sync = *s;
+            both!(insert)
+        }
+        JournalCmd::Sync { .. } => both!(sync_now),
+        JournalCmd::Checkpoint { .. } => both!(checkpoint),
+    };
+
+    if json {
+        println!("{out}");
+        return Ok(());
+    }
+    match &cmd {
+        JournalCmd::Info { .. } => {
+            println!("entries    {}", out["entries"]);
+            println!("next seq   {}", out["seq"]);
+            println!("type       {}", out["type_id"].as_str().unwrap_or(""));
+            println!("generation {}", out["generation"].as_str().unwrap_or(""));
+        }
+        JournalCmd::Insert { .. } => println!(
+            "record {} seq {}{}",
+            out["entries"],
+            out["seq"],
+            if out["synced"] == true {
+                " (durable)"
+            } else {
+                ""
+            }
+        ),
+        JournalCmd::Sync { .. } => {
+            println!("durable at seq {} ({} entries)", out["seq"], out["entries"])
+        }
+        JournalCmd::Checkpoint { .. } => {
+            println!("checkpoint {}", out["file"].as_str().unwrap_or(""))
         }
     }
     Ok(())

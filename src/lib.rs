@@ -231,6 +231,12 @@ pub struct AddressCounts {
 
 // ---------------------------------------------------------------- values
 
+/// The derive, re-exported so a caller writes `bgpkit_snap::SnapValue` for both the
+/// trait and `#[derive(SnapValue)]`. The macro lives in a namespace of its own, so the
+/// name is not taken twice.
+#[cfg(feature = "derive")]
+pub use bgpkit_snap_derive::SnapValue;
+
 /// A value type that can live in a trie.
 pub trait SnapValue: rkyv::Archive + Clone + for<'a> rkyv::Serialize<HighSer<'a>> {
     /// Stable identifier, e.g. `snap.u32:v1`.

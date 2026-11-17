@@ -142,6 +142,10 @@ pub struct Journal<T: Codec> {
     checkpoints: u64,
     seq: u64,
     base_seq: u64,
+    /// Whether `state.json` has been written for this directory in this session. The
+    /// first record writes it, so the value type is pinned from the first byte: without
+    /// it a reader of another type could decode these records as its own.
+    state_written: bool,
     v4: PrefixMap<ipnet::Ipv4Net, T>,
     v6: PrefixMap<ipnet::Ipv6Net, T>,
     blob: Vec<u8>,
@@ -307,6 +311,7 @@ where
             checkpoints: 0,
             seq: 1,
             base_seq: 0,
+            state_written: state.is_some(),
             v4: PrefixMap::new(),
             v6: PrefixMap::new(),
             blob: Vec::new(),
@@ -834,6 +839,11 @@ where
         }
         seg.bytes += 8 + payload.len() as u64;
         self.seq = next_seq;
+        if !self.state_written {
+            // the identity of the directory has to exist before a second session can
+            // read this record: a reader of another value type would decode it as its own
+            self.persist_state()?;
+        }
         Ok(seq)
     }
 
@@ -994,6 +1004,11 @@ where
                 return Err(Error::Io(e));
             }
         }
+        self.persist_state()
+    }
+
+    /// Write `state.json`, which is what tells a reader what wrote this directory.
+    fn persist_state(&mut self) -> Result<(), Error> {
         let (type_id, payload) = self.config();
         let state = State {
             next_seq: self.seq,
@@ -1004,6 +1019,7 @@ where
             payload,
         };
         write_state(&self.dir, &state)?;
+        self.state_written = true;
         Ok(())
     }
 
@@ -1295,6 +1311,14 @@ where
     /// process's.
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// The stream incarnation this journal writes under.
+    ///
+    /// It is minted on first use and reused from then on, so a reader can tell a
+    /// continued stream from a new one that happens to share the tree.
+    pub fn generation(&self) -> [u8; 16] {
+        self.generation
     }
 }
 

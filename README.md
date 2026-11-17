@@ -136,7 +136,9 @@ that value needs the program that defines it.
 
 ## The format
 
-The normative contract is [`docs/format.md`](docs/format.md). Short version:
+The normative contract is [`docs/format.md`](docs/format.md); how to use the crate and
+the CLI, including the JSON shapes an agent reads, is
+[`docs/usage.md`](docs/usage.md). Short version:
 
 ```text
 header (192 B)   magic, version, flags, tree_id, generation, base_seq,
