@@ -168,6 +168,55 @@ The same queries as the main trie are there: `len`, `get_exact`, `lpm`, `iter`. 
 records the value type id, so reading a section as the wrong type is `ConfigMismatch`
 instead of a reinterpretation of its bytes.
 
+## Verification
+
+Three layers, cheapest first. Each answers a different question, and the SDK exposes
+all three so a service can verify as part of its own startup instead of shelling out.
+
+```rust
+use bgpkit_snap::{recorded_counts, Snapshot, verify_bytes};
+
+let raw = std::fs::read("table.snap")?;
+
+// layer 1: no value type. Header, CRC, layout, section table, content id.
+let header = verify_bytes(&raw)?;
+println!("{}: {} sections, {} bytes", header.type_id_str(), header.section_count, header.file_len);
+
+// layer 2: with your type. Adds the type check and rkyv bytecheck of both tries.
+let snap: Snapshot<Origin> = Snapshot::from_bytes(&raw)?;
+
+// layer 3: decode every value and compare with the count the writer recorded.
+if let Some(counted) = recorded_counts(&raw)? {
+    assert_eq!(counted.entries, snap.len() as u64);
+}
+```
+
+What the content id covers: BLAKE3 over `"bgpkit-snap-v4\0"`, header bytes `0..148`
+(flags, tree id, generation, base sequence, type id, layout fields, coverage window), the
+section table, and every section body. It does **not** cover `created_at`, the content id
+field itself, the header CRC, or the alignment padding between sections.
+
+What each layer refuses:
+
+- container: wrong magic or version, a header field out of range, a header CRC mismatch,
+  a file shorter than its layout claims, section ids out of order, a kind that disagrees
+  with its id, non-zero padding, a length that runs past the end, extra bytes after the
+  last section, and any byte changed in a hashed region (`Error::ContentId`).
+- typed: everything above, plus a different `TYPE_ID` (`Error::TypeMismatch`), a required
+  section this reader does not implement (`UnknownRequiredSection`), and a trie body that
+  is not a valid archive of `T` (`BadArchive`).
+- content: a body that decodes to a different number of entries than the object records.
+
+What verification does not prove: that the data is true, who produced it (the format has
+no signature), or its provenance (`created_at` and `window` are outside the content id, so
+a re-dated copy keeps the same id). For a value type other than the integers this crate
+implements, `bgpkit-snap verify` stops at the container layer and says so; the typed layer
+runs in the program that declares the type.
+
+A journal verifies itself as it opens: each record carries a CRC32C and a dense sequence
+number, so a hole or a torn frame is an error rather than a shorter tree, and a checkpoint
+is verified against the live tree before `state.json` names it.
+
 ## Journals
 
 A journal is a log of changes over **one object**. It is never a tree of its own: it
