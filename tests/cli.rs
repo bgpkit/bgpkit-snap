@@ -225,83 +225,88 @@ fn a_foreign_value_type_says_what_to_do() {
 }
 
 #[test]
-fn a_journal_round_trips_through_the_cli() {
-    // the writable half of the format, for a program that keeps a live table: insert,
-    // read the state back, checkpoint, read again
-    let d = dir("journal");
+fn a_journal_folds_into_one_object() {
+    // writing a journal is the application's job; what a caller needs from the CLI is
+    // the readable object, and folding is one call
+    #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct PeerCount(u32);
+    impl bgpkit_snap::SnapValue for PeerCount {
+        const TYPE_ID: &str = "snap.u32:v1";
+    }
+
+    let d = dir("fold");
     let log = d.join("journal");
-    let log_s = log.to_str().unwrap();
+    {
+        let mut j: bgpkit_snap::journal::Journal<PeerCount> =
+            bgpkit_snap::journal::Journal::open(&log, bgpkit_snap::TreeId::from_name("snap"))
+                .unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), PeerCount(7))
+            .unwrap();
+        j.insert("192.0.2.0/24".parse().unwrap(), PeerCount(9))
+            .unwrap();
+        j.sync().unwrap();
+    }
 
-    let inserted = Command::new(bin())
-        .args(["--json", "journal", "insert", log_s])
-        .args(["--prefix", "10.0.0.0/8", "--value", "7", "--sync"])
+    let out = d.join("folded.snap");
+    let folded = Command::new(bin())
+        .args(["--json", "fold"])
+        .arg(&log)
+        .arg("--out")
+        .arg(&out)
         .output()
         .unwrap();
     assert!(
-        inserted.status.success(),
-        "insert failed: {}",
-        String::from_utf8_lossy(&inserted.stderr)
+        folded.status.success(),
+        "fold failed: {}",
+        String::from_utf8_lossy(&folded.stderr)
     );
-    let inserted: serde_json::Value = serde_json::from_slice(&inserted.stdout).unwrap();
-    assert_eq!(inserted["seq"], 1);
-    assert_eq!(inserted["entries"], 1);
-    assert_eq!(inserted["type_id"], "snap.u32:v1");
+    let folded: serde_json::Value = serde_json::from_slice(&folded.stdout).unwrap();
+    assert_eq!(folded["entries"], 2);
+    assert_eq!(folded["seq"], 3);
+    assert_eq!(folded["type_id"], "snap.u32:v1");
 
-    let info = Command::new(bin())
-        .args(["--json", "journal", "info", log_s])
+    // the folded object is an ordinary snapshot
+    let hit = Command::new(bin())
+        .args(["--json", "search"])
+        .arg(&out)
+        .arg("10.1.2.3")
         .output()
         .unwrap();
-    let info: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
-    assert_eq!(info["entries"], 1);
-    assert_eq!(info["seq"], 2, "one record consumed one sequence");
-
-    let checkpoint = Command::new(bin())
-        .args(["--json", "journal", "checkpoint", log_s])
-        .output()
-        .unwrap();
-    let checkpoint: serde_json::Value = serde_json::from_slice(&checkpoint.stdout).unwrap();
-    let file = checkpoint["file"].as_str().expect("a checkpoint name");
-    assert!(log.join(file).exists(), "{file} was not written");
-
-    // a reader opens the stable path without touching the journal
-    let stable = log.join("current.snap");
-    let verified = Command::new(bin())
-        .arg("verify")
-        .arg(&stable)
-        .output()
-        .unwrap();
-    assert!(
-        verified.status.success(),
-        "current.snap does not verify: {}",
-        String::from_utf8_lossy(&verified.stderr)
-    );
+    let hit: serde_json::Value = serde_json::from_slice(&hit.stdout).unwrap();
+    assert_eq!(hit["match"]["prefix"], "10.0.0.0/8");
+    assert_eq!(hit["match"]["value"], 7);
     std::fs::remove_dir_all(&d).ok();
 }
 
 #[test]
-fn a_journal_of_another_value_type_names_it() {
-    let d = dir("journal-type");
+fn folding_with_the_wrong_value_type_names_the_journal() {
+    #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct Big(u64);
+    impl bgpkit_snap::SnapValue for Big {
+        const TYPE_ID: &str = "snap.u64:v1";
+    }
+
+    let d = dir("fold-type");
     let log = d.join("journal");
-    let log_s = log.to_str().unwrap();
-    let built = Command::new(bin())
-        .args(["journal", "insert", log_s])
-        .args(["--prefix", "10.0.0.0/8", "--value", "4294967296"])
-        .args(["--value-type", "u64"])
+    {
+        let mut j: bgpkit_snap::journal::Journal<Big> =
+            bgpkit_snap::journal::Journal::open(&log, bgpkit_snap::TreeId::from_name("snap"))
+                .unwrap();
+        j.insert("10.0.0.0/8".parse().unwrap(), Big(7)).unwrap();
+        j.sync().unwrap();
+    }
+    let folded = Command::new(bin())
+        .arg("fold")
+        .arg(&log)
+        .arg("--out")
+        .arg(d.join("x.snap"))
         .output()
         .unwrap();
     assert!(
-        built.status.success(),
-        "insert failed: {}",
-        String::from_utf8_lossy(&built.stderr)
+        !folded.status.success(),
+        "the default u32 must not fold u64"
     );
-
-    // the default is u32; opening a u64 journal has to say what wrote it
-    let wrong = Command::new(bin())
-        .args(["journal", "info", log_s])
-        .output()
-        .unwrap();
-    assert!(!wrong.status.success());
-    let err = String::from_utf8_lossy(&wrong.stderr);
+    let err = String::from_utf8_lossy(&folded.stderr);
     assert!(err.contains("snap.u64:v1"), "got {err}");
     std::fs::remove_dir_all(&d).ok();
 }

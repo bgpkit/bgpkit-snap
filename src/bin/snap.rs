@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use bgpkit_snap::journal::Journal;
-use bgpkit_snap::{header::HEADER_LEN, Header, Opts, SnapValue, Snapshot, TreeId, Writer};
+use bgpkit_snap::{header::HEADER_LEN, Header, Opts, Snapshot, TreeId, Writer};
 use clap::{Parser, Subcommand, ValueEnum};
 use ipnet::IpNet;
 
@@ -25,21 +25,33 @@ struct Cli {
     cmd: Cmd,
 }
 
-/// The value types this binary can decode. A caller's own `SnapValue` type needs the
-/// program that defines it; the two here are what `build` writes and `search` reads.
+/// The value types this binary can read and write: every integer width the crate
+/// implements. Anything else is a `SnapValue` type of the caller's, which only the
+/// program that declares it can decode, so the CLI says so by name and stops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ValueType {
+    U8,
+    U16,
     U32,
     U64,
+    U128,
 }
 
 impl ValueType {
     fn from_type_id(id: &str) -> Option<Self> {
         match id {
+            "snap.u8:v1" => Some(Self::U8),
+            "snap.u16:v1" => Some(Self::U16),
             "snap.u32:v1" => Some(Self::U32),
             "snap.u64:v1" => Some(Self::U64),
+            "snap.u128:v1" => Some(Self::U128),
             _ => None,
         }
+    }
+
+    /// What the CLI can do, for an error that has to name it.
+    fn supported() -> &'static str {
+        "snap.u8:v1, snap.u16:v1, snap.u32:v1, snap.u64:v1 and snap.u128:v1"
     }
 }
 
@@ -62,61 +74,25 @@ enum Cmd {
     },
     /// Print what the 192-byte header says
     Info { file: String },
-    /// Verify the container, and the bodies when the value type is u32 or u64
+    /// Verify the container, and the bodies when the value type is an integer
     Verify { file: String },
-    /// Longest-prefix match for an address or prefix, in a u32 or u64 object
+    /// Longest-prefix match for an address or prefix, in an integer-valued object
     Search { file: String, query: String },
-    /// Read and append to a journal directory
-    Journal {
-        #[command(subcommand)]
-        cmd: JournalCmd,
-    },
-}
-
-/// The four calls a program that keeps a live table needs.
-#[derive(Subcommand)]
-enum JournalCmd {
-    /// What the directory holds: entries, next sequence, value type
-    Info {
+    /// Fold a journal directory into one snapshot object
+    Fold {
+        /// The journal directory
         dir: String,
-        /// Tree name; the journal id is its hash, so the same name is the same journal
-        #[arg(long, default_value = "snap")]
-        tree: String,
-        /// Value type this binary opens the journal with
-        #[arg(long, value_enum, default_value = "u32")]
-        value_type: ValueType,
-    },
-    /// Append one record and optionally make it durable
-    Insert {
-        dir: String,
-        #[arg(long)]
-        prefix: String,
-        #[arg(long)]
-        value: u64,
+        #[arg(short, long)]
+        out: String,
+        /// Tree name the journal was opened with
         #[arg(long, default_value = "snap")]
         tree: String,
         /// Value type the journal stores
         #[arg(long, value_enum, default_value = "u32")]
         value_type: ValueType,
-        /// fsync the record before returning
+        /// unix seconds UTC for the object; defaults to now
         #[arg(long)]
-        sync: bool,
-    },
-    /// Make every appended record durable
-    Sync {
-        dir: String,
-        #[arg(long, default_value = "snap")]
-        tree: String,
-        #[arg(long, value_enum, default_value = "u32")]
-        value_type: ValueType,
-    },
-    /// Write a checkpoint and prune what it covers
-    Checkpoint {
-        dir: String,
-        #[arg(long, default_value = "snap")]
-        tree: String,
-        #[arg(long, value_enum, default_value = "u32")]
-        value_type: ValueType,
+        created_at: Option<i64>,
     },
 }
 
@@ -155,7 +131,13 @@ fn main() {
             Ok(()) => {}
             Err(e) => fail(&format!("{e}")),
         },
-        Cmd::Journal { cmd } => match journal(cmd, json) {
+        Cmd::Fold {
+            dir,
+            out,
+            tree,
+            value_type,
+            created_at,
+        } => match fold(&dir, &out, &tree, value_type, created_at, json) {
             Ok(()) => {}
             Err(e) => fail(&format!("{e}")),
         },
@@ -214,8 +196,11 @@ fn build(
         }};
     }
     Ok(match value {
+        ValueType::U8 => build_with!(u8),
+        ValueType::U16 => build_with!(u16),
         ValueType::U32 => build_with!(u32),
         ValueType::U64 => build_with!(u64),
+        ValueType::U128 => build_with!(u128),
     })
 }
 
@@ -313,8 +298,11 @@ fn verify(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let header = bgpkit_snap::verify_bytes(&raw)?;
     let typed = ValueType::from_type_id(&header.type_id_str());
     let entries = match typed {
+        Some(ValueType::U8) => Some(Snapshot::<u8>::from_bytes(&raw)?.len()),
+        Some(ValueType::U16) => Some(Snapshot::<u16>::from_bytes(&raw)?.len()),
         Some(ValueType::U32) => Some(Snapshot::<u32>::from_bytes(&raw)?.len()),
         Some(ValueType::U64) => Some(Snapshot::<u64>::from_bytes(&raw)?.len()),
+        Some(ValueType::U128) => Some(Snapshot::<u128>::from_bytes(&raw)?.len()),
         None => None,
     };
     if json {
@@ -347,11 +335,11 @@ fn search(file: &str, query: &str, json: bool) -> Result<(), Box<dyn std::error:
         // say what the object holds and both ways out: a caller who meant to query
         // their own type needs the program that declares it, not a hex dump
         return Err(std::io::Error::other(format!(
-            "this object holds {}, which `snap search` cannot decode; it decodes \
-             snap.u32:v1 and snap.u64:v1. Query it from a program that defines that \
-             SnapValue type (`Snapshot::open` in the developer guide), or rebuild it \
-             with `snap build --value u32`",
-            header.type_id_str()
+            "this object holds {}, which `snap search` cannot decode; it decodes {}. \
+             Query it from a program that defines that SnapValue type (`Snapshot::open` \
+             in the developer guide), or rebuild it with `snap build --value u32`",
+            header.type_id_str(),
+            ValueType::supported()
         ))
         .into());
     };
@@ -375,8 +363,11 @@ fn search(file: &str, query: &str, json: bool) -> Result<(), Box<dyn std::error:
         }};
     }
     let hit = match ty {
+        ValueType::U8 => find!(u8),
+        ValueType::U16 => find!(u16),
         ValueType::U32 => find!(u32),
         ValueType::U64 => find!(u64),
+        ValueType::U128 => find!(u128),
     };
     match hit {
         Some((prefix, value)) => {
@@ -407,168 +398,93 @@ fn search(file: &str, query: &str, json: bool) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-/// Read and append to a journal directory. A journal is the writable half of the
-/// format, so a program that keeps a live table needs these four calls and nothing
-/// else, and `--json` makes each of them one object.
-fn journal(cmd: JournalCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (dir, tree, ty) = match &cmd {
-        JournalCmd::Info {
-            dir,
-            tree,
-            value_type,
-        } => (dir.clone(), tree.clone(), *value_type),
-        JournalCmd::Insert {
-            dir,
-            tree,
-            value_type,
-            ..
-        } => (dir.clone(), tree.clone(), *value_type),
-        JournalCmd::Sync {
-            dir,
-            tree,
-            value_type,
-        } => (dir.clone(), tree.clone(), *value_type),
-        JournalCmd::Checkpoint {
-            dir,
-            tree,
-            value_type,
-        } => (dir.clone(), tree.clone(), *value_type),
+/// Turn a journal into one object. Writing a journal is the application's job; what a
+/// caller needs from the CLI is the readable, distributable result.
+fn fold(
+    dir: &str,
+    out: &str,
+    tree: &str,
+    value_type: ValueType,
+    created_at: Option<i64>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let opts = Opts {
+        created_at: created_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        stream: None,
+        window: None,
+        extras: &[],
     };
-
-    // declared here rather than inside the match arm: a macro body resolves names where
-    // it is defined, so an arm-local would not be visible to it. Only the insert path
-    // assigns them.
-    let prefix: IpNet;
-    let value: u64;
-    let sync: bool;
-
-    // the value type is part of the directory, so the width is a run-time choice: each
-    // command writes its body once here and the macro expands it for u32 and u64
-    macro_rules! info {
+    // the journal's value type decides the width, and the flag has to match it
+    macro_rules! fold_as {
         ($t:ty) => {{
-            let j: Journal<$t> = Journal::open(&dir, TreeId::from_name(&tree))?;
-            let out = serde_json::json!({
-                "dir": dir,
-                "tree": tree,
-                "entries": j.len(),
-                "seq": j.seq(),
-                "type_id": <$t as SnapValue>::TYPE_ID,
-                "generation": bgpkit_snap::header::hex16(&j.generation()),
-            });
+            let j: Journal<$t> = Journal::open(dir, TreeId::from_name(tree))?;
+            let entries = j.len();
+            let seq = j.seq();
+            let bytes = j.to_bytes(&opts)?;
             drop(j);
-            out
+            (entries, seq, bytes)
         }};
     }
-    macro_rules! insert {
-        ($t:ty) => {{
-            let record: $t = value.try_into().map_err(|_| {
-                std::io::Error::other(format!("{value} does not fit in {}", stringify!($t)))
-            })?;
-            let mut j: Journal<$t> = Journal::open(&dir, TreeId::from_name(&tree))?;
-            let seq = j.insert(prefix, record)?;
-            if sync {
-                j.sync()?;
-            }
-            let out = serde_json::json!({
-                "dir": dir,
-                "tree": tree,
-                "seq": seq,
-                "entries": j.len(),
-                "synced": sync,
-                "type_id": <$t as SnapValue>::TYPE_ID,
-            });
-            drop(j);
-            out
-        }};
-    }
-    macro_rules! sync_now {
-        ($t:ty) => {{
-            let mut j: Journal<$t> = Journal::open(&dir, TreeId::from_name(&tree))?;
-            j.sync()?;
-            let out = serde_json::json!({
-                "dir": dir,
-                "tree": tree,
-                "seq": j.seq(),
-                "entries": j.len(),
-                "type_id": <$t as SnapValue>::TYPE_ID,
-            });
-            drop(j);
-            out
-        }};
-    }
-    macro_rules! checkpoint {
-        ($t:ty) => {{
-            let mut j: Journal<$t> = Journal::open(&dir, TreeId::from_name(&tree))?;
-            let path = j.checkpoint(&Opts::now())?;
-            let out = serde_json::json!({
-                "dir": dir,
-                "tree": tree,
-                "file": path.file_name().map(|n| n.to_string_lossy().into_owned()),
-                "entries": j.len(),
-                "seq": j.seq(),
-                "type_id": <$t as SnapValue>::TYPE_ID,
-            });
-            drop(j);
-            out
-        }};
-    }
-    macro_rules! both {
-        ($body:ident) => {
-            match ty {
-                ValueType::U32 => $body!(u32),
-                ValueType::U64 => $body!(u64),
-            }
-        };
-    }
-
-    let out = match &cmd {
-        JournalCmd::Info { .. } => both!(info),
-        JournalCmd::Insert {
-            prefix: p,
-            value: v,
-            sync: s,
-            ..
-        } => {
-            prefix = p
-                .parse()
-                .map_err(|e: ipnet::AddrParseError| std::io::Error::other(e.to_string()))?;
-            value = *v;
-            sync = *s;
-            both!(insert)
-        }
-        JournalCmd::Sync { .. } => both!(sync_now),
-        JournalCmd::Checkpoint { .. } => both!(checkpoint),
+    let (entries, seq, bytes) = match value_type {
+        ValueType::U8 => fold_as!(u8),
+        ValueType::U16 => fold_as!(u16),
+        ValueType::U32 => fold_as!(u32),
+        ValueType::U64 => fold_as!(u64),
+        ValueType::U128 => fold_as!(u128),
     };
-
+    let target = resolve_symlink(Path::new(out));
+    write_object_atomically(&target, &bytes)?;
     if json {
-        println!("{out}");
-        return Ok(());
-    }
-    match &cmd {
-        JournalCmd::Info { .. } => {
-            println!("entries    {}", out["entries"]);
-            println!("next seq   {}", out["seq"]);
-            println!("type       {}", out["type_id"].as_str().unwrap_or(""));
-            println!("generation {}", out["generation"].as_str().unwrap_or(""));
-        }
-        JournalCmd::Insert { .. } => println!(
-            "record {} seq {}{}",
-            out["entries"],
-            out["seq"],
-            if out["synced"] == true {
-                " (durable)"
-            } else {
-                ""
-            }
-        ),
-        JournalCmd::Sync { .. } => {
-            println!("durable at seq {} ({} entries)", out["seq"], out["entries"])
-        }
-        JournalCmd::Checkpoint { .. } => {
-            println!("checkpoint {}", out["file"].as_str().unwrap_or(""))
-        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "journal": dir,
+                "out": out,
+                "entries": entries,
+                "seq": seq,
+                "type_id": type_id_of(value_type),
+                "bytes": bytes.len(),
+            })
+        );
+    } else {
+        println!(
+            "folded {dir} into {out}: {entries} entries at seq {seq}, {} bytes",
+            bytes.len()
+        );
     }
     Ok(())
+}
+
+/// Write `bytes` beside `path` and rename, so a reader never sees a partial object and a
+/// failed write leaves whatever was already there.
+fn write_object_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("snap.{}.tmp", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The type id a width writes, for JSON output.
+fn type_id_of(ty: ValueType) -> &'static str {
+    match ty {
+        ValueType::U8 => "snap.u8:v1",
+        ValueType::U16 => "snap.u16:v1",
+        ValueType::U32 => "snap.u32:v1",
+        ValueType::U64 => "snap.u64:v1",
+        ValueType::U128 => "snap.u128:v1",
+    }
 }
 
 fn file_header(file: &str) -> Result<Header, Box<dyn std::error::Error>> {
@@ -593,10 +509,18 @@ fn parse_line(line: &str, value: ValueType) -> Result<(IpNet, u64), String> {
         .as_u64()
         .ok_or("\"value\" must be an unsigned integer")?;
     match value {
+        ValueType::U8 => u8::try_from(raw)
+            .map(|n| (prefix, n as u64))
+            .map_err(|_| format!("\"value\" {raw} does not fit in u8")),
+        ValueType::U16 => u16::try_from(raw)
+            .map(|n| (prefix, n as u64))
+            .map_err(|_| format!("\"value\" {raw} does not fit in u16")),
         ValueType::U32 => u32::try_from(raw)
             .map(|n| (prefix, n as u64))
             .map_err(|_| format!("\"value\" {raw} does not fit in u32")),
-        ValueType::U64 => Ok((prefix, raw)),
+        // a u128 object can be read and searched; `build` writes what its input can
+        // express, and a JSON integer here is a u64
+        ValueType::U64 | ValueType::U128 => Ok((prefix, raw)),
     }
 }
 

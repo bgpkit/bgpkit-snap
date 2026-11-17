@@ -188,9 +188,13 @@ Library and tooling
   `snap.u64:v1` as well as `snap.u32:v1` (`--value u64`), and `search` on an object
   whose value type belongs to another program names that type and both ways out
   instead of only reporting a mismatch.
-- `snap journal info|insert|sync|checkpoint`: the writable half of the format from a
-  shell, so a program that keeps a live table needs no Rust. Every command answers in
-  JSON with `--json`.
+- `snap fold <journal-dir> --out <file>`: read a journal and write the object its
+  records describe, atomically. Writing a journal is the application's job; the CLI's
+  job is the readable artifact, so there is one read-only command instead of a shell API
+  for `insert`/`sync`/`checkpoint`.
+- `u8`, `u16` and `u128` are value types as well (`snap.u8:v1`, `snap.u16:v1`,
+  `snap.u128:v1`), so an integer-valued table needs no type of its own and the CLI can
+  build, verify, search and fold all of them.
 - `docs/usage.md`: the whole crate and CLI in one place, including the JSON fields and
   exit codes a caller programs against.
 

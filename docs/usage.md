@@ -161,14 +161,11 @@ is not, because rewriting it would hide a gap.
 ## CLI
 
 ```
-snap build <in.jsonl> --out <file> [--value u32|u64] [--created-at T] [--window A,B]
+snap build <in.jsonl> --out <file> [--value u8|u16|u32|u64|u128] [--created-at T] [--window A,B]
 snap info <file>
 snap verify <file>
 snap search <file> <address-or-prefix>
-snap journal info <dir> [--tree NAME] [--value-type u32|u64]
-snap journal insert <dir> --prefix P --value N [--sync] [--tree NAME] [--value-type ...]
-snap journal sync <dir> [--tree NAME] [--value-type ...]
-snap journal checkpoint <dir> [--tree NAME] [--value-type ...]
+snap fold <journal-dir> --out <file> [--tree NAME] [--value-type u8|u16|u32|u64|u128]
 ```
 
 `build` reads one JSON object per line, `{"prefix": "10.0.0.0/8", "value": 7}`. A value
@@ -176,8 +173,23 @@ that is missing, not an unsigned integer, or too wide for the chosen type is an 
 with the line number; it never becomes zero.
 
 `info` reads the 192-byte header and nothing else. `verify` checks the container and,
-for `snap.u32:v1` / `snap.u64:v1`, every body. `search` takes an address or a prefix and
-prints the longest match.
+for an integer value type, every body. `search` takes an address or a prefix and prints
+the longest match.
+
+`fold` is the one journal operation the CLI has, and it is read-only: it opens the
+journal, builds the object its records describe, and writes it atomically to `--out`.
+Writing a journal is the application's job, so there is no `insert` here; what a caller
+needs afterwards is one file it can ship and query.
+
+```sh
+# a program appended to ./tbl; turn it into something everyone can read
+snap --json fold ./tbl --out tbl.snap
+snap --json search tbl.snap 8.8.8.8
+```
+
+A journal is single-writer, so `fold` fails with `another writer holds this journal`
+while the application has it open. Either fold the `current.snap` it publishes (the last
+checkpoint), or fold after the writer stops.
 
 Every command takes `--json` and prints exactly one JSON object, whatever the outcome:
 
@@ -187,10 +199,7 @@ Every command takes `--json` and prints exactly one JSON object, whatever the ou
 | `info --json` | `type_id`, `content_id`, `file_len`, `file_len_on_disk`, `consistent`, `sections`, `created_at`, `created_at_unix`, `window`, `stream` |
 | `verify --json` | `ok`, `type_id`, `sections`, `bodies_checked`, `entries` |
 | `search --json` | `query`, `type_id`, `match` (`{prefix, value}` or `null`) |
-| `journal info --json` | `dir`, `tree`, `entries`, `seq`, `type_id`, `generation` |
-| `journal insert --json` | `dir`, `tree`, `seq`, `entries`, `synced`, `type_id` |
-| `journal sync --json` | `dir`, `tree`, `seq`, `entries`, `type_id` |
-| `journal checkpoint --json` | `dir`, `tree`, `file`, `entries`, `seq`, `type_id` |
+| `fold --json` | `journal`, `out`, `entries`, `seq`, `type_id`, `bytes` |
 
 Exit codes: `0` success, `1` anything else, with the reason on stderr prefixed `snap: `.
 So a caller checks the exit code and, on `--json`, reads stdout as an object.
@@ -212,17 +221,16 @@ snap --json verify big.snap | jq -e '.ok and .bodies_checked'
 # which prefix covers this address, and what is its value?
 snap --json search big.snap 8.8.8.8 | jq -r '.match.prefix, .match.value'
 
-# keep a live table: append, then checkpoint when the count crosses a line
-snap journal insert tbl --prefix 10.0.0.0/8 --value 7 --sync
-snap --json journal info tbl | jq '.entries, .seq'
-snap journal checkpoint tbl
+# a journal your program writes, folded into one object for everyone else
+snap --json fold ./tbl --out tbl.snap | jq '.entries, .seq, .bytes'
 ```
 
 ## What it does not do
 
 - A writer holds the whole tree in memory. A build larger than RAM is out of scope.
 - One writer per directory (enforced by a lock). Readers are unlimited and need no lock.
-- The CLI's journal commands speak `snap.u32:v1` and `snap.u64:v1`; a journal over a
-  custom type is a library call.
+- The CLI reads and writes objects whose value type is an integer (`snap.u8:v1` through
+  `snap.u128:v1`). A journal or object over a caller's own type is a library call, and
+  the CLI says which type it found instead of guessing.
 - No compaction beyond checkpoints, no replication, no S3 backend: a journal is a
   directory, and moving it is `mv` or a sync job you write.

@@ -263,12 +263,24 @@ pub trait SnapValue: rkyv::Archive + Clone + for<'a> rkyv::Serialize<HighSer<'a>
     fn canonicalize(&mut self) {}
 }
 
+impl SnapValue for u8 {
+    const TYPE_ID: &str = "snap.u8:v1";
+}
+
+impl SnapValue for u16 {
+    const TYPE_ID: &str = "snap.u16:v1";
+}
+
 impl SnapValue for u32 {
     const TYPE_ID: &str = "snap.u32:v1";
 }
 
 impl SnapValue for u64 {
     const TYPE_ID: &str = "snap.u64:v1";
+}
+
+impl SnapValue for u128 {
+    const TYPE_ID: &str = "snap.u128:v1";
 }
 
 /// Decode a value from archived bytes, used by the journal.
