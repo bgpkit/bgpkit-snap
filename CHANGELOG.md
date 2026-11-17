@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.1.0
+All notable changes to this project are documented in this file.
+
+## v0.1.0 - 2026-11-17
 
 The first version under the pre-stable numbering. The crate moved from `1.0.0-rc.4` to
 `0.1.0` on purpose: no service has leaned on this interface for long enough to freeze
