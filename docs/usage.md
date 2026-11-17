@@ -44,7 +44,8 @@ The trie stores any `rkyv` type. A value has to declare one stable id, because t
 goes into the file header and a reader refuses an object written under another id.
 
 `#[snap_value]` takes the type and does the rest, so a caller needs no `rkyv` in its
-manifest at all:
+manifest at all. It is on `main` and ships in 0.2.0; this crate at 0.1.0 has only the
+derive form below:
 
 ```rust
 use bgpkit_snap::snap_value;

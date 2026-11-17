@@ -68,7 +68,9 @@ one, which is what makes the file safe to share and cheap to verify.
 ## Quick start
 
 A value type is one attribute: `#[snap_value]` adds `rkyv`'s derives and the id, so the
-crate that uses it needs no `rkyv` dependency of its own.
+crate that uses it needs no `rkyv` dependency of its own. It is on `main` and arrives in
+0.2.0; on the published 0.1.0, write the four derives and `#[snap(type_id = "...")]`
+instead (both forms are described in `docs/usage.md`).
 
 ```rust
 use bgpkit_snap::snap_value;
