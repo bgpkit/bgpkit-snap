@@ -231,6 +231,9 @@ pub struct AddressCounts {
 
 // ---------------------------------------------------------------- values
 
+/// The one-attribute way to make a value type: it adds `rkyv`'s derives for you.
+#[cfg(feature = "derive")]
+pub use bgpkit_snap_derive::snap_value;
 /// The derive, re-exported so a caller writes `bgpkit_snap::SnapValue` for both the
 /// trait and `#[derive(SnapValue)]`. The macro lives in a namespace of its own, so the
 /// name is not taken twice.

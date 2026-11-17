@@ -1,11 +1,32 @@
 //! `#[derive(SnapValue)]`: the value type a caller writes without the boilerplate.
 #![cfg(feature = "derive")]
 
-use bgpkit_snap::{Opts, SnapValue, Snapshot, Writer};
+use bgpkit_snap::{snap_value, Opts, SnapValue, Snapshot, Writer};
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, SnapValue)]
 #[snap(type_id = "test.peer-count:v1")]
 struct PeerCount(u32);
+
+#[snap_value(type_id = "test.one-attribute:v1", canonicalize = sort)]
+#[derive(Clone, Debug, PartialEq)]
+struct OneAttribute(Vec<u32>);
+
+fn sort(v: &mut OneAttribute) {
+    v.0.sort_unstable();
+}
+
+#[test]
+fn one_attribute_makes_a_value_type() {
+    assert_eq!(OneAttribute::TYPE_ID, "test.one-attribute:v1");
+    let mut w: Writer<OneAttribute> = Writer::new();
+    // out of order going in, canonical coming out
+    w.insert("10.0.0.0/8".parse().unwrap(), OneAttribute(vec![9, 3, 7]))
+        .unwrap();
+    let bytes = w.finish(&Opts::now()).unwrap();
+    let snap: Snapshot<OneAttribute> = Snapshot::from_bytes(&bytes).unwrap();
+    let hit = snap.owned().search("10.1.2.3".parse().unwrap()).unwrap();
+    assert_eq!(hit.unwrap().1, OneAttribute(vec![3, 7, 9]));
+}
 
 #[test]
 fn a_derived_value_type_writes_and_reads_back() {

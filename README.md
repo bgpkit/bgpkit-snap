@@ -67,18 +67,22 @@ one, which is what makes the file safe to share and cheap to verify.
 
 ## Quick start
 
-```rust
-use bgpkit_snap::{Opts, SnapValue, Snapshot, Writer};
+A value type is one attribute: `#[snap_value]` adds `rkyv`'s derives and the id, so the
+crate that uses it needs no `rkyv` dependency of its own.
 
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+```rust
+use bgpkit_snap::snap_value;
+
+#[snap_value(type_id = "example.roa-set:v1", canonicalize = sort_entries)]
+#[derive(Clone)]
 struct RoaSet(Vec<u32>);
 
-impl SnapValue for RoaSet {
-    const TYPE_ID: &str = "example.roa-set:v1";
-    fn canonicalize(&mut self) { self.0.sort_unstable(); }
-}
+// optional: a canonical order, so two builds of the same data give the same bytes
+fn sort_entries(v: &mut RoaSet) { v.0.sort_unstable(); }
 
 // build, then write the bytes yourself
+use bgpkit_snap::{Opts, Snapshot, Writer};
+
 let mut w: Writer<RoaSet> = Writer::new();
 w.insert("10.0.0.0/8".parse()?, RoaSet(vec![64512]))?;
 let bytes = w.finish(&Opts {

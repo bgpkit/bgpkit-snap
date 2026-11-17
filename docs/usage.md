@@ -43,27 +43,47 @@ bgpkit-snap --help
 The trie stores any `rkyv` type. A value has to declare one stable id, because the id
 goes into the file header and a reader refuses an object written under another id.
 
-```rust
-use bgpkit_snap::SnapValue;
+`#[snap_value]` takes the type and does the rest, so a caller needs no `rkyv` in its
+manifest at all:
 
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, SnapValue)]
+```rust
+use bgpkit_snap::snap_value;
+
+#[snap_value(type_id = "demo.peer-count:v1")]
+#[derive(Clone, Debug)]
+struct PeerCount(u32);
+```
+
+That expands to `rkyv`'s three derives, the `rkyv` crate path, and the `SnapValue` impl.
+`canonicalize = some_fn` adds the ordering hook, for a value whose byte order is not
+already fixed:
+
+```rust
+#[snap_value(type_id = "demo.roa-set:v1", canonicalize = sort_entries)]
+#[derive(Clone)]
+struct RoaSet(Vec<u32>);
+
+fn sort_entries(v: &mut RoaSet) { v.0.sort_unstable(); }
+```
+A crate that already depends on `rkyv` can spell the same thing out and keep its own
+`rkyv` version; the derive writes only the id:
+
+```rust
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, bgpkit_snap::SnapValue)]
 #[snap(type_id = "demo.peer-count:v1")]
 struct PeerCount(u32);
 ```
 
-Without the derive, the same thing by hand:
+Doing it by hand is the third way, and the shortest: implement `SnapValue` yourself and
+the id is all you add.
 
-```rust
-impl SnapValue for PeerCount {
-    const TYPE_ID: &'static str = "demo.peer-count:v1";
-}
-```
-
-`SnapValue` supplies only that id. A type that forgets rkyv's three derives does not
-compile: the error names the missing `Serialize<Strategy<...>>` bound at the type, and
-`cannot be stored in a snapshot` where it is used. Nothing about a value type involves
-`serde`: the stored bytes are rkyv's, and `serde` in this crate is only for the
-journal's `state.json` and the CLI's JSON.
+`snap_value` refuses a type that already derives `rkyv`'s traits, because that would be
+two archive impls, and it names both ways out. A type that forgets `rkyv` entirely
+(calling the derive without the rkyv derives) does not compile: the error names the
+missing `Serialize<Strategy<...>>` bound at the type and `cannot be stored in a
+snapshot` where it is used. Nothing about a value type involves `serde`: the stored
+bytes are rkyv's, and `serde` in this crate is only for the journal's `state.json` and
+the CLI's JSON.
 
 The id is at most 31 bytes of printable ASCII, no space, quote or backslash, and never
 empty. A value that cannot fit is refused when the object is written, not when it is
