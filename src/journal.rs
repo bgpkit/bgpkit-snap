@@ -79,7 +79,7 @@ impl PayloadSection {
 /// fixture rather than a deployment.
 pub struct JournalOptions<T: Codec> {
     dir: std::path::PathBuf,
-    tree_id: crate::TreeId,
+    base: BaseSource,
     payload: Option<PayloadSection>,
     generation: Option<[u8; 16]>,
     _t: std::marker::PhantomData<T>,
@@ -106,10 +106,38 @@ where
         self
     }
 
+    /// Start the journal from `base` instead of reopening an existing directory.
+    pub fn attach(mut self, base: impl AsRef<Path>) -> Self {
+        self.base = BaseSource::Attach(base.as_ref().to_path_buf());
+        self
+    }
+
+    /// Start the journal from an empty object with this tree id, or resume it.
+    pub fn start(mut self, tree_id: impl Into<crate::TreeId>) -> Self {
+        self.base = BaseSource::Start(tree_id.into());
+        self
+    }
+
     /// Open with these options.
     pub fn open(self) -> Result<Journal<T>, Error> {
-        Journal::<T>::open_inner(self.dir, self.tree_id, self.payload, self.generation)
+        Journal::<T>::open_inner(self.dir, self.base, self.payload, self.generation)
     }
+}
+
+/// How a journal starts: reopening a directory, adopting an object as its base, or
+/// minting an empty base for a stream that has none yet.
+pub(crate) enum BaseSource {
+    Reopen,
+    Attach(PathBuf),
+    Start(crate::TreeId),
+}
+
+/// What a fresh journal takes from its base: the tree id, the generation it writes
+/// under, and the base record `(content id hex, path)`.
+pub(crate) struct StartIdentity {
+    pub tree_id: [u8; 16],
+    pub generation: [u8; 16],
+    pub base: Option<(String, String)>,
 }
 
 struct Segment {
@@ -137,6 +165,8 @@ pub struct Journal<T: Codec> {
     /// The committed checkpoint: `(base_seq, file)`. Held in memory so a `sync`
     /// after a lost `state.json` cannot silently drop it.
     checkpoint: Option<(u64, String)>,
+    /// The object this journal was attached to, `(content id hex, path)`.
+    base: Option<(String, String)>,
     /// How many checkpoints this process has written, so two of them at the same
     /// sequence number do not share a file name.
     checkpoints: u64,
@@ -157,30 +187,56 @@ where
     T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
         + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
 {
-    /// Open a journal over a tree with no payload section, recovering the tree from
-    /// the last checkpoint plus the segments. The generation is reused when a
-    /// journal already exists.
-    pub fn open(dir: impl AsRef<Path>, tree_id: impl Into<crate::TreeId>) -> Result<Self, Error> {
-        Self::open_inner(dir, tree_id, None, None)
+    /// Reopen the journal in `dir`.
+    ///
+    /// A journal is a log of changes to one object, never a tree of its own: it is
+    /// created by `attach` (or `create` for an empty start) and reopened by this
+    /// call, which recovers the tree from the last checkpoint plus the segments, and
+    /// from the base object when no checkpoint has been written yet.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_inner(dir, BaseSource::Reopen, None, None)
+    }
+
+    /// Start a journal whose base is `base`, the object the log will keep current.
+    ///
+    /// The base is read once and recorded by content id; until the first checkpoint
+    /// the journal cannot be opened without it, and a base that was replaced is
+    /// refused instead of silently adopted. After the first checkpoint the tree comes
+    /// from that checkpoint and the base is provenance.
+    pub fn attach(base: impl AsRef<Path>, dir: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_inner(
+            dir,
+            BaseSource::Attach(base.as_ref().to_path_buf()),
+            None,
+            None,
+        )
+    }
+
+    /// Start a journal whose base is an empty object with this tree id, for a stream
+    /// that has no snapshot yet.
+    ///
+    /// A directory that already holds a journal is resumed instead, and the tree id has
+    /// to be the one that journal records: a service can call this on every start
+    /// without first asking whether the directory is new.
+    pub fn start(dir: impl AsRef<Path>, tree_id: impl Into<crate::TreeId>) -> Result<Self, Error> {
+        Self::open_inner(dir, BaseSource::Start(tree_id.into()), None, None)
     }
 
     /// A journal whose values point into a blob arena. The section has to be the one
-    /// the directory was checkpointed with, or `open` refuses it.
+    /// the base or the checkpoint carries, or open refuses it.
     pub fn open_with_payload(
         dir: impl AsRef<Path>,
-        tree_id: impl Into<crate::TreeId>,
         payload: PayloadSection,
     ) -> Result<Self, Error> {
-        Self::open_inner(dir, tree_id, Some(payload), None)
+        Self::open_inner(dir, BaseSource::Reopen, Some(payload), None)
     }
 
-    /// The two knobs a constructor should not take positionally: an optional payload
-    /// section and a caller-minted generation. Both are for the uncommon case, so
-    /// they sit behind methods instead of arguments.
-    pub fn options(dir: impl AsRef<Path>, tree_id: impl Into<crate::TreeId>) -> JournalOptions<T> {
+    /// The knobs a constructor should not take positionally: the payload section, a
+    /// caller-minted generation, and how the journal starts.
+    pub fn options(dir: impl AsRef<Path>) -> JournalOptions<T> {
         JournalOptions {
             dir: dir.as_ref().to_path_buf(),
-            tree_id: tree_id.into(),
+            base: BaseSource::Reopen,
             payload: None,
             generation: None,
             _t: std::marker::PhantomData,
@@ -189,14 +245,14 @@ where
 
     pub(crate) fn open_inner(
         dir: impl AsRef<Path>,
-        tree_id: impl Into<crate::TreeId>,
+        base: BaseSource,
         payload: Option<PayloadSection>,
         generation: Option<[u8; 16]>,
     ) -> Result<Self, Error> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
         let lock = Self::take_writer_lock(&dir)?;
-        Self::open_locked(dir, tree_id, payload, generation, lock)
+        Self::open_locked(dir, base, payload, generation, lock)
     }
 
     /// The writer lock for this directory, or `Locked` when another journal has it.
@@ -216,21 +272,45 @@ where
     /// call would then delete.
     fn open_locked(
         dir: impl AsRef<Path>,
-        tree_id: impl Into<crate::TreeId>,
+        base: BaseSource,
         payload: Option<PayloadSection>,
         generation: Option<[u8; 16]>,
         lock: File,
     ) -> Result<Self, Error> {
-        let tree_id = *tree_id.into().as_bytes();
         let dir = dir.as_ref().to_path_buf();
+        // a journal is a log for one object, so the two ways to start are explicit and
+        // a directory that already holds a journal is only ever reopened
+        let start = match (&base, read_state(&dir)?) {
+            (BaseSource::Reopen, None) => return Err(Error::BadOpts(
+                "this directory holds no journal yet: start one with Journal::attach(base, dir) \
+                     or Journal::create(dir, tree_id)",
+            )),
+            (BaseSource::Reopen, Some(state)) => Some(state),
+            (_, None) => None,
+            (BaseSource::Start(tree_id), Some(state)) => {
+                // resuming is only resuming when it is the same tree; anything else is a
+                // caller pointing a stream at another stream's directory
+                if *tree_id.as_bytes() != state.tree_id {
+                    return Err(Error::ConfigMismatch(format!(
+                        "this journal belongs to tree {}, not {}",
+                        crate::header::hex16(&state.tree_id),
+                        crate::header::hex16(tree_id.as_bytes())
+                    )));
+                }
+                Some(state)
+            }
+            (BaseSource::Attach(_), Some(_)) => {
+                return Err(Error::BadOpts(
+                    "this directory already holds a journal: reopen it with Journal::open instead \
+                     of attaching another base",
+                ))
+            }
+        };
         // reject here what a checkpoint would reject later, after data was written
         if generation.unwrap_or([1u8; 16]) == [0u8; 16] {
             return Err(Error::BadOpts(
                 "a journal generation of all zeros means \"mint one\"; pass None to mint it",
             ));
-        }
-        if tree_id == [0u8; 16] {
-            return Err(Error::BadOpts("tree id is all zero"));
         }
         if let Some(p) = payload {
             if p.id < crate::header::FIRST_PROFILE_ID {
@@ -240,47 +320,47 @@ where
                 return Err(Error::BadRecord("payload section uses a family kind"));
             }
         }
-        std::fs::create_dir_all(&dir)?;
 
-        let state = read_state(&dir)?;
         // the directory records what wrote it; a reopen with another value type or
         // another payload would reinterpret the same bytes without a word
-        if let Some(state) = state.as_ref() {
-            if let Some(type_id) = state.type_id.as_deref() {
-                if type_id != T::TYPE_ID {
-                    return Err(Error::ConfigMismatch(format!(
-                        "this journal was written as {type_id}, not {}",
-                        T::TYPE_ID
-                    )));
+        let (tree_id, generation, base_record, fresh) = match &start {
+            Some(state) => {
+                if let Some(type_id) = state.type_id.as_deref() {
+                    if type_id != T::TYPE_ID {
+                        return Err(Error::ConfigMismatch(format!(
+                            "this journal was written as {type_id}, not {}",
+                            T::TYPE_ID
+                        )));
+                    }
                 }
-            }
-            let configured = payload.map(|p| (p.id, p.kind, p.required));
-            if let Some(written) = state.payload {
-                if Some(written) != configured {
-                    return Err(Error::ConfigMismatch(format!(
-                        "this journal was written with payload section {} (kind {}, required {}); \
-                         open it with that configuration",
-                        written.0,
-                        String::from_utf8_lossy(&written.1),
-                        written.2
-                    )));
+                let configured = payload.map(|p| (p.id, p.kind, p.required));
+                if let Some(written) = state.payload {
+                    if Some(written) != configured {
+                        return Err(Error::ConfigMismatch(format!(
+                            "this journal was written with payload section {} (kind {}, required \
+                             {}); open it with that configuration",
+                            written.0,
+                            String::from_utf8_lossy(&written.1),
+                            written.2
+                        )));
+                    }
                 }
+                if let Some(wanted) = generation {
+                    if wanted != state.generation {
+                        return Err(Error::ConfigMismatch(format!(
+                            "this journal was minted as generation {}, not {}",
+                            crate::header::hex16(&state.generation),
+                            crate::header::hex16(&wanted)
+                        )));
+                    }
+                }
+                (state.tree_id, state.generation, state.base.clone(), false)
             }
-        }
-        let existing = state
-            .as_ref()
-            .map(|s| s.generation)
-            .or(existing_generation(&dir)?);
-        if let (Some(existing), Some(wanted)) = (existing, generation) {
-            if existing != wanted {
-                return Err(Error::ConfigMismatch(format!(
-                    "this journal was minted as generation {}, not {}",
-                    crate::header::hex16(&existing),
-                    crate::header::hex16(&wanted)
-                )));
+            None => {
+                let identity = Self::start_from(&dir, base, generation)?;
+                (identity.tree_id, identity.generation, identity.base, true)
             }
-        }
-        let generation = existing.or(generation).unwrap_or_else(random_generation);
+        };
         // a new segment, never the existing ones: reopening must not truncate
         let index = segment_paths(&dir)?
             .iter()
@@ -308,22 +388,42 @@ where
             seg_index: index,
             seg_dirty_from: None,
             checkpoint: None,
+            base: base_record.clone(),
             checkpoints: 0,
             seq: 1,
             base_seq: 0,
-            state_written: state.is_some(),
+            state_written: !fresh,
             v4: PrefixMap::new(),
             v6: PrefixMap::new(),
             blob: Vec::new(),
             payload,
         };
-        if state.is_none() && !snapshot_paths(&journal.dir)?.is_empty() {
-            // the checkpoints exist but nothing says which one is current, and
-            // the segments they replaced may already be gone
-            return Err(Error::BadRecord(
-                "checkpoints exist but state.json is missing",
-            ));
-        }
+        // a fresh directory records itself before it accepts a record, so a crash
+        // before the first sync still leaves a journal that names its base
+        let state = match start {
+            Some(state) => Some(state),
+            None => {
+                if !snapshot_paths(&journal.dir)?.is_empty() {
+                    // the checkpoints exist but nothing says which one is current, and
+                    // the segments they replaced may already be gone
+                    return Err(Error::BadRecord(
+                        "checkpoints exist but state.json is missing",
+                    ));
+                }
+                let state = State {
+                    next_seq: 1,
+                    generation,
+                    tree_id,
+                    checkpoint: None,
+                    base: journal.base.clone(),
+                    type_id: Some(T::TYPE_ID.to_string()),
+                    payload: journal.payload.map(|p| (p.id, p.kind, p.required)),
+                };
+                write_state(&journal.dir, &state)?;
+                journal.state_written = true;
+                Some(state)
+            }
+        };
         let keep = journal.recover(state)?;
         // the snapshot name carries a per-sequence ordinal; seeding it from disk keeps
         // the first checkpoint after a restart from reusing a committed name
@@ -349,6 +449,76 @@ where
             }
         }
         Ok(journal)
+    }
+
+    /// The identity a fresh journal takes from its base, and the base record it stores:
+    /// `(tree id, generation, (content id hex, path))`.
+    ///
+    /// The tree id comes from the object the log extends, not from a name the caller
+    /// types: a plain snapshot has none, so the id is derived from its content id, and a
+    /// checkpoint keeps the id of the stream it belongs to.
+    fn start_from(
+        dir: &Path,
+        base: BaseSource,
+        generation: Option<[u8; 16]>,
+    ) -> Result<StartIdentity, Error> {
+        match base {
+            BaseSource::Reopen => unreachable!("a reopen never starts a directory"),
+            BaseSource::Start(tree_id) => {
+                let tree_id = *tree_id.as_bytes();
+                if tree_id == [0u8; 16] {
+                    return Err(Error::BadOpts("tree id is all zero"));
+                }
+                let generation = generation.unwrap_or_else(random_generation);
+                let opts = crate::Opts {
+                    created_at: chrono::Utc::now().timestamp(),
+                    stream: Some(crate::StreamRef {
+                        tree_id,
+                        generation,
+                        base_seq: 0,
+                    }),
+                    window: None,
+                    extras: &[],
+                };
+                let path = dir.join("base.snap");
+                crate::Writer::<T>::new().finish_to(&path, &opts)?;
+                let raw = std::fs::read(&path)?;
+                let content_id = crate::header::hex32(&crate::Header::parse(&raw)?.content_id);
+                // absolute: the record outlives this call, and a relative path would be
+                // read against whatever directory the next process runs in
+                let path = std::fs::canonicalize(&path)?;
+                Ok(StartIdentity {
+                    tree_id,
+                    generation,
+                    base: Some((content_id, path.to_string_lossy().into_owned())),
+                })
+            }
+            BaseSource::Attach(path) => {
+                // reading the base once here is also the check that it is a whole object
+                // of this value type, so a wrong file is named at attach time
+                let snap = Snapshot::<T>::open(&path)?;
+                if snap.header().type_id_str() != T::TYPE_ID {
+                    return Err(Error::ConfigMismatch(format!(
+                        "the base object holds {}, not {}",
+                        snap.header().type_id_str(),
+                        T::TYPE_ID
+                    )));
+                }
+                let content_id = crate::header::hex32(&snap.header().content_id);
+                let tree_id = match snap.header().stream() {
+                    Some(s) => s.tree_id,
+                    None => *crate::TreeId::from_name(&content_id).as_bytes(),
+                };
+                Ok(StartIdentity {
+                    tree_id,
+                    generation: generation.unwrap_or_else(random_generation),
+                    base: Some((
+                        content_id,
+                        std::fs::canonicalize(&path)?.to_string_lossy().into_owned(),
+                    )),
+                })
+            }
+        }
     }
 
     /// Create this session's segment. Called on the first append, so a journal
@@ -461,6 +631,62 @@ where
     /// it. A checkpoint that has been written and fsynced is the state, so a
     /// lost or truncated segment after it costs only the records on top.
     fn recover(&mut self, state: Option<State>) -> Result<Option<String>, Error> {
+        // nothing has been checkpointed yet: the tree is the base object the journal was
+        // attached to, and it has to still be the object that was attached
+        if let Some((content_id, path)) = state
+            .as_ref()
+            .filter(|s| s.checkpoint.is_none())
+            .and_then(|s| s.base.clone())
+        {
+            let raw = match std::fs::read(&path) {
+                Ok(raw) => raw,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::BaseLost(format!(
+                        "the object this journal was attached to is gone: {path}"
+                    )))
+                }
+                Err(e) => return Err(Error::Io(e)),
+            };
+            let snap: Snapshot<T> = Snapshot::from_bytes(&raw).map_err(|e| match e {
+                // a base that no longer verifies was replaced under the journal
+                Error::ContentId => Error::BaseLost(format!(
+                    "the object at {path} is not the one this journal was attached to"
+                )),
+                other => other,
+            })?;
+            if snap.header().type_id_str() != T::TYPE_ID {
+                return Err(Error::ConfigMismatch(format!(
+                    "the base object holds {}, not {}",
+                    snap.header().type_id_str(),
+                    T::TYPE_ID
+                )));
+            }
+            if crate::header::hex32(&snap.header().content_id) != content_id {
+                return Err(Error::BaseLost(format!(
+                    "the object at {path} is not the one this journal was attached to"
+                )));
+            }
+            // a plain object makes no tree claim, and the id was derived from its content
+            // id at attach time; only a checkpoint can disagree about which stream it is
+            if let Some(s) = snap.header().stream() {
+                if s.tree_id != self.tree_id {
+                    return Err(Error::BadRecord(
+                        "the base object belongs to another tree than this journal",
+                    ));
+                }
+            }
+            for (p, v) in snap.v4().map(|m| m.iter()).into_iter().flatten() {
+                let value = rkyv::deserialize::<T, RkyvError>(v)
+                    .map_err(|_| Error::BadRecord("base value does not decode"))?;
+                self.v4.insert(p, value);
+            }
+            for (p, v) in snap.v6().map(|m| m.iter()).into_iter().flatten() {
+                let value = rkyv::deserialize::<T, RkyvError>(v)
+                    .map_err(|_| Error::BadRecord("base value does not decode"))?;
+                self.v6.insert(p, value);
+            }
+        }
+
         if let Some((base, file)) = state.as_ref().and_then(|s| s.checkpoint.clone()) {
             let path = self.dir.join(&file);
             let raw = std::fs::read(&path).map_err(|e| match e.kind() {
@@ -969,6 +1195,7 @@ where
                 next_seq: base
                     .checked_add(1)
                     .ok_or(Error::BadRecord("checkpoint sequence is not representable"))?,
+                base: None,
                 generation,
                 tree_id,
                 checkpoint: Some((base, file.clone())),
@@ -982,7 +1209,7 @@ where
         let adopted = lock
             .try_clone()
             .map_err(Error::Io)
-            .and_then(|held| Self::open_locked(&dir, tree_id, payload, None, held));
+            .and_then(|held| Self::open_locked(&dir, BaseSource::Reopen, payload, None, held));
         match adopted {
             Ok(journal) => {
                 drop(lock);
@@ -1023,6 +1250,7 @@ where
             generation: self.generation,
             tree_id: self.tree_id,
             checkpoint: self.checkpoint.clone(),
+            base: self.base.clone(),
             type_id: Some(type_id),
             payload,
         };
@@ -1218,6 +1446,7 @@ where
                 generation: self.generation,
                 tree_id: self.tree_id,
                 checkpoint: Some((covered, name.clone())),
+                base: self.base.clone(),
                 type_id: Some(T::TYPE_ID.to_string()),
                 payload: self.payload.map(|p| (p.id, p.kind, p.required)),
             },
@@ -1321,6 +1550,16 @@ where
         self.seq
     }
 
+    /// The base object this journal was attached to, `(content id hex, path)`.
+    pub fn base(&self) -> Option<&(String, String)> {
+        self.base.as_ref()
+    }
+
+    /// The newest committed checkpoint, `(base seq, file name)`.
+    pub fn last_checkpoint(&self) -> Option<&(u64, String)> {
+        self.checkpoint.as_ref()
+    }
+
     /// The stream incarnation this journal writes under.
     ///
     /// It is minted on first use and reused from then on, so a reader can tell a
@@ -1419,12 +1658,22 @@ fn prefix_from_fields(family: u8, len: u8, addr: &[u8; 16]) -> Option<IpNet> {
 /// The durable commit record: what the journal promises survives a crash, plus what
 /// the directory was written as, so a reopen with another value type or payload is
 /// refused instead of silently reinterpreted.
+/// The value type a journal directory records, for a tool that has to choose a `T`
+/// before it can open one. `None` when the directory holds no journal yet.
+pub fn recorded_type_id(dir: impl AsRef<Path>) -> Result<Option<String>, Error> {
+    Ok(read_state(dir.as_ref())?.and_then(|s| s.type_id))
+}
+
 struct State {
     next_seq: u64,
     generation: [u8; 16],
     tree_id: [u8; 16],
     /// `(base_seq, file name)` of the newest verified checkpoint.
     checkpoint: Option<(u64, String)>,
+    /// `(content id hex, path)` of the object this journal was attached to. Read only
+    /// until the first checkpoint: from then on the tree comes from that checkpoint and
+    /// the base is provenance.
+    base: Option<(String, String)>,
     type_id: Option<String>,
     payload: Option<(u16, [u8; 4], bool)>,
 }
@@ -1480,11 +1729,22 @@ fn read_state(dir: &Path) -> Result<Option<State>, Error> {
         }
         Some(_) => return Err(Error::BadRecord("state.json payload is malformed")),
     };
+    let base = match &v["base"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::Object(o) => match (o.get("content_id"), o.get("path")) {
+            (Some(serde_json::Value::String(c)), Some(serde_json::Value::String(p))) => {
+                Some((c.clone(), p.clone()))
+            }
+            _ => return Err(Error::BadRecord("state.json base is malformed")),
+        },
+        _ => return Err(Error::BadRecord("state.json base is malformed")),
+    };
     Ok(Some(State {
         next_seq,
         generation,
         tree_id,
         checkpoint,
+        base,
         type_id,
         payload,
     }))
@@ -1501,6 +1761,9 @@ fn write_state(dir: &Path, state: &State) -> Result<(), Error> {
     }
     if let Some(type_id) = &state.type_id {
         v["type_id"] = serde_json::json!(type_id);
+    }
+    if let Some((content_id, path)) = &state.base {
+        v["base"] = serde_json::json!({ "content_id": content_id, "path": path });
     }
     if let Some((id, kind, required)) = &state.payload {
         v["payload"] = serde_json::json!({
@@ -1598,20 +1861,6 @@ fn segment_paths(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(out)
 }
 
-fn existing_generation(dir: &Path) -> Result<Option<[u8; 16]>, Error> {
-    let mut paths = segment_paths(dir)?;
-    paths.sort();
-    for path in paths {
-        let raw = std::fs::read(&path)?;
-        if raw.len() >= SEGMENT_HEADER_LEN && &raw[..8] == MAGIC {
-            let mut generation = [0u8; 16];
-            generation.copy_from_slice(&raw[28..44]);
-            return Ok(Some(generation));
-        }
-    }
-    Ok(None)
-}
-
 fn random_generation() -> [u8; 16] {
     let mut out = [0u8; 16];
     if let Ok(mut f) = File::open("/dev/urandom") {
@@ -1643,7 +1892,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("snap-cutback-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let tree_id = [72u8; 16];
-        let mut j: Journal<V> = Journal::open(&dir, tree_id).unwrap();
+        let mut j: Journal<V> = Journal::start(&dir, tree_id).unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
 
         // a half-written frame lands past the acknowledged bytes
@@ -1698,8 +1947,11 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
             let tree_id = [71u8; 16];
             {
-                let mut j: Journal<V> =
-                    Journal::open_with_payload(&dir, tree_id, PayloadSection::payload(16)).unwrap();
+                let mut j: Journal<V> = Journal::options(&dir)
+                    .start(tree_id)
+                    .payload(PayloadSection::payload(16))
+                    .open()
+                    .unwrap();
                 j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
                 j.sync().unwrap();
             }
@@ -1721,8 +1973,7 @@ mod tests {
             raw[SEGMENT_HEADER_LEN + 4..payload_base].copy_from_slice(&crc.to_le_bytes());
             std::fs::write(&segment, &raw).unwrap();
 
-            let reopened =
-                Journal::<V>::open_with_payload(&dir, tree_id, PayloadSection::payload(16));
+            let reopened = Journal::<V>::open_with_payload(&dir, PayloadSection::payload(16));
             match reopened {
                 Ok(j) => panic!(
                     "a record with {name} set must be refused, got len {}",
@@ -1746,8 +1997,11 @@ mod tests {
     fn a_torn_write_is_cut_before_the_next_append() {
         let dir = std::env::temp_dir().join(format!("snap-torn-write-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
-        let mut j: Journal<V> =
-            Journal::open_with_payload(&dir, [1u8; 16], PayloadSection::payload(16)).unwrap();
+        let mut j: Journal<V> = Journal::options(&dir)
+            .start([1u8; 16])
+            .payload(PayloadSection::payload(16))
+            .open()
+            .unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.sync().unwrap();
 
@@ -1771,9 +2025,8 @@ mod tests {
         j.sync().unwrap();
         drop(j);
 
-        let j: Journal<V> =
-            Journal::open_with_payload(&dir, [1u8; 16], PayloadSection::payload(16))
-                .expect("the torn bytes must not survive into a reopen");
+        let j: Journal<V> = Journal::open_with_payload(&dir, PayloadSection::payload(16))
+            .expect("the torn bytes must not survive into a reopen");
         assert_eq!(j.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }

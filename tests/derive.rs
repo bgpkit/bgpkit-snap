@@ -7,8 +7,9 @@ use bgpkit_snap::{snap_value, Opts, SnapValue, Snapshot, Writer};
 #[snap(type_id = "test.peer-count:v1")]
 struct PeerCount(u32);
 
-#[snap_value(type_id = "test.one-attribute:v1", canonicalize = sort)]
-#[derive(Clone, Debug, PartialEq)]
+// one attribute: the id is positional and Clone comes from it, the rest is the caller's
+#[snap_value("test.one-attribute:v1", canonicalize = sort)]
+#[derive(Debug, PartialEq)]
 struct OneAttribute(Vec<u32>);
 
 fn sort(v: &mut OneAttribute) {

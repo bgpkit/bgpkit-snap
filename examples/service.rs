@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    The tree id names the tree. The same name reopens the same journal, and a
     //    typo gives a different journal instead of adopting this one.
     let tree = TreeId::from_name("collector-routeviews-2");
-    let mut journal: Journal<Peers> = Journal::open(dir.join("feed"), tree)?;
+    let mut journal: Journal<Peers> = Journal::start(dir.join("feed"), tree)?;
     for (prefix, peers) in parse("10.0.0.0/8 3\n192.0.2.0/24 1\n2001:db8::/32 2") {
         journal.insert(prefix, Peers(peers))?;
     }

@@ -331,32 +331,69 @@ let arena = snap.section_bytes(16);
 # }
 ```
 
-## Journal: building the object from a feed
+## Journal: keeping one object current
 
-Use a journal when the tree changes over time and you cannot afford to rebuild
-the whole file for every change.
+A journal is not a store of its own. It is the log of changes over **one object**,
+and it always starts from that object:
+
+1. build or receive the object (`table.snap`),
+2. attach a journal to it and append what changed since,
+3. checkpoint when the log is long enough to be worth folding back into an object.
 
 ```rust,no_run
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 use bgpkit_snap::journal::Journal;
-use bgpkit_snap::{Opts, TreeId};
+use bgpkit_snap::Opts;
 # use bgpkit_snap::SnapValue;
 # #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 # struct PeerCount(u32);
 # impl SnapValue for PeerCount { const TYPE_ID: &str = "example.peer-count:v1"; }
+# let dir = std::env::temp_dir().join(format!("guide-feed-{}-{}", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
+# std::fs::remove_dir_all(&dir).ok();
+# std::fs::create_dir_all(&dir)?;
+# let base = dir.join("table.snap");
+# {
+#     let mut w: bgpkit_snap::Writer<PeerCount> = bgpkit_snap::Writer::new();
+#     w.insert("10.0.0.0/8".parse()?, PeerCount(3))?;
+#     w.finish_to(&base, &Opts::now())?;
+# }
+let log = dir.join("table.journal");
 
+// the base is the object this log keeps current: it is read once, recorded by
+// content id, and refused later if the file was replaced
+let mut journal: Journal<PeerCount> = Journal::attach(&base, &log)?;
 
-// the id names this tree: the same name reopens the same journal, and a typo
-// gives a different journal instead of adopting this one
-# let feed_dir = std::env::temp_dir().join(format!("guide-feed-{}-{}", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
-# std::fs::remove_dir_all(&feed_dir).ok();
-let mut journal: Journal<PeerCount> =
-    Journal::open(&feed_dir, TreeId::from_name("peer-counts"))?;
+// what changed since that object was built
+journal.insert("192.0.2.0/24".parse()?, PeerCount(7))?;
+journal.withdraw("198.51.100.0/24".parse()?)?;
+journal.sync()?;                                     // durable on return
+
+// fold base + log into a new object; `current.snap` in `log` names it
+let next = journal.checkpoint(&Opts::now())?;
+// publish it wherever you like, then attach the next journal to it
+# std::fs::remove_dir_all(&dir).ok();
+# Ok(())
+# }
+```
+
+Starting from nothing is the same shape with an empty base:
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use bgpkit_snap::journal::Journal;
+use bgpkit_snap::TreeId;
+# use bgpkit_snap::SnapValue;
+# #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+# struct PeerCount(u32);
+# impl SnapValue for PeerCount { const TYPE_ID: &str = "example.peer-count:v1"; }
+# let log = std::env::temp_dir().join(format!("guide-start-{}-{}", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
+# std::fs::remove_dir_all(&log).ok();
+// the id names this stream: the same id resumes the same journal, and a different
+// one is refused instead of adopting this directory
+let mut journal: Journal<PeerCount> = Journal::start(&log, TreeId::from_name("peer-counts"))?;
 journal.insert("10.0.0.0/8".parse()?, PeerCount(3))?;
-journal.sync()?;                                        // durable on return
-
-let object = journal.checkpoint(&Opts::now())?;          // verified, then named
-// <journal dir>/current.snap now points at `object`
+journal.sync()?;
+# std::fs::remove_dir_all(&log).ok();
 # Ok(())
 # }
 ```
@@ -415,7 +452,7 @@ touching the disk:
 # impl SnapValue for PeerCount { const TYPE_ID: &str = "example.peer-count:v1"; }
 # let d = std::env::temp_dir().join(format!("guide-to-snapshot-{}-{}", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
 # std::fs::remove_dir_all(&d).ok();
-# let mut journal: Journal<PeerCount> = Journal::open(&d, TreeId::from_name("guide-to-snapshot"))?;
+# let mut journal: Journal<PeerCount> = Journal::start(&d, TreeId::from_name("guide-to-snapshot"))?;
 let snap = journal.to_snapshot(&Opts::now())?;   // every Snapshot query, no file
 let under = snap.children("10.0.0.0/8".parse()?);
 # std::fs::remove_dir_all(&d).ok();
@@ -446,11 +483,10 @@ impl SnapValue for PathRef { const TYPE_ID: &str = "example.path-ref:v1"; }
 
 # let journal_path = std::env::temp_dir().join(format!("guide-aspaths-{}-{}.journal", std::process::id(), std::time::UNIX_EPOCH.elapsed().map(|d| d.subsec_nanos()).unwrap_or(0)));
 # std::fs::remove_dir_all(&journal_path).ok();
-let mut journal: Journal<PathRef> = Journal::open_with_payload(
-    &journal_path,
-    TreeId::from_name("aspaths"),
-    PayloadSection::payload(16),
-)?;
+let mut journal: Journal<PathRef> = Journal::options(&journal_path)
+    .start(TreeId::from_name("aspaths"))
+    .payload(PayloadSection::payload(16))
+    .open()?;
 let arena_bytes: &[u8] = b"aspathbytes!";   // 12 bytes: this toy profile pads to 4
 let inserted = journal.insert_with_blob("10.0.0.0/8".parse()?, arena_bytes, |off| PathRef {
     off,

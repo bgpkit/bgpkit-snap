@@ -12,27 +12,36 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, Expr, Item, Lit, Meta};
+use syn::punctuated::Punctuated;
+use syn::{parse_macro_input, DeriveInput, Expr, Item, Lit, Meta, Token};
 
 /// Make a value type out of a struct or an enum, in one attribute.
 ///
 /// ```ignore
-/// #[bgpkit_snap::snap_value(type_id = "demo.peer-count:v1")]
-/// #[derive(Clone, Debug)]
+/// #[bgpkit_snap::snap_value("demo.peer-count:v1")]
 /// struct PeerCount(u32);
 /// ```
 ///
-/// The attribute adds `rkyv`'s three derives and its crate path, then writes the
+/// The id comes first because it is the only required argument. The attribute adds
+/// `Clone`, `rkyv`'s three derives and the `rkyv` crate path, then writes the
 /// `SnapValue` impl, so nothing about `rkyv` appears in the caller's manifest.
+///
+/// Optional arguments:
+///
+/// - `canonicalize = some_fn`, where `some_fn: fn(&mut T)`, for a value whose byte
+///   order is not already fixed.
+/// - `rkyv(...)`, passed through to `rkyv`'s own derive attributes, for the archive
+///   options this crate does not set (for example `compare(PartialEq)`).
 #[proc_macro_attribute]
 pub fn snap_value(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
     let Args {
         id,
         canonicalize,
+        rkyv,
         error,
     } = args;
-    let id = match error.map_or_else(|| id.ok_or(MISSING_ID.to_string()), Err) {
+    let id = match error.map_or_else(|| id.ok_or_else(missing_id), Err) {
         Ok(id) => match check_id(id) {
             Ok(id) => id,
             Err(message) => {
@@ -68,6 +77,16 @@ pub fn snap_value(attr: TokenStream, item: TokenStream) -> TokenStream {
         );
     }
 
+    // `SnapValue` requires `Clone`, so the attribute derives it too and a caller writes
+    // nothing; a caller who already derives it keeps that one
+    let clone = if has_derive(&item, "Clone") {
+        None
+    } else {
+        Some(quote!(::core::clone::Clone,))
+    };
+
+    let passthrough = rkyv.map(|tokens| quote!(#[rkyv(#tokens)]));
+
     let generics = item_generics(&item);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let canonicalize = canonicalize.map(|path| {
@@ -80,6 +99,7 @@ pub fn snap_value(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     quote! {
         #[derive(
+            #clone
             ::bgpkit_snap::rkyv::Archive,
             ::bgpkit_snap::rkyv::Serialize,
             ::bgpkit_snap::rkyv::Deserialize,
@@ -87,6 +107,7 @@ pub fn snap_value(attr: TokenStream, item: TokenStream) -> TokenStream {
         // the derives above are told where `rkyv` lives, so the caller's manifest needs no
         // dependency on it and the archived layout is the one this crate reads back
         #[rkyv(crate = ::bgpkit_snap::rkyv)]
+        #passthrough
         #item
 
         impl #impl_generics ::bgpkit_snap::SnapValue for #ident #ty_generics #where_clause {
@@ -154,7 +175,7 @@ fn type_id(input: &DeriveInput) -> Result<String, String> {
 /// The id as the header will store it, or a message naming the offending byte.
 fn check_id(id: String) -> Result<String, String> {
     if id.is_empty() {
-        return Err("type_id must not be empty".to_string());
+        return Err("the value type id must not be empty".to_string());
     }
     // the reader refuses these bytes, so refuse them where the caller wrote them rather
     // than when an object is written
@@ -163,23 +184,43 @@ fn check_id(id: String) -> Result<String, String> {
         .find(|b| !(0x21..=0x7e).contains(b) || *b == b'"' || *b == b'\\')
     {
         return Err(format!(
-            "type_id contains {bad:#04x}, which the header cannot hold: ASCII \
+            "the value type id contains {bad:#04x}, which the header cannot hold: ASCII \
              `0x21..=0x7e` without a quote or a backslash"
         ));
     }
     Ok(id)
 }
 
-/// Which of rkyv's three derives the item already names, if any.
-fn existing_archive_derive(item: &Item) -> Option<&'static str> {
-    let attrs = match item {
+fn attrs_of(item: &Item) -> &[syn::Attribute] {
+    match item {
         Item::Struct(s) => &s.attrs,
         Item::Enum(e) => &e.attrs,
         Item::Union(u) => &u.attrs,
-        _ => return None,
-    };
+        _ => &[],
+    }
+}
+
+/// Whether the item's own `#[derive(...)]` list names `name`.
+fn has_derive(item: &Item, name: &str) -> bool {
+    attrs_of(item).iter().any(|attr| {
+        if !attr.path().is_ident("derive") {
+            return false;
+        }
+        let mut found = false;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.segments.last().is_some_and(|s| s.ident == name) {
+                found = true;
+            }
+            Ok(())
+        });
+        found
+    })
+}
+
+/// Which of rkyv's three derives the item already names, if any.
+fn existing_archive_derive(item: &Item) -> Option<&'static str> {
     let mut found = None;
-    for attr in attrs {
+    for attr in attrs_of(item) {
         if !attr.path().is_ident("derive") {
             continue;
         }
@@ -225,34 +266,33 @@ fn compile_error(item: &Item, message: impl std::fmt::Display) -> TokenStream {
     .into()
 }
 
-/// `type_id = "..."` and, optionally, `canonicalize = path`, parsed the way `#[snap(..)]`
-/// is on the derive.
+/// The attribute's arguments: a leading id, then `canonicalize = path` and `rkyv(...)`.
+#[derive(Default)]
 struct Args {
     id: Option<String>,
     canonicalize: Option<syn::Path>,
+    rkyv: Option<proc_macro2::TokenStream>,
     error: Option<String>,
 }
 
 /// What to say when the attribute carries no id.
-const MISSING_ID: &str = "add type_id = \"...\": the id is what a reader matches on";
+fn missing_id() -> String {
+    "name the value type id first, for example #[snap_value(\"demo.x:v1\")]".to_string()
+}
 
 impl syn::parse::Parse for Args {
     fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-        let mut out = Args {
-            id: None,
-            canonicalize: None,
-            error: None,
-        };
+        let mut out = Args::default();
+        if input.peek(syn::LitStr) {
+            let id: syn::LitStr = input.parse()?;
+            out.id = Some(id.value());
+            if !input.is_empty() {
+                let _: Token![,] = input.parse()?;
+            }
+        }
         while !input.is_empty() {
             let meta: Meta = input.parse()?;
             match meta {
-                Meta::NameValue(nv) if nv.path.is_ident("type_id") => match nv.value {
-                    Expr::Lit(lit) => match lit.lit {
-                        Lit::Str(s) => out.id = Some(s.value()),
-                        _ => out.error = Some("type_id wants a string literal".to_string()),
-                    },
-                    _ => out.error = Some("type_id wants a string literal".to_string()),
-                },
                 Meta::NameValue(nv) if nv.path.is_ident("canonicalize") => match nv.value {
                     Expr::Path(path) => out.canonicalize = Some(path.path),
                     _ => {
@@ -263,16 +303,34 @@ impl syn::parse::Parse for Args {
                         )
                     }
                 },
+                Meta::List(list) if list.path.is_ident("rkyv") => {
+                    // `crate = ...` would fight the path this attribute sets, so it is
+                    // refused here instead of at the derive
+                    match list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) {
+                        Ok(items) => {
+                            if items.iter().any(|m| m.path().is_ident("crate")) {
+                                out.error = Some(
+                                    "rkyv(crate = ...) is set by #[snap_value]; pass only the \
+                                     archive options you need"
+                                        .to_string(),
+                                );
+                            } else {
+                                out.rkyv = Some(quote!(#items));
+                            }
+                        }
+                        Err(e) => out.error = Some(e.to_string()),
+                    }
+                }
                 _ => {
                     out.error = Some(
-                        "the arguments here are type_id = \"...\" and, optionally, \
-                     canonicalize = some_fn"
+                        "the arguments are an id string first, then optionally \
+                         canonicalize = some_fn and rkyv(...)"
                             .to_string(),
                     )
                 }
             }
             if !input.is_empty() {
-                let _: syn::Token![,] = input.parse()?;
+                let _: Token![,] = input.parse()?;
             }
         }
         Ok(out)

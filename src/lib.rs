@@ -113,6 +113,10 @@ pub enum Error {
     BadValue,
     /// A journal record or its state is not a record this build can act on.
     BadRecord(&'static str),
+    /// The object a journal was attached to is gone or is no longer that object. A
+    /// journal is a log of changes to one object, so this is not damage to the log:
+    /// point the journal at the object it was attached to, or the log means nothing.
+    BaseLost(String),
     /// Records were lost: the next sequence number on disk is not the expected one.
     SequenceGap {
         /// The sequence number the journal expected next.
@@ -155,7 +159,8 @@ impl fmt::Display for Error {
             }
             Error::ConfigMismatch(why) => write!(f, "{why}"),
             Error::BadValue => write!(f, "value could not be decoded"),
-            Error::BadRecord(why) => write!(f, "bad journal record: {why}"),
+            Error::BadRecord(what) => write!(f, "journal record: {what}"),
+            Error::BaseLost(what) => write!(f, "journal base: {what}"),
             Error::SequenceGap { expected, found } => {
                 write!(
                     f,

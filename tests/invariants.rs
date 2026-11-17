@@ -436,8 +436,11 @@ fn a_journal_checkpoint_carries_its_arena_and_nothing_else() {
     std::fs::remove_dir_all(&dir).ok();
     // an empty arena still gets a section, so a validator that requires it can open
     // the journal's own object
-    let mut j: Journal<u32> =
-        Journal::open_with_payload(&dir, [31u8; 16], PayloadSection::payload(16)).unwrap();
+    let mut j: Journal<u32> = Journal::options(&dir)
+        .start([31u8; 16])
+        .payload(PayloadSection::payload(16))
+        .open()
+        .unwrap();
     j.insert("10.0.0.0/8".parse().unwrap(), 1).unwrap();
     let object = j.checkpoint(&Opts::now()).expect("checkpoint");
 

@@ -27,7 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::remove_dir_all(&dir).ok();
     let log = dir.join("journal");
     // a fixed generation, so the bytes below are the same on every run
-    let mut j: Journal<V> = Journal::options(&log, [0x11; 16])
+    let mut j: Journal<V> = Journal::options(&log)
+        .start([0x11; 16])
         .payload(PayloadSection::payload(16))
         .generation([0x22; 16])
         .open()?;

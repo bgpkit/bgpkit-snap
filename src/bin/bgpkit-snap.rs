@@ -10,10 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use bgpkit_snap::journal::Journal;
+use bgpkit_snap::journal::{recorded_type_id, Journal};
 use bgpkit_snap::{
     header::{ENTRY_LEN, HEADER_LEN},
-    Header, Opts, Snapshot, TreeId, Writer,
+    Header, Opts, Snapshot, Writer,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use ipnet::IpNet;
@@ -76,22 +76,36 @@ enum Cmd {
     Verify { file: String },
     /// What the object holds: sections, sizes, and counts when the value type is ours
     Stats { file: String },
-    /// Fold a journal directory into one snapshot object
-    Fold {
-        /// The journal directory
+    /// Keep a snapshot current: a journal is a log of changes over one object
+    Journal {
+        #[command(subcommand)]
+        cmd: JournalCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum JournalCmd {
+    /// Adopt an object as the base of a new journal in this directory
+    Init {
+        /// The object the log keeps current
+        base: String,
+        /// The directory the journal lives in
         dir: String,
-        #[arg(short, long)]
-        out: String,
-        /// Tree name the journal was opened with
-        #[arg(long, default_value = "snap")]
-        tree: String,
-        /// Value type the journal stores
-        #[arg(long, value_enum, default_value = "u32")]
-        value_type: ValueType,
+    },
+    /// Append records to the log: one JSON object per line
+    ///
+    /// `{"prefix": "10.0.0.0/8", "value": 5}` inserts or replaces a value, and
+    /// `{"prefix": "10.0.0.0/8", "withdraw": true}` removes one.
+    Append { dir: String, records: String },
+    /// Fold the log into a new object inside the journal directory
+    Checkpoint {
+        dir: String,
         /// unix seconds UTC for the object; defaults to now
         #[arg(long)]
         created_at: Option<i64>,
     },
+    /// What the log holds: its base, its sequence, its last checkpoint
+    Status { dir: String },
 }
 
 fn main() {
@@ -129,16 +143,19 @@ fn main() {
             Ok(()) => {}
             Err(e) => fail(&format!("{e}")),
         },
-        Cmd::Fold {
-            dir,
-            out,
-            tree,
-            value_type,
-            created_at,
-        } => match fold(&dir, &out, &tree, value_type, created_at, json) {
-            Ok(()) => {}
-            Err(e) => fail(&format!("{e}")),
-        },
+        Cmd::Journal { cmd } => {
+            let outcome = match cmd {
+                JournalCmd::Init { base, dir } => journal_init(&base, &dir, json),
+                JournalCmd::Append { dir, records } => journal_append(&dir, &records, json),
+                JournalCmd::Checkpoint { dir, created_at } => {
+                    journal_checkpoint(&dir, created_at, json)
+                }
+                JournalCmd::Status { dir } => journal_status(&dir, json),
+            };
+            if let Err(e) = outcome {
+                fail(&format!("{e}"));
+            }
+        }
     }
 }
 
@@ -406,83 +423,255 @@ fn stats(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Turn a journal into one object. Writing a journal is the application's job; what a
 /// caller needs from the CLI is the readable, distributable result.
-fn fold(
+/// `journal init`: adopt an object as the base of a new journal.
+fn journal_init(base: &str, dir: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // the base's own header says which value type it holds, so the caller does not
+    // have to repeat what the file already records
+    let raw = std::fs::read(base)?;
+    let header = Header::parse(&raw)?;
+    let type_id = header.type_id_str();
+    let value = ValueType::from_type_id(&type_id).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "{base} holds {type_id}, which this binary cannot decode: a value type belongs to \
+             the program that declares it, and that program opens the journal itself"
+        ))
+    })?;
+    macro_rules! init_as {
+        ($t:ty) => {{
+            let journal: Journal<$t> = Journal::attach(base, dir)?;
+            (journal.len(), journal.seq(), journal.generation())
+        }};
+    }
+    let (entries, seq, generation) = match value {
+        ValueType::U8 => init_as!(u8),
+        ValueType::U16 => init_as!(u16),
+        ValueType::U32 => init_as!(u32),
+        ValueType::U64 => init_as!(u64),
+        ValueType::U128 => init_as!(u128),
+    };
+    let content_id = bgpkit_snap::header::hex32(&header.content_id);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dir": dir,
+                "base": base,
+                "base_content_id": content_id,
+                "type_id": type_id,
+                "generation": bgpkit_snap::header::hex16(&generation),
+                "entries": entries,
+                "seq": seq,
+            })
+        );
+    } else {
+        println!("journal in {dir}: base {base} ({content_id}), {entries} entries at seq {seq}");
+    }
+    Ok(())
+}
+
+/// `journal append`: add records to the log, then make them durable.
+fn journal_append(dir: &str, records: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let value = journal_value_type(dir)?;
+    let text = std::fs::read_to_string(records)?;
+    macro_rules! append_as {
+        ($t:ty) => {{
+            let mut journal: Journal<$t> = Journal::open(dir)?;
+            let (mut inserts, mut withdrawals) = (0usize, 0usize);
+            for (i, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+                let v: serde_json::Value = serde_json::from_str(line)
+                    .map_err(|e| std::io::Error::other(format!("{e}, line {}", i + 1)))?;
+                let prefix: IpNet = v["prefix"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!("missing prefix, line {}", i + 1))
+                    })?
+                    .parse()
+                    .map_err(|e: ipnet::AddrParseError| {
+                        std::io::Error::other(format!("{e}, line {}", i + 1))
+                    })?;
+                if v.get("withdraw").and_then(|w| w.as_bool()).unwrap_or(false) {
+                    journal
+                        .withdraw(prefix)
+                        .map_err(|e| std::io::Error::other(format!("{e}, line {}", i + 1)))?;
+                    withdrawals += 1;
+                } else {
+                    let (_, raw) = parse_line(line, value)
+                        .map_err(|e| std::io::Error::other(format!("{e}, line {}", i + 1)))?;
+                    let value: $t = raw.try_into().map_err(|_| {
+                        std::io::Error::other(format!("{raw} does not fit, line {}", i + 1))
+                    })?;
+                    journal
+                        .insert(prefix, value)
+                        .map_err(|e| std::io::Error::other(format!("{e}, line {}", i + 1)))?;
+                    inserts += 1;
+                }
+            }
+            journal.sync()?;
+            (journal.len(), journal.seq(), inserts, withdrawals)
+        }};
+    }
+    let (entries, seq, inserts, withdrawals) = match value {
+        ValueType::U8 => append_as!(u8),
+        ValueType::U16 => append_as!(u16),
+        ValueType::U32 => append_as!(u32),
+        ValueType::U64 => append_as!(u64),
+        ValueType::U128 => append_as!(u128),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dir": dir,
+                "inserts": inserts,
+                "withdrawals": withdrawals,
+                "entries": entries,
+                "next_seq": seq,
+            })
+        );
+    } else {
+        println!(
+            "appended to {dir}: {inserts} inserts, {withdrawals} withdrawals, {entries} entries, \
+             next seq {seq}"
+        );
+    }
+    Ok(())
+}
+
+/// `journal checkpoint`: fold the log into a new object inside the directory.
+fn journal_checkpoint(
     dir: &str,
-    out: &str,
-    tree: &str,
-    value_type: ValueType,
     created_at: Option<i64>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let value = journal_value_type(dir)?;
     let opts = Opts {
         created_at: created_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
         stream: None,
         window: None,
         extras: &[],
     };
-    // the journal's value type decides the width, and the flag has to match it
-    macro_rules! fold_as {
+    macro_rules! checkpoint_as {
         ($t:ty) => {{
-            let j: Journal<$t> = Journal::open(dir, TreeId::from_name(tree))?;
-            let entries = j.len();
-            let seq = j.seq();
-            let bytes = j.to_bytes(&opts)?;
-            drop(j);
-            (entries, seq, bytes)
+            let mut journal: Journal<$t> = Journal::open(dir)?;
+            let entries = journal.len();
+            let seq = journal.seq();
+            let path = journal.checkpoint(&opts)?;
+            (entries, seq, path)
         }};
     }
-    let (entries, seq, bytes) = match value_type {
-        ValueType::U8 => fold_as!(u8),
-        ValueType::U16 => fold_as!(u16),
-        ValueType::U32 => fold_as!(u32),
-        ValueType::U64 => fold_as!(u64),
-        ValueType::U128 => fold_as!(u128),
+    let (entries, seq, path) = match value {
+        ValueType::U8 => checkpoint_as!(u8),
+        ValueType::U16 => checkpoint_as!(u16),
+        ValueType::U32 => checkpoint_as!(u32),
+        ValueType::U64 => checkpoint_as!(u64),
+        ValueType::U128 => checkpoint_as!(u128),
     };
-    let target = resolve_symlink(Path::new(out));
-    write_object_atomically(&target, &bytes)?;
+    // the object it just wrote is the answer, so report its own header rather than
+    // the arguments this call was made with
+    let raw = std::fs::read(&path)?;
+    let header = Header::parse(&raw)?;
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "journal": dir,
-                "out": out,
+                "dir": dir,
+                "object": path.display().to_string(),
+                "content_id": bgpkit_snap::header::hex32(&header.content_id),
                 "entries": entries,
-                "seq": seq,
-                "type_id": type_id_of(value_type),
-                "bytes": bytes.len(),
+                "base_seq": header.stream().map(|s| s.base_seq),
+                "next_seq": seq,
+                "bytes": raw.len(),
             })
         );
     } else {
         println!(
-            "folded {dir} into {out}: {entries} entries at seq {seq}, {} bytes",
-            bytes.len()
+            "checkpointed {dir}: {} entries at seq {}, object {} ({} bytes)",
+            entries,
+            seq,
+            path.display(),
+            raw.len()
         );
     }
     Ok(())
 }
 
-/// Write `bytes` beside `path` and rename, so a reader never sees a partial object and a
-/// failed write leaves whatever was already there.
-fn write_object_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let tmp = path.with_extension(format!("snap.{}.tmp", std::process::id()));
-    let written = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()
-    })();
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+/// `journal status`: what the log holds and where it is anchored.
+fn journal_status(dir: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let value = journal_value_type(dir)?;
+    macro_rules! status_as {
+        ($t:ty) => {{
+            let journal: Journal<$t> = Journal::open(dir)?;
+            (
+                journal.len(),
+                journal.seq(),
+                journal.base().cloned(),
+                journal.last_checkpoint().cloned(),
+                journal.generation(),
+            )
+        }};
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    let (entries, seq, base, checkpoint, generation) = match value {
+        ValueType::U8 => status_as!(u8),
+        ValueType::U16 => status_as!(u16),
+        ValueType::U32 => status_as!(u32),
+        ValueType::U64 => status_as!(u64),
+        ValueType::U128 => status_as!(u128),
+    };
+    let base_content_id = base.as_ref().map(|(id, _)| id.clone());
+    let base_path = base.as_ref().map(|(_, p)| p.clone());
+    let checkpoint =
+        checkpoint.map(|(covered, file)| serde_json::json!({ "base_seq": covered, "file": file }));
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dir": dir,
+                "type_id": type_id_of(value),
+                "generation": bgpkit_snap::header::hex16(&generation),
+                "base_content_id": base_content_id,
+                "base_path": base_path,
+                "entries": entries,
+                "next_seq": seq,
+                "checkpoint": checkpoint,
+            })
+        );
+    } else {
+        match (&base_content_id, &base_path) {
+            (Some(id), Some(path)) => println!("base: {path} ({id})"),
+            _ => println!("base: none recorded"),
+        }
+        match &checkpoint {
+            Some(c) => println!(
+                "checkpoint: {} covering up to seq {}",
+                c["file"], c["base_seq"]
+            ),
+            None => println!("checkpoint: none yet, the tree comes from the base"),
+        }
+        println!(
+            "entries: {entries}, next seq: {seq}, generation: {}",
+            bgpkit_snap::header::hex16(&generation)
+        );
     }
     Ok(())
 }
 
-/// The type id a width writes, for JSON output.
+/// The value type a journal directory records, so a verb can pick its `T` without the
+/// caller repeating what the directory already says.
+fn journal_value_type(dir: &str) -> Result<ValueType, Box<dyn std::error::Error>> {
+    let type_id = recorded_type_id(dir)?.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "{dir} holds no journal: start one with journal init <base.snap> {dir}"
+        ))
+    })?;
+    match ValueType::from_type_id(&type_id) {
+        Some(v) => Ok(v),
+        None => Err(Box::new(std::io::Error::other(format!(
+            "{dir} holds {type_id}, which this binary cannot decode: a value type belongs to \
+             the program that declares it, and that program opens the journal itself"
+        ))) as Box<dyn std::error::Error>),
+    }
+}
+
 fn type_id_of(ty: ValueType) -> &'static str {
     match ty {
         ValueType::U8 => "snap.u8:v1",

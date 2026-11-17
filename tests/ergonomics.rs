@@ -35,12 +35,18 @@ fn a_tree_id_from_a_name_is_stable_and_distinguishes_trees() {
 
     let d = dir("treeid");
     {
-        let mut j: Journal<V> =
-            Journal::open_with_payload(&d, a, PayloadSection::payload(SECTION)).unwrap();
+        let mut j: Journal<V> = Journal::options(&d)
+            .start(a)
+            .payload(PayloadSection::payload(SECTION))
+            .open()
+            .unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.sync().unwrap();
     }
-    let j: Journal<V> = Journal::open_with_payload(&d, a, PayloadSection::payload(SECTION))
+    let j: Journal<V> = Journal::options(&d)
+        .start(a)
+        .payload(PayloadSection::payload(SECTION))
+        .open()
         .expect("the same name reopens its own journal");
     assert_eq!(j.len(), 1);
     std::fs::remove_dir_all(&d).ok();
@@ -50,20 +56,19 @@ fn a_tree_id_from_a_name_is_stable_and_distinguishes_trees() {
 fn a_journal_cannot_adopt_another_trees_directory() {
     let d = dir("wrong-tree");
     {
-        let mut j: Journal<V> = Journal::open_with_payload(
-            &d,
-            TreeId::from_name("first"),
-            PayloadSection::payload(SECTION),
-        )
-        .unwrap();
+        let mut j: Journal<V> = Journal::options(&d)
+            .start(TreeId::from_name("first"))
+            .payload(PayloadSection::payload(SECTION))
+            .open()
+            .unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.checkpoint(&Opts::now()).unwrap();
     }
-    let err = match Journal::<V>::open_with_payload(
-        &d,
-        TreeId::from_name("second"),
-        PayloadSection::payload(SECTION),
-    ) {
+    let err = match Journal::<V>::options(&d)
+        .start(TreeId::from_name("second"))
+        .payload(PayloadSection::payload(SECTION))
+        .open()
+    {
         Ok(_) => panic!("a checkpoint from another tree must be refused"),
         Err(e) => e,
     };
@@ -77,12 +82,11 @@ fn a_journal_cannot_adopt_another_trees_directory() {
 #[test]
 fn to_bytes_answers_the_queries_the_journal_does_not() {
     let d = dir("tobytes");
-    let mut j: Journal<V> = Journal::open_with_payload(
-        &d,
-        TreeId::from_name("tobytes"),
-        PayloadSection::payload(SECTION),
-    )
-    .unwrap();
+    let mut j: Journal<V> = Journal::options(&d)
+        .start(TreeId::from_name("tobytes"))
+        .payload(PayloadSection::payload(SECTION))
+        .open()
+        .unwrap();
     j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
     j.insert("10.1.0.0/16".parse().unwrap(), V(2)).unwrap();
     j.sync().unwrap();
@@ -203,7 +207,8 @@ fn a_value_whose_deserialize_refuses_is_an_error_not_a_miss() {
 #[test]
 fn a_zero_generation_is_refused_rather_than_breaking_every_checkpoint() {
     let d = dir("zero-generation");
-    let err = match Journal::<V>::options(&d, TreeId::from_name("zero-gen"))
+    let err = match Journal::<V>::options(&d)
+        .start(TreeId::from_name("zero-gen"))
         .generation([0u8; 16])
         .open()
     {
@@ -235,7 +240,7 @@ fn a_checkpoint_that_holds_an_undecodable_value_is_refused_before_the_commit() {
     }
 
     let d = dir("checkpoint-refuses");
-    let mut j: Journal<F> = Journal::open(&d, TreeId::from_name("undecodable")).unwrap();
+    let mut j: Journal<F> = Journal::start(&d, TreeId::from_name("undecodable")).unwrap();
     j.insert("10.0.0.0/8".parse().unwrap(), F(1)).unwrap();
     let err = j
         .checkpoint(&Opts::now())
@@ -244,9 +249,12 @@ fn a_checkpoint_that_holds_an_undecodable_value_is_refused_before_the_commit() {
         format!("{err}").to_lowercase().contains("value"),
         "got {err}"
     );
-    let state = std::fs::read_to_string(d.join("state.json")).unwrap_or_default();
+    // the state file names the base, so ask it for the key rather than for the word
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("state.json")).unwrap_or_default())
+            .unwrap_or(serde_json::Value::Null);
     assert!(
-        !state.contains("checkpoint"),
+        state.get("checkpoint").is_none(),
         "nothing was committed: {state}"
     );
     std::fs::remove_dir_all(&d).ok();
@@ -257,12 +265,19 @@ fn a_journal_refuses_a_value_type_or_payload_other_than_its_own() {
     let d = dir("config-mismatch");
     let tree = TreeId::from_name("config-mismatch");
     {
-        let mut j: Journal<V> =
-            Journal::open_with_payload(&d, tree, PayloadSection::payload(16)).unwrap();
+        let mut j: Journal<V> = Journal::options(&d)
+            .start(tree)
+            .payload(PayloadSection::payload(16))
+            .open()
+            .unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.sync().unwrap();
     }
-    let err = match Journal::<V>::open_with_payload(&d, tree, PayloadSection::payload(17)) {
+    let err = match Journal::<V>::options(&d)
+        .start(tree)
+        .payload(PayloadSection::payload(17))
+        .open()
+    {
         Ok(_) => panic!("another payload id must not adopt the directory"),
         Err(e) => e,
     };
@@ -275,7 +290,7 @@ fn repair_refuses_a_directory_that_still_has_its_state_file() {
     let d = dir("repair-live-state");
     let tree = TreeId::from_name("repair-live");
     {
-        let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+        let mut j: Journal<V> = Journal::start(&d, tree).unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.checkpoint(&Opts::now()).unwrap();
     }
@@ -299,11 +314,18 @@ fn a_payload_kind_with_high_bytes_survives_state_json() {
         required: true,
     };
     {
-        let mut j: Journal<V> = Journal::open_with_payload(&d, tree, payload).unwrap();
+        let mut j: Journal<V> = Journal::options(&d)
+            .start(tree)
+            .payload(payload)
+            .open()
+            .unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.sync().unwrap();
     }
-    let j: Journal<V> = Journal::open_with_payload(&d, tree, payload)
+    let j: Journal<V> = Journal::options(&d)
+        .start(tree)
+        .payload(payload)
+        .open()
         .expect("a journal must reopen with the kind it was written with");
     assert_eq!(j.len(), 1);
     std::fs::remove_dir_all(&d).ok();
@@ -347,7 +369,7 @@ fn a_checkpoint_sequence_of_u64_max_is_refused_not_added_to() {
     )
     .unwrap();
 
-    let opened = std::panic::catch_unwind(|| match Journal::<V>::open(&log, tree) {
+    let opened = std::panic::catch_unwind(|| match Journal::<V>::start(&log, tree) {
         Ok(_) => Err::<(), String>("accepted an unrepresentable sequence".to_string()),
         Err(e) => Err::<(), String>(format!("{e}")),
     });
@@ -363,7 +385,7 @@ fn a_second_checkpoint_after_a_restart_does_not_reuse_a_committed_name() {
     let d = dir("restart-name");
     let tree = TreeId::from_name("restart-name");
     let first = {
-        let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+        let mut j: Journal<V> = Journal::start(&d, tree).unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.checkpoint(&Opts::now()).unwrap()
     };
@@ -372,7 +394,7 @@ fn a_second_checkpoint_after_a_restart_does_not_reuse_a_committed_name() {
     {
         // no new records: the sequence does not advance, only the ordinal can keep the
         // two checkpoints apart
-        let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+        let mut j: Journal<V> = Journal::start(&d, tree).unwrap();
         let second = j
             .checkpoint(&Opts {
                 created_at: 1_794_614_400 + 60,
@@ -408,7 +430,7 @@ fn a_checkpoint_whose_publication_fails_leaves_the_stable_path_openable() {
     // named, so the stable path was dangling until the next open.
     let d = dir("publish-fail");
     let tree = TreeId::from_name("publish-fail");
-    let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+    let mut j: Journal<V> = Journal::start(&d, tree).unwrap();
     j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
     j.checkpoint(&Opts::now()).unwrap();
 
@@ -445,7 +467,11 @@ fn repair_without_a_payload_section_leaves_a_payload_checkpoint_alone() {
         required: false,
     };
     {
-        let mut j: Journal<V> = Journal::open_with_payload(&d, tree, payload).unwrap();
+        let mut j: Journal<V> = Journal::options(&d)
+            .start(tree)
+            .payload(payload)
+            .open()
+            .unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.checkpoint(&Opts::now()).unwrap();
     }
@@ -555,9 +581,9 @@ fn an_exhausted_sequence_space_is_refused_instead_of_wrapped() {
     )
     .unwrap();
 
-    let opened = std::panic::catch_unwind(|| Journal::<V>::open(&log, tree).map(|j| j.len()));
+    let opened = std::panic::catch_unwind(|| Journal::<V>::start(&log, tree).map(|j| j.len()));
     let mut j = match opened.expect("opening must not panic") {
-        Ok(_) => Journal::<V>::open(&log, tree).expect("the directory opens"),
+        Ok(_) => Journal::<V>::start(&log, tree).expect("the directory opens"),
         Err(e) => panic!("the directory must open with seq = u64::MAX: {e}"),
     };
     let err = match j.insert("192.0.2.0/24".parse().unwrap(), V(2)) {
@@ -576,7 +602,7 @@ fn repair_replaces_a_state_file_it_cannot_read() {
     let d = dir("repair-corrupt-state");
     let tree = TreeId::from_name("repair-corrupt");
     {
-        let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+        let mut j: Journal<V> = Journal::start(&d, tree).unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.checkpoint(&Opts::now()).unwrap();
     }
@@ -586,7 +612,7 @@ fn repair_replaces_a_state_file_it_cannot_read() {
         .expect("an unreadable state file is what repair is for");
     assert_eq!(j.len(), 1);
     drop(j);
-    let reopened: Journal<V> = Journal::open(&d, tree).expect("the repaired directory opens");
+    let reopened: Journal<V> = Journal::start(&d, tree).expect("the repaired directory opens");
     assert_eq!(reopened.len(), 1);
     std::fs::remove_dir_all(&d).ok();
 }
@@ -610,11 +636,11 @@ fn the_first_record_pins_the_value_type() {
     let d = dir("type-pinned");
     let tree = TreeId::from_name("type-pinned");
     {
-        let mut j: Journal<u64> = Journal::open(&d, tree).unwrap();
+        let mut j: Journal<u64> = Journal::start(&d, tree).unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), 7u64).unwrap();
         // deliberately no sync: the record exists, the state has to exist with it
     }
-    let err = match Journal::<V>::open(&d, tree) {
+    let err = match Journal::<V>::start(&d, tree) {
         Ok(_) => panic!("another value type must not adopt this directory"),
         Err(e) => e,
     };
@@ -629,13 +655,13 @@ fn the_first_record_pins_the_value_type() {
 fn a_journal_reports_the_next_sequence() {
     let d = dir("seq-accessor");
     let tree = TreeId::from_name("seq-accessor");
-    let mut j: Journal<V> = Journal::open(&d, tree).unwrap();
+    let mut j: Journal<V> = Journal::start(&d, tree).unwrap();
     let first = j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
     assert_eq!(j.seq(), first + 1, "one record in, one sequence consumed");
     j.sync().unwrap();
     drop(j);
 
-    let j: Journal<V> = Journal::open(&d, tree).unwrap();
+    let j: Journal<V> = Journal::start(&d, tree).unwrap();
     assert_eq!(
         j.seq(),
         first + 1,

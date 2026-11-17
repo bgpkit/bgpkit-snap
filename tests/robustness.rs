@@ -124,7 +124,7 @@ fn a_damaged_journal_segment_is_an_error_not_a_panic() {
     let tree = bgpkit_snap::TreeId::from_name("robust");
     {
         let mut j: bgpkit_snap::journal::Journal<V> =
-            bgpkit_snap::journal::Journal::open(&dir, tree).unwrap();
+            bgpkit_snap::journal::Journal::start(&dir, tree).unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), V(1)).unwrap();
         j.sync().unwrap();
     }
@@ -151,7 +151,7 @@ fn a_damaged_journal_segment_is_an_error_not_a_panic() {
         bytes[at] ^= next() | 1;
         std::fs::write(&segment, &bytes).unwrap();
         let opened = std::panic::catch_unwind(|| {
-            match bgpkit_snap::journal::Journal::<V>::open(&dir, tree) {
+            match bgpkit_snap::journal::Journal::<V>::start(&dir, tree) {
                 Ok(_) | Err(_) => (),
             }
         });

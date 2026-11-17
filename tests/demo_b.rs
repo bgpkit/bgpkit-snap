@@ -154,12 +154,11 @@ fn demo_b_journal_carries_the_payload() {
 
     // write
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .expect("open journal");
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .expect("open journal");
         j.insert_with_blob("10.0.0.0/8".parse().unwrap(), &a, |off| PathRef {
             off: off as u32,
             len: a.len() as u32,
@@ -187,12 +186,11 @@ fn demo_b_journal_carries_the_payload() {
 
     // recover: the arena is rebuilt from the records, in order
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .expect("reopen journal");
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .expect("reopen journal");
         assert_eq!(j.len(), 2);
         assert_eq!(j.blob_len(), a.len() + b.len());
         let snap_path = j
@@ -228,9 +226,11 @@ fn demo_b_journal_updates_the_live_tree_and_refuses_a_second_writer() {
     let log = dir.join("journal");
     let tree_id = [9u8; 16];
 
-    let mut j: Journal<PathRef> =
-        Journal::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
-            .expect("open");
+    let mut j: Journal<PathRef> = Journal::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .expect("open");
     j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 0 })
         .expect("insert");
     // the live tree must reflect the record immediately, before any checkpoint
@@ -238,7 +238,10 @@ fn demo_b_journal_updates_the_live_tree_and_refuses_a_second_writer() {
 
     // one writer per tree
     assert!(
-        Journal::<PathRef>::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
+        Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
             .is_err(),
         "a second writer must be refused"
     );
@@ -260,9 +263,11 @@ fn demo_b_journal_updates_the_live_tree_and_refuses_a_second_writer() {
 
     // reopening recovers the same state
     drop(j);
-    let reopened: Journal<PathRef> =
-        Journal::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
-            .expect("reopen");
+    let reopened: Journal<PathRef> = Journal::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .expect("reopen");
     assert_eq!(reopened.len(), 1, "recovery must restore the tree");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -328,12 +333,11 @@ fn recovery_keeps_a_committed_checkpoint_when_a_segment_is_lost() {
     let tree_id = [3u8; 16];
 
     let seq = {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .expect("open");
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .expect("open");
         let seq = j
             .insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 0 })
             .expect("insert");
@@ -361,9 +365,11 @@ fn recovery_keeps_a_committed_checkpoint_when_a_segment_is_lost() {
         }
     }
 
-    let mut j: Journal<PathRef> =
-        Journal::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
-            .expect("reopen");
+    let mut j: Journal<PathRef> = Journal::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .expect("reopen");
     assert_eq!(j.len(), 1, "the checkpoint must be the recovered state");
     let next = j
         .insert("192.0.2.0/24".parse().unwrap(), PathRef { off: 0, len: 0 })
@@ -378,7 +384,7 @@ fn an_empty_tree_can_be_checkpointed() {
     let dir = std::env::temp_dir().join(format!("snap-empty-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     let log = dir.join("journal");
-    let mut j: Journal<PathRef> = Journal::open(&log, [4u8; 16]).expect("open");
+    let mut j: Journal<PathRef> = Journal::start(&log, [4u8; 16]).expect("open");
     j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 0 })
         .unwrap();
     j.withdraw("10.0.0.0/8".parse().unwrap()).unwrap();
@@ -406,12 +412,11 @@ fn a_torn_tail_costs_only_the_uncommitted_record() {
     let tree_id = [7u8; 16];
 
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .expect("open");
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .expect("open");
         for p in ["10.0.0.0/8", "192.0.2.0/24", "198.51.100.0/24"] {
             j.insert(p.parse().unwrap(), PathRef { off: 0, len: 0 })
                 .unwrap();
@@ -436,17 +441,21 @@ fn a_torn_tail_costs_only_the_uncommitted_record() {
         f.write_all(&[0u8; 20]).unwrap();
     }
 
-    let j: Journal<PathRef> =
-        Journal::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
-            .expect("reopen");
+    let j: Journal<PathRef> = Journal::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .expect("reopen");
     assert_eq!(j.len(), 3, "the three committed records must survive");
 
     // a checkpoint after a torn tail must cover what is left, and then the
     // segment it covers is the one that may go
     drop(j);
-    let mut j: Journal<PathRef> =
-        Journal::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
-            .expect("reopen");
+    let mut j: Journal<PathRef> = Journal::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .expect("reopen");
     j.checkpoint(&Opts {
         created_at: 1_763_164_800,
         window: None,
@@ -491,12 +500,11 @@ fn a_hole_in_the_middle_is_an_error_not_a_shorter_tree() {
     let tree_id = [5u8; 16];
 
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .unwrap();
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         for p in ["10.0.0.0/8", "192.0.2.0/24", "198.51.100.0/24"] {
             j.insert(p.parse().unwrap(), PathRef { off: 0, len: 0 })
                 .unwrap();
@@ -519,8 +527,10 @@ fn a_hole_in_the_middle_is_an_error_not_a_shorter_tree() {
     hole.extend_from_slice(&raw[52 + first_len + drop..]);
     std::fs::write(&segment, &hole).unwrap();
 
-    let opened =
-        Journal::<PathRef>::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID));
+    let opened = Journal::<PathRef>::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open();
     match opened {
         Err(e) => assert!(format!("{e}").contains("sequence"), "got {e}"),
         Ok(j) => panic!("a missing record must not read as {} entries", j.len()),
@@ -537,7 +547,10 @@ fn a_committed_record_above_the_checkpoint_is_reported_as_a_gap() {
     let log = dir.join("journal");
     let tree_id = [6u8; 16];
     let open = || {
-        Journal::<PathRef>::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
+        Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
     };
 
     {
@@ -576,7 +589,7 @@ fn a_blob_without_a_payload_section_is_refused() {
     let dir = std::env::temp_dir().join(format!("snap-noblob-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     let log = dir.join("journal");
-    let mut j: Journal<PathRef> = Journal::open(&log, [6u8; 16]).unwrap();
+    let mut j: Journal<PathRef> = Journal::start(&log, [6u8; 16]).unwrap();
     let err = j
         .insert_with_blob("10.0.0.0/8".parse().unwrap(), b"x", |_| PathRef {
             off: 0,
@@ -594,12 +607,11 @@ fn a_corrupt_state_file_is_not_treated_as_absent() {
     let log = dir.join("journal");
     let tree_id = [8u8; 16];
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .unwrap();
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 0 })
             .unwrap();
         j.sync().unwrap();
@@ -613,7 +625,10 @@ fn a_corrupt_state_file_is_not_treated_as_absent() {
     }
     std::fs::write(log.join("state.json"), b"{not json").unwrap();
     assert!(
-        Journal::<PathRef>::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
+        Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
             .is_err(),
         "a corrupt state file must stop recovery, not reset it"
     );
@@ -627,12 +642,11 @@ fn a_snapshot_no_state_file_names_is_cleaned_up() {
     let log = dir.join("journal");
     let tree_id = [9u8; 16];
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .unwrap();
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 0 })
             .unwrap();
         j.sync().unwrap();
@@ -653,8 +667,11 @@ fn a_snapshot_no_state_file_names_is_cleaned_up() {
         .count();
     assert_eq!(kept, 2, "one named plus one orphan before the reopen");
 
-    let _j: Journal<PathRef> =
-        Journal::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID)).unwrap();
+    let _j: Journal<PathRef> = Journal::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .unwrap();
     let after: Vec<String> = std::fs::read_dir(&log)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
@@ -675,12 +692,11 @@ fn a_checkpoint_is_not_adopted_without_its_configuration() {
     let log = dir.join("journal");
     let tree_id = [12u8; 16];
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .unwrap();
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         j.insert_with_blob("10.0.0.0/8".parse().unwrap(), b"abcd", |off| PathRef {
             off: off as u32,
             len: 4,
@@ -696,7 +712,7 @@ fn a_checkpoint_is_not_adopted_without_its_configuration() {
         .unwrap();
     }
     // reopening without the payload section would silently drop the arena
-    let opened = Journal::<PathRef>::open(&log, tree_id);
+    let opened = Journal::<PathRef>::start(&log, tree_id);
     assert!(
         opened.is_err(),
         "a checkpoint with a payload section must not be adopted without it"
@@ -711,12 +727,11 @@ fn checkpoints_without_a_state_file_are_refused() {
     let log = dir.join("journal");
     let tree_id = [13u8; 16];
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .unwrap();
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 0 })
             .unwrap();
         j.sync().unwrap();
@@ -730,7 +745,10 @@ fn checkpoints_without_a_state_file_are_refused() {
     }
     std::fs::remove_file(log.join("state.json")).unwrap();
     assert!(
-        Journal::<PathRef>::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
+        Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
             .is_err(),
         "a checkpoint nobody names is not a state to recover from"
     );
@@ -744,12 +762,11 @@ fn a_journal_holding_blobs_cannot_reopen_without_its_payload_section() {
     let log = dir.join("journal");
     let tree_id = [21u8; 16];
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .unwrap();
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         j.insert_with_blob("10.0.0.0/8".parse().unwrap(), b"abcd", |off| PathRef {
             off: off as u32,
             len: 4,
@@ -758,7 +775,7 @@ fn a_journal_holding_blobs_cannot_reopen_without_its_payload_section() {
         j.sync().unwrap();
         // no checkpoint yet: the arena lives only in the segments
     }
-    let opened = Journal::<PathRef>::open(&log, tree_id);
+    let opened = Journal::<PathRef>::start(&log, tree_id);
     assert!(
         opened.is_err(),
         "reopening without the payload section would drop the arena at the next checkpoint"
@@ -773,12 +790,11 @@ fn a_malformed_checkpoint_field_is_an_error() {
     let log = dir.join("journal");
     let tree_id = [31u8; 16];
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .unwrap();
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 0 })
             .unwrap();
         j.sync().unwrap();
@@ -805,8 +821,10 @@ fn a_malformed_checkpoint_field_is_an_error() {
 
     let before = snapshots(&log);
     assert_eq!(before.len(), 1, "one snapshot before the reopen");
-    let opened =
-        Journal::<PathRef>::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID));
+    let opened = Journal::<PathRef>::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open();
     assert!(
         opened.is_err(),
         "a checkpoint missing its file must not read as no checkpoint"
@@ -832,12 +850,11 @@ fn a_damaged_segment_header_is_not_an_empty_journal() {
     let log = dir.join("journal");
     let tree_id = [41u8; 16];
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .unwrap();
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         for p in ["10.0.0.0/8", "192.0.2.0/24", "198.51.100.0/24"] {
             j.insert(p.parse().unwrap(), PathRef { off: 0, len: 0 })
                 .unwrap();
@@ -856,7 +873,10 @@ fn a_damaged_segment_header_is_not_an_empty_journal() {
     std::fs::write(&segment, &raw).unwrap();
 
     assert!(
-        Journal::<PathRef>::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
+        Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
             .is_err(),
         "an unreadable segment must not read as an empty tree"
     );
@@ -887,12 +907,11 @@ fn a_long_random_op_sequence_survives_recovery_unchanged() {
         extras: &[],
     };
     {
-        let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-            &log,
-            tree_id,
-            PayloadSection::payload(SECTION_ID),
-        )
-        .unwrap();
+        let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+            .start(tree_id)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         for _ in 0..400 {
             let r = next();
             let prefix = format!("10.{}.{}.0/24", (r >> 8) % 4, (r >> 16) % 4);
@@ -914,8 +933,11 @@ fn a_long_random_op_sequence_survives_recovery_unchanged() {
     }
 
     // recover from disk, checkpoint again, and compare every value
-    let mut j: Journal<PathRef> =
-        Journal::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID)).unwrap();
+    let mut j: Journal<PathRef> = Journal::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .unwrap();
     assert_eq!(
         j.len(),
         expected.len(),
@@ -940,12 +962,11 @@ fn a_segment_header_with_unknown_fields_is_refused() {
         let log = dir.join("journal");
         let tree_id = [61u8; 16];
         {
-            let mut j: Journal<PathRef> = Journal::<PathRef>::open_with_payload(
-                &log,
-                tree_id,
-                PayloadSection::payload(SECTION_ID),
-            )
-            .unwrap();
+            let mut j: Journal<PathRef> = Journal::<PathRef>::options(&log)
+                .start(tree_id)
+                .payload(PayloadSection::payload(SECTION_ID))
+                .open()
+                .unwrap();
             j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 0 })
                 .unwrap();
             j.sync().unwrap();
@@ -959,12 +980,11 @@ fn a_segment_header_with_unknown_fields_is_refused() {
         raw[offset] = value;
         std::fs::write(&segment, &raw).unwrap();
         assert!(
-            Journal::<PathRef>::open_with_payload(
-                &log,
-                tree_id,
-                PayloadSection::payload(SECTION_ID)
-            )
-            .is_err(),
+            Journal::<PathRef>::options(&log)
+                .start(tree_id)
+                .payload(PayloadSection::payload(SECTION_ID))
+                .open()
+                .is_err(),
             "byte {offset} = {value} must be refused"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -976,8 +996,11 @@ fn a_writer_can_read_back_what_it_holds() {
     let dir = std::env::temp_dir().join(format!("snap-get-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     let log = dir.join("journal");
-    let mut j: Journal<PathRef> =
-        Journal::open_with_payload(&log, [77u8; 16], PayloadSection::payload(SECTION_ID)).unwrap();
+    let mut j: Journal<PathRef> = Journal::options(&log)
+        .start([77u8; 16])
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .unwrap();
     j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 7, len: 2 })
         .unwrap();
     j.insert("2001:db8::/32".parse().unwrap(), PathRef { off: 9, len: 1 })
@@ -1003,8 +1026,11 @@ fn the_lock_is_its_own_error_and_the_repair_path_can_be_reached() {
     let log = dir.join("journal");
     let tree_id = [91u8; 16];
 
-    let mut j: Journal<PathRef> =
-        Journal::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID)).unwrap();
+    let mut j: Journal<PathRef> = Journal::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .unwrap();
     j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 0 })
         .unwrap();
     j.sync().unwrap();
@@ -1017,7 +1043,10 @@ fn the_lock_is_its_own_error_and_the_repair_path_can_be_reached() {
     let name = object.file_name().unwrap().to_string_lossy().into_owned();
 
     // a second writer is a lock, not corruption
-    match Journal::<PathRef>::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
+    match Journal::<PathRef>::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
     {
         Err(bgpkit_snap::Error::Locked) => {}
         other => panic!(
@@ -1029,7 +1058,10 @@ fn the_lock_is_its_own_error_and_the_repair_path_can_be_reached() {
 
     // the repair the guide documents is reachable: lose the state, then adopt
     std::fs::remove_file(log.join("state.json")).unwrap();
-    match Journal::<PathRef>::open_with_payload(&log, tree_id, PayloadSection::payload(SECTION_ID))
+    match Journal::<PathRef>::options(&log)
+        .start(tree_id)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
     {
         Ok(_) => panic!("with no state file, open must refuse"),
         Err(e) => assert!(format!("{e}").contains("state.json"), "got {e}"),
@@ -1065,8 +1097,11 @@ fn a_checkpoint_carries_the_journals_own_sections_only() {
     let dir = std::env::temp_dir().join(format!("snap-extras-reopen-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     let side = b"sidecar".to_vec();
-    let mut j: Journal<PathRef> =
-        Journal::open_with_payload(&dir, [41u8; 16], PayloadSection::payload(SECTION_ID)).unwrap();
+    let mut j: Journal<PathRef> = Journal::options(&dir)
+        .start([41u8; 16])
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .unwrap();
     j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 1 })
         .unwrap();
     for required in [false, true] {
@@ -1098,8 +1133,11 @@ fn a_payload_bearing_checkpoint_cannot_be_reopened_without_its_payload() {
     std::fs::remove_dir_all(&dir).ok();
     let tree = [45u8; 16];
     {
-        let mut j: Journal<PathRef> =
-            Journal::open_with_payload(&dir, tree, PayloadSection::payload(SECTION_ID)).unwrap();
+        let mut j: Journal<PathRef> = Journal::options(&dir)
+            .start(tree)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         j.insert_with_blob("10.0.0.0/8".parse().unwrap(), b"data", |off| PathRef {
             off: off as u32,
             len: 4,
@@ -1109,7 +1147,7 @@ fn a_payload_bearing_checkpoint_cannot_be_reopened_without_its_payload() {
     }
     // opening without the payload would leave the arena on disk and the handles
     // pointing into nothing, so it is refused rather than silently accepted
-    let err = match Journal::<PathRef>::open(&dir, tree) {
+    let err = match Journal::<PathRef>::start(&dir, tree) {
         Ok(_) => panic!("a payload-bearing checkpoint must not open without its payload"),
         Err(e) => e,
     };
@@ -1121,8 +1159,11 @@ fn a_payload_bearing_checkpoint_cannot_be_reopened_without_its_payload() {
 fn the_removal_and_blob_paths_refuse_a_host_bit_prefix() {
     let dir = std::env::temp_dir().join(format!("snap-canonical-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
-    let mut j: Journal<PathRef> =
-        Journal::open_with_payload(&dir, [43u8; 16], PayloadSection::payload(SECTION_ID)).unwrap();
+    let mut j: Journal<PathRef> = Journal::options(&dir)
+        .start([43u8; 16])
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .unwrap();
     j.insert("10.0.0.0/8".parse().unwrap(), PathRef { off: 0, len: 1 })
         .unwrap();
     let blob = b"ab";
@@ -1148,8 +1189,11 @@ fn a_journal_that_crosses_the_segment_boundary_reopens_intact() {
     let tree = [44u8; 16];
     let big = vec![7u8; 64 * 1024 * 1024];
     {
-        let mut j: Journal<PathRef> =
-            Journal::open_with_payload(&dir, tree, PayloadSection::payload(SECTION_ID)).unwrap();
+        let mut j: Journal<PathRef> = Journal::options(&dir)
+            .start(tree)
+            .payload(PayloadSection::payload(SECTION_ID))
+            .open()
+            .unwrap();
         j.insert_with_blob("10.0.0.0/8".parse().unwrap(), &big, |off| PathRef {
             off: off as u32,
             len: big.len() as u32,
@@ -1170,8 +1214,11 @@ fn a_journal_that_crosses_the_segment_boundary_reopens_intact() {
             "the first segment must be closed, not reused"
         );
     }
-    let j: Journal<PathRef> =
-        Journal::open_with_payload(&dir, tree, PayloadSection::payload(SECTION_ID)).unwrap();
+    let j: Journal<PathRef> = Journal::options(&dir)
+        .start(tree)
+        .payload(PayloadSection::payload(SECTION_ID))
+        .open()
+        .unwrap();
     assert_eq!(j.len(), 2, "both records survive a rotation and a restart");
     std::fs::remove_dir_all(&dir).ok();
 }
