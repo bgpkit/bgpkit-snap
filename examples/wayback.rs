@@ -1,10 +1,9 @@
 //! A downstream tool over a `.snap` object: the wayback ROA archive.
 //!
-//! This is the pattern a project with its own value type follows. `bgpkit-snap`'s own
-//! CLI reads and writes integer-valued objects and inspects any container, but a
-//! `bgpkit.roa-set:v1` value only means something to the program that declares it, so
-//! the domain binary lives with the type. Here it is 120 lines, and it opens the real
-//! dump:
+//! This is the pattern a project with its own value type follows. `bgpkit-snap`'s CLI
+//! inspects, verifies, builds and folds objects and answers no domain queries, because a
+//! `bgpkit.roa-set:v1` value only means something to the program that declares it. The
+//! domain binary lives with the type: here it is 120 lines, and it opens the real dump.
 //!
 //! ```sh
 //! cargo run --example wayback -- <roas.snap> 8.8.8.8

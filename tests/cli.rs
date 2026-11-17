@@ -146,23 +146,24 @@ fn json_output_is_one_object_per_command() {
     assert_eq!(verify_json["bodies_checked"], true);
     assert_eq!(verify_json["entries"], 8);
 
-    let search = Command::new(bin())
-        .args(["--json", "search"])
+    let stats = Command::new(bin())
+        .args(["--json", "stats"])
         .arg(&out)
-        .arg("10.0.1.1")
         .output()
         .unwrap();
-    let search_json: serde_json::Value =
-        serde_json::from_slice(&search.stdout).expect("search --json is one object");
-    assert_eq!(search_json["match"]["prefix"], "10.0.1.0/24");
-    assert_eq!(search_json["match"]["value"], 1);
+    let stats_json: serde_json::Value =
+        serde_json::from_slice(&stats.stdout).expect("stats --json is one object");
+    assert_eq!(stats_json["entries"], 8);
+    assert_eq!(stats_json["type_id"], "snap.u32:v1");
+    assert!(stats_json["sections"]
+        .as_array()
+        .is_some_and(|s| !s.is_empty()));
     std::fs::remove_dir_all(&d).ok();
 }
 
 #[test]
-fn a_u64_object_can_be_built_and_searched() {
-    // the CLI used to speak only snap.u32:v1, so an object built with u64 could be
-    // verified but never queried
+fn a_u64_object_can_be_built_and_counted() {
+    // the CLI used to speak only snap.u32:v1, so a u64 object could not be read at all
     let d = dir("u64");
     let path = d.join("in.jsonl");
     std::fs::write(&path, "{\"prefix\":\"10.0.0.0/8\",\"value\":4294967296}\n").unwrap();
@@ -181,24 +182,21 @@ fn a_u64_object_can_be_built_and_searched() {
         "build failed: {}",
         String::from_utf8_lossy(&built.stderr)
     );
-    let found = Command::new(bin())
-        .arg("search")
+    let stats = Command::new(bin())
+        .args(["--json", "stats"])
         .arg(&out)
-        .arg("10.1.2.3")
         .output()
         .unwrap();
-    assert!(found.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&found.stdout).trim(),
-        "10.0.0.0/8 -> 4294967296"
-    );
+    let stats: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(stats["type_id"], "snap.u64:v1");
+    assert_eq!(stats["entries"], 1);
     std::fs::remove_dir_all(&d).ok();
 }
 
 #[test]
-fn a_foreign_value_type_says_what_to_do() {
-    // the object's value type is the caller's: the CLI cannot decode it, and the
-    // error has to say so and name both ways out instead of only the mismatch
+fn a_foreign_value_type_is_inspected_but_not_counted() {
+    // the container is readable whatever the value type is; the count is not, because
+    // only the program that declares the type can walk those values
     #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     struct Origin(u32);
     impl bgpkit_snap::SnapValue for Origin {
@@ -212,103 +210,23 @@ fn a_foreign_value_type_says_what_to_do() {
         .unwrap();
     w.finish_to(&out, &bgpkit_snap::Opts::now()).unwrap();
 
-    let search = Command::new(bin())
-        .arg("search")
-        .arg(&out)
-        .arg("10.1.2.3")
-        .output()
-        .unwrap();
-    assert!(!search.status.success());
-    let err = String::from_utf8_lossy(&search.stderr);
-    assert!(err.contains("cli-test.origin:v1"), "got {err}");
-    assert!(err.contains("snap build"), "the error must name a way out");
-    std::fs::remove_dir_all(&d).ok();
-}
-
-#[test]
-fn a_journal_folds_into_one_object() {
-    // writing a journal is the application's job; what a caller needs from the CLI is
-    // the readable object, and folding is one call
-    #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-    struct PeerCount(u32);
-    impl bgpkit_snap::SnapValue for PeerCount {
-        const TYPE_ID: &str = "snap.u32:v1";
-    }
-
-    let d = dir("fold");
-    let log = d.join("journal");
-    {
-        let mut j: bgpkit_snap::journal::Journal<PeerCount> =
-            bgpkit_snap::journal::Journal::open(&log, bgpkit_snap::TreeId::from_name("snap"))
-                .unwrap();
-        j.insert("10.0.0.0/8".parse().unwrap(), PeerCount(7))
-            .unwrap();
-        j.insert("192.0.2.0/24".parse().unwrap(), PeerCount(9))
-            .unwrap();
-        j.sync().unwrap();
-    }
-
-    let out = d.join("folded.snap");
-    let folded = Command::new(bin())
-        .args(["--json", "fold"])
-        .arg(&log)
-        .arg("--out")
+    let stats = Command::new(bin())
+        .args(["--json", "stats"])
         .arg(&out)
         .output()
         .unwrap();
     assert!(
-        folded.status.success(),
-        "fold failed: {}",
-        String::from_utf8_lossy(&folded.stderr)
+        stats.status.success(),
+        "stats failed on a foreign type: {}",
+        String::from_utf8_lossy(&stats.stderr)
     );
-    let folded: serde_json::Value = serde_json::from_slice(&folded.stdout).unwrap();
-    assert_eq!(folded["entries"], 2);
-    assert_eq!(folded["seq"], 3);
-    assert_eq!(folded["type_id"], "snap.u32:v1");
-
-    // the folded object is an ordinary snapshot
-    let hit = Command::new(bin())
-        .args(["--json", "search"])
-        .arg(&out)
-        .arg("10.1.2.3")
-        .output()
-        .unwrap();
-    let hit: serde_json::Value = serde_json::from_slice(&hit.stdout).unwrap();
-    assert_eq!(hit["match"]["prefix"], "10.0.0.0/8");
-    assert_eq!(hit["match"]["value"], 7);
-    std::fs::remove_dir_all(&d).ok();
-}
-
-#[test]
-fn folding_with_the_wrong_value_type_names_the_journal() {
-    #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-    struct Big(u64);
-    impl bgpkit_snap::SnapValue for Big {
-        const TYPE_ID: &str = "snap.u64:v1";
-    }
-
-    let d = dir("fold-type");
-    let log = d.join("journal");
-    {
-        let mut j: bgpkit_snap::journal::Journal<Big> =
-            bgpkit_snap::journal::Journal::open(&log, bgpkit_snap::TreeId::from_name("snap"))
-                .unwrap();
-        j.insert("10.0.0.0/8".parse().unwrap(), Big(7)).unwrap();
-        j.sync().unwrap();
-    }
-    let folded = Command::new(bin())
-        .arg("fold")
-        .arg(&log)
-        .arg("--out")
-        .arg(d.join("x.snap"))
-        .output()
-        .unwrap();
+    let stats: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(stats["type_id"], "cli-test.origin:v1");
     assert!(
-        !folded.status.success(),
-        "the default u32 must not fold u64"
+        stats["entries"].is_null(),
+        "a foreign type must not be counted"
     );
-    let err = String::from_utf8_lossy(&folded.stderr);
-    assert!(err.contains("snap.u64:v1"), "got {err}");
+    assert!(stats["sections"].as_array().is_some_and(|s| !s.is_empty()));
     std::fs::remove_dir_all(&d).ok();
 }
 

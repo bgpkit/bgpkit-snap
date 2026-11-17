@@ -183,11 +183,13 @@ Library and tooling
   verify an object whose type belongs to another binary.
 - `Writer::finish` refuses headers a reader would reject; a value that is missing
   or too wide is refused by `bgpkit-snap build` instead of becoming zero.
-- `bgpkit-snap` CLI: build, info, verify, search; `info` still reads 192 bytes. Every
-  command takes `--json` and answers in one object, `build` and `search` handle
-  `snap.u64:v1` as well as `snap.u32:v1` (`--value u64`), and `search` on an object
-  whose value type belongs to another program names that type and both ways out
-  instead of only reporting a mismatch.
+- `bgpkit-snap` CLI: `build`, `info`, `stats`, `verify`, `fold`. It is a container tool
+  and answers no domain queries: `info` reads the header, `stats` adds the section table
+  and the prefix count when the value type is one it decodes, `verify` checks the
+  container (and the bodies for an integer type), `build` and `fold` produce objects.
+  A query needs the value's meaning, which belongs to the program that declares the
+  type, so `search` was removed rather than taught to refuse other people's objects.
+  Every command takes `--json` and answers in one object.
 - the CLI binary is `bgpkit-snap`, not `snap`: Ubuntu's package manager owns that name,
   so `cargo install` would have put a second `snap` on the path. Every command keeps its
   flags, and the error prefix changed with it.

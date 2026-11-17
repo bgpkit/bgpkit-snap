@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use bgpkit_snap::journal::Journal;
-use bgpkit_snap::{header::HEADER_LEN, Header, Opts, Snapshot, TreeId, Writer};
+use bgpkit_snap::{
+    header::{ENTRY_LEN, HEADER_LEN},
+    Header, Opts, Snapshot, TreeId, Writer,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use ipnet::IpNet;
 
@@ -48,11 +51,6 @@ impl ValueType {
             _ => None,
         }
     }
-
-    /// What the CLI can do, for an error that has to name it.
-    fn supported() -> &'static str {
-        "snap.u8:v1, snap.u16:v1, snap.u32:v1, snap.u64:v1 and snap.u128:v1"
-    }
 }
 
 #[derive(Subcommand)]
@@ -76,8 +74,8 @@ enum Cmd {
     Info { file: String },
     /// Verify the container, and the bodies when the value type is an integer
     Verify { file: String },
-    /// Longest-prefix match for an address or prefix, in an integer-valued object
-    Search { file: String, query: String },
+    /// What the object holds: sections, sizes, and counts when the value type is ours
+    Stats { file: String },
     /// Fold a journal directory into one snapshot object
     Fold {
         /// The journal directory
@@ -127,7 +125,7 @@ fn main() {
             Ok(()) => {}
             Err(e) => fail(&format!("{e}")),
         },
-        Cmd::Search { file, query } => match search(&file, &query, json) {
+        Cmd::Stats { file } => match stats(&file, json) {
             Ok(()) => {}
             Err(e) => fail(&format!("{e}")),
         },
@@ -329,71 +327,82 @@ fn verify(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn search(file: &str, query: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let header = file_header(file)?;
-    let Some(ty) = ValueType::from_type_id(&header.type_id_str()) else {
-        // say what the object holds and both ways out: a caller who meant to query
-        // their own type needs the program that declares it, not a hex dump
-        return Err(std::io::Error::other(format!(
-            "this object holds {}, which `snap search` cannot decode; it decodes {}. \
-             Query it from a program that defines that SnapValue type (`Snapshot::open` \
-             in the developer guide), or rebuild it with `snap build --value u32`",
-            header.type_id_str(),
-            ValueType::supported()
-        ))
-        .into());
-    };
-    let query_ip: Option<std::net::IpAddr> = query.parse().ok();
-    let query_net: Option<IpNet> = query.parse().ok();
-    if query_ip.is_none() && query_net.is_none() {
-        return Err(std::io::Error::other(format!("{query} is not an address or a prefix")).into());
+/// What the object holds. Everything here is readable without knowing the value type:
+/// the header, and the section table. Counts need the type, so they appear only when
+/// this binary decodes it.
+fn stats(file: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = std::fs::read(file)?;
+    let header = bgpkit_snap::verify_bytes(&raw)?;
+    let mut sections = Vec::with_capacity(header.section_count as usize);
+    for i in 0..header.section_count as usize {
+        let at = HEADER_LEN + i * ENTRY_LEN;
+        let entry = bgpkit_snap::header::Entry::parse(&raw[at..at + ENTRY_LEN])?;
+        sections.push(entry);
     }
-    // the owned view decodes the one value a lookup lands on, so both widths come back
-    // as a plain u128 here without a per-width branch in the printing code
-    macro_rules! find {
-        ($t:ty) => {{
-            let snap: Snapshot<$t> = Snapshot::open(file)?;
-            let owned = snap.owned();
-            let hit = match (query_net, query_ip) {
-                (Some(net), _) => owned.lpm(net)?,
-                (None, Some(addr)) => owned.search(addr)?,
-                (None, None) => unreachable!("checked above"),
-            };
-            hit.map(|(prefix, value)| (prefix, value as u128))
-        }};
-    }
-    let hit = match ty {
-        ValueType::U8 => find!(u8),
-        ValueType::U16 => find!(u16),
-        ValueType::U32 => find!(u32),
-        ValueType::U64 => find!(u64),
-        ValueType::U128 => find!(u128),
+    let typed = ValueType::from_type_id(&header.type_id_str());
+    let counts = match typed {
+        Some(ValueType::U8) => Some(Snapshot::<u8>::from_bytes(&raw)?.len()),
+        Some(ValueType::U16) => Some(Snapshot::<u16>::from_bytes(&raw)?.len()),
+        Some(ValueType::U32) => Some(Snapshot::<u32>::from_bytes(&raw)?.len()),
+        Some(ValueType::U64) => Some(Snapshot::<u64>::from_bytes(&raw)?.len()),
+        Some(ValueType::U128) => Some(Snapshot::<u128>::from_bytes(&raw)?.len()),
+        None => None,
     };
-    match hit {
-        Some((prefix, value)) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "query": query,
-                        "type_id": header.type_id_str(),
-                        "match": {"prefix": prefix.to_string(), "value": value},
-                    })
-                );
-            } else {
-                println!("{prefix} -> {value}");
-            }
-        }
-        None => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"query": query, "type_id": header.type_id_str(), "match": null})
-                );
-            } else {
-                println!("no match");
-            }
-        }
+    let total: u64 = sections.iter().map(|s| s.len).sum();
+    if json {
+        let table: Vec<_> = sections
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "kind": bgpkit_snap::header::hex4(&s.kind),
+                    "required": s.required,
+                    "bytes": s.len,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "file": file,
+                "type_id": header.type_id_str(),
+                "content_id": header.content_id_hex(),
+                "file_len": header.file_len,
+                "file_len_on_disk": raw.len(),
+                "created_at": stamp(header.created_at),
+                "window": header.window().map(|(a, b)| serde_json::json!([a, b])),
+                "sections": table,
+                "section_bytes": total,
+                "entries": counts,
+            })
+        );
+        return Ok(());
+    }
+    println!("file       {file}");
+    println!("type_id    {}", header.type_id_str());
+    println!("content_id {}", header.content_id_hex());
+    println!("file_len   {}", header.file_len);
+    println!("created_at {}", stamp(header.created_at));
+    match header.window() {
+        Some((a, b)) => println!("window     {}..{}", stamp(a), stamp(b)),
+        None => println!("window     none"),
+    }
+    println!("sections   {}", sections.len());
+    for s in &sections {
+        println!(
+            "  id {:>3}  kind {}{}  {:>12} bytes",
+            s.id,
+            bgpkit_snap::header::hex4(&s.kind),
+            if s.required { " required" } else { "         " },
+            s.len
+        );
+    }
+    match counts {
+        Some(n) => println!("entries    {n}"),
+        None => println!(
+            "entries    not counted (type {} is not one this binary decodes)",
+            header.type_id_str()
+        ),
     }
     Ok(())
 }
@@ -485,15 +494,6 @@ fn type_id_of(ty: ValueType) -> &'static str {
         ValueType::U64 => "snap.u64:v1",
         ValueType::U128 => "snap.u128:v1",
     }
-}
-
-fn file_header(file: &str) -> Result<Header, Box<dyn std::error::Error>> {
-    let mut raw = [0u8; HEADER_LEN];
-    {
-        use std::io::Read;
-        std::fs::File::open(file)?.read_exact(&mut raw)?;
-    }
-    Ok(Header::parse(&raw)?)
 }
 
 /// One input line. A value that is missing, not an unsigned integer, or wider

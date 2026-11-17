@@ -119,21 +119,22 @@ package manager). It builds and searches integer-valued objects (`snap.u8:v1` th
 bgpkit-snap build prefixes.jsonl --out example.snap --created-at 1794614400
 bgpkit-snap build counters.jsonl --out counters.snap --value u64
 bgpkit-snap info example.snap      # reads 192 bytes only
+bgpkit-snap stats example.snap     # sections, sizes, prefix count
 bgpkit-snap verify example.snap    # container, and bodies for those types
-bgpkit-snap search example.snap 10.1.2.3
 ```
 
 Every command takes `--json` and prints one object instead of text, so a script or an
 agent can read the answer without parsing prose:
 
 ```sh
-bgpkit-snap --json search example.snap 10.1.2.3
-{"match":{"prefix":"10.1.2.0/24","value":1},"query":"10.1.2.3","type_id":"snap.u32:v1"}
+bgpkit-snap --json stats example.snap | jq '{type_id, entries}'
 ```
 
-An object whose value type is a caller's own `SnapValue` opens, verifies its container
-and reports its type here; `search` says so and names both ways out, because decoding
-that value needs the program that defines it.
+The CLI is a container tool: it inspects, verifies, builds and folds, and it does not
+answer domain queries. `info`, `stats` and `verify` work on any object; the prefix count in
+`stats` appears only when the value type is one this binary decodes, because only the
+program that declares a type can walk its values. Querying a `bgpkit.roa-set:v1` object is
+that program's job (`examples/wayback.rs`).
 
 ## The format
 

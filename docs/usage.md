@@ -160,76 +160,77 @@ is not, because rewriting it would hide a gap.
 
 ## CLI
 
+The binary is `bgpkit-snap` (not `snap`: Ubuntu owns that name). It is a **container**
+tool: it inspects, verifies, builds and folds objects, and it deliberately does not answer
+domain queries, because a query depends on what the value means and only the program that
+declares the type knows that.
+
 ```
 bgpkit-snap build <in.jsonl> --out <file> [--value u8|u16|u32|u64|u128] [--created-at T] [--window A,B]
 bgpkit-snap info <file>
+bgpkit-snap stats <file>
 bgpkit-snap verify <file>
-bgpkit-snap search <file> <address-or-prefix>
 bgpkit-snap fold <journal-dir> --out <file> [--tree NAME] [--value-type u8|u16|u32|u64|u128]
 ```
 
-`build` reads one JSON object per line, `{"prefix": "10.0.0.0/8", "value": 7}`. A value
-that is missing, not an unsigned integer, or too wide for the chosen type is an error
-with the line number; it never becomes zero.
+`build` and `fold` produce objects; `info`, `stats` and `verify` read them.
 
-`info` reads the 192-byte header and nothing else. `verify` checks the container and,
-for an integer value type, every body. `search` takes an address or a prefix and prints
-the longest match.
+- `info` reads the 192-byte header and nothing else: type id, content id, length,
+  sections, creation time, coverage window, stream coordinates.
+- `stats` adds the section table (id, kind, required, bytes) and, when the object's value
+  type is one this binary decodes, the number of prefixes.
+- `verify` checks the container (header, layout, table, content id); for an integer value
+  type it also checks every body.
+- `fold` turns a journal directory into one object, atomically and read-only. Writing a
+  journal is the application's job, so there is no `insert` here. A live writer makes it
+  fail with `another writer holds this journal`: fold the `current.snap` it publishes, or
+  fold after it stops.
 
-`fold` is the one journal operation the CLI has, and it is read-only: it opens the
-journal, builds the object its records describe, and writes it atomically to `--out`.
-Writing a journal is the application's job, so there is no `insert` here; what a caller
-needs afterwards is one file it can ship and query.
+Everything works on an object whose value type belongs to another program. `info` and
+`verify` never need the type; `stats` reports the section table and says the count is not
+available rather than guessing it.
 
 ```sh
-# a program appended to ./tbl; turn it into something everyone can read
-bgpkit-snap --json fold ./tbl --out tbl.snap
-bgpkit-snap --json search tbl.snap 8.8.8.8
+bgpkit-snap stats /data/wayback/roas.snap
+# file       /data/wayback/roas.snap
+# type_id    bgpkit.roa-set:v1
+# file_len   219462112
+# window     2015-03-10T00:00:00Z..2026-11-12T23:59:59Z
+# sections   2
+#   id   2  kind 56340000              156012248 bytes
+#   id   3  kind 56360000               63449536 bytes
+# entries    not counted (type bgpkit.roa-set:v1 is not one this binary decodes)
 ```
 
-A journal is single-writer, so `fold` fails with `another writer holds this journal`
-while the application has it open. Either fold the `current.snap` it publishes (the last
-checkpoint), or fold after the writer stops.
+Answering "which ROA covers 8.8.8.8" is the wayback program's job, because it owns the
+value type. `examples/wayback.rs` is that program in 120 lines; every project with its own
+value type writes the same thing.
 
-Every command takes `--json` and prints exactly one JSON object, whatever the outcome:
+### JSON
+
+Every command takes `--json` and prints exactly one JSON object:
 
 | command | fields |
 | --- | --- |
 | `build --json` | `out`, `entries`, `bytes` |
 | `info --json` | `type_id`, `content_id`, `file_len`, `file_len_on_disk`, `consistent`, `sections`, `created_at`, `created_at_unix`, `window`, `stream` |
+| `stats --json` | `file`, `type_id`, `content_id`, `file_len`, `file_len_on_disk`, `created_at`, `window`, `sections` (`id`, `kind`, `required`, `bytes`), `section_bytes`, `entries` (null when the type is not ours) |
 | `verify --json` | `ok`, `type_id`, `sections`, `bodies_checked`, `entries` |
-| `search --json` | `query`, `type_id`, `match` (`{prefix, value}` or `null`) |
 | `fold --json` | `journal`, `out`, `entries`, `seq`, `type_id`, `bytes` |
 
-Exit codes: `0` success, `1` anything else, with the reason on stderr prefixed `snap: `.
-So a caller checks the exit code and, on `--json`, reads stdout as an object.
-
-An object written by another program for its own value type can be `info`'d and
-`verify`'d, and `search` says which type it holds and what to do about it. Decoding that
-value needs the program that declares the type, because the bytes only mean something to
-the `rkyv` layout that wrote them.
-
-That is not a gap to work around: it is the shape of the thing. A project with its own
-value type ships a small binary next to it. `examples/wayback.rs` is that binary for the
-wayback ROA archive, in 120 lines, and it opens the real 219 MB dump:
-
-```sh
-cargo run --example wayback -- roas.snap 8.8.8.8
-cargo run --example wayback -- roas.snap 8.8.8.8 --date 2023-06-24
-```
-
+Exit codes: `0` success, `1` anything else, with the reason on stderr prefixed
+`bgpkit-snap: `. A caller checks the exit code and reads stdout as an object.
 
 ### For agents
 
-The CLI is meant to be driven by a program: one JSON object per invocation, stable
-field names, exit code `0`/`1`, and no interactive prompts. Some recipes:
+One JSON object per invocation, stable field names, exit code `0`/`1`, no prompts:
 
 ```sh
-# does this file hold what I think, and is it intact?
-bgpkit-snap --json verify big.snap | jq -e '.ok and .bodies_checked'
+# is this file what it claims, and is it intact?
+bgpkit-snap --json verify big.snap | jq -e '.ok'
 
-# which prefix covers this address, and what is its value?
-bgpkit-snap --json search big.snap 8.8.8.8 | jq -r '.match.prefix, .match.value'
+# what is in it, and how big is each part?
+bgpkit-snap --json stats big.snap | jq '{type_id, entries, sections: [.sections[] | {id, kind, bytes}]}'
 
 # a journal your program writes, folded into one object for everyone else
 bgpkit-snap --json fold ./tbl --out tbl.snap | jq '.entries, .seq, .bytes'
