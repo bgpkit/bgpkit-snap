@@ -19,7 +19,7 @@ jobs:
       # matching the code fails the build
       - run: cargo test --features cli,derive
       - name: Build every example
-        run: cargo build --examples --features cli
+        run: cargo build --examples --features cli,derive
       - name: Build the out-of-crate consumer
         run: cargo test --manifest-path tests/downstream/Cargo.toml
 

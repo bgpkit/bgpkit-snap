@@ -16,6 +16,11 @@ members = ["derive"]
 # the out-of-crate consumer is built with its own manifest, on purpose
 exclude = ["tests/downstream"]
 
+# the live example shows #[snap_value], so it needs the macro
+[[example]]
+name = "live"
+required-features = ["derive"]
+
 [features]
 default = []
 # The `snap` CLI. Library users never pay for clap.
