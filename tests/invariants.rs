@@ -29,6 +29,26 @@ fn build(extras: &[ExtraSection<'_>]) -> Vec<u8> {
 }
 
 #[test]
+fn every_object_carries_both_family_sections() {
+    // the shape of an object must not depend on its contents: a client that walks the
+    // tries should never have to ask which families happen to be in this file
+    for (name, prefixes) in [
+        ("v4 only", vec!["10.0.0.0/8"]),
+        ("v6 only", vec!["2001:db8::/32"]),
+        ("empty", vec![]),
+    ] {
+        let mut w: Writer<N> = Writer::new();
+        for prefix in &prefixes {
+            w.insert(prefix.parse().unwrap(), N(1)).expect("canonical");
+        }
+        let bytes = w.finish(&Opts::now()).expect("build");
+        let snap: Snapshot<N> = Snapshot::from_bytes(&bytes).expect("open");
+        assert!(snap.v4().is_some(), "{name}: the IPv4 section is missing");
+        assert!(snap.v6().is_some(), "{name}: the IPv6 section is missing");
+    }
+}
+
+#[test]
 fn header_is_self_sufficient() {
     let bytes = build(&[]);
     let h = Header::parse(&bytes[..192]).expect("header");
@@ -424,8 +444,8 @@ fn a_journal_checkpoint_carries_its_arena_and_nothing_else() {
     let raw = std::fs::read(&object).unwrap();
     let header = Header::parse(&raw[..192]).unwrap();
     assert_eq!(
-        header.section_count, 3,
-        "the IPv4 trie, the arena, and the records' counts; nothing else"
+        header.section_count, 4,
+        "both family sections, the records' counts, and the arena; nothing else"
     );
     let snap: Snapshot<u32> = Snapshot::from_bytes_with(&raw, &{
         struct Knows;

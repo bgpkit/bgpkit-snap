@@ -132,7 +132,9 @@ fn a_merge_is_its_inputs_contents_not_their_order() {
         Snapshot::merge_last_wins(&empty, &opts()).expect("an empty merge is an empty object");
     let merged: Snapshot<V> = Snapshot::from_bytes(&bytes).unwrap();
     assert_eq!(merged.len(), 0);
-    assert_eq!(merged.address_counts().v4, bgpkit_snap::Count::NoEntries);
+    // an empty merge still carries both family sections, so the family is present and
+    // covers nothing rather than absent
+    assert_eq!(merged.address_counts().v4, bgpkit_snap::Count::Exact(0));
 }
 
 #[test]

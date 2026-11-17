@@ -189,6 +189,10 @@ Library and tooling
   container (and the bodies for an integer type), `build` and `fold` produce objects.
   The two do not overlap: a header claim (content id, creation time, coverage window) is
   `info`'s, and what the body holds is `stats`'.
+- every object carries both family sections, even when a family holds nothing (an empty
+  archive is 32 bytes), so a client never has to ask which families a file happens to
+  contain. A reader still accepts a missing family: objects written before this rule
+  exist, and there an absent family is not an empty one.
 - the writer records the entry counts in the object (section id 4, kind `CNT`, 32 bytes,
   optional for readers), so `stats` reports how many prefixes an object holds without
   knowing its value type. `verify` compares the recorded counts with the decoded ones

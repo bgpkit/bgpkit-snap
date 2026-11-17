@@ -482,28 +482,28 @@ impl<T: SnapValue> Writer<T> {
 
         // sections in ascending id order, each starting on a 16-byte boundary
         let mut sections: Vec<(Entry, &[u8])> = Vec::new();
-        if !self.v4.is_empty() {
-            sections.push((
-                Entry {
-                    id: ID_V4,
-                    kind: KIND_V4,
-                    required: false,
-                    len: v4_bytes.len() as u64,
-                },
-                &v4_bytes,
-            ));
-        }
-        if !self.v6.is_empty() {
-            sections.push((
-                Entry {
-                    id: ID_V6,
-                    kind: KIND_V6,
-                    required: false,
-                    len: v6_bytes.len() as u64,
-                },
-                &v6_bytes,
-            ));
-        }
+        // both family sections are written even when a family holds nothing: an object
+        // whose shape depends on its contents makes every client carry the "which
+        // families are in this file" question. A reader still has to accept a missing
+        // family, because objects written before this rule exist.
+        sections.push((
+            Entry {
+                id: ID_V4,
+                kind: KIND_V4,
+                required: false,
+                len: v4_bytes.len() as u64,
+            },
+            &v4_bytes,
+        ));
+        sections.push((
+            Entry {
+                id: ID_V6,
+                kind: KIND_V6,
+                required: false,
+                len: v6_bytes.len() as u64,
+            },
+            &v6_bytes,
+        ));
         // the counts section carries no data the tries need, so it stays optional: a
         // reader that does not know it skips it, and one that does can report the entry
         // count without decoding a value

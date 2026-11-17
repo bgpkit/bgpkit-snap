@@ -109,14 +109,17 @@ fn the_prefix_trie_read_api_is_available_without_matching_on_family() {
         counts.v6,
         Count::Exact(79_228_162_514_264_337_593_543_950_336)
     );
+    // every object the writer produces carries both family sections, so an empty object
+    // reports "present, covering nothing" rather than "no such family". `NoEntries` still
+    // exists for objects written before that rule.
     let empty = Snapshot::<V>::from_bytes(&build_empty()).unwrap();
     assert_eq!(
         empty.address_counts(),
         AddressCounts {
-            v4: Count::NoEntries,
-            v6: Count::NoEntries
+            v4: Count::Exact(0),
+            v6: Count::Exact(0)
         },
-        "an absent family is not the same as a covered one"
+        "an empty family is present and covers nothing"
     );
 
     // owned values: the same queries, without naming the archived type

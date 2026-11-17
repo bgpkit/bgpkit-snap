@@ -249,6 +249,13 @@ bgpkit-snap --json fold ./tbl --out tbl.snap | jq '.entries, .seq, .bytes'
 
 ## What it does not do
 
+- One value type per object. Both tries hold the same `T`: the header records a single
+  type id, and `Snapshot<T>` is one type parameter. A profile that needs a second
+  structure with another value type puts it in its own section (id 16 and up), opens
+  those bytes itself, and the crate will not query it for you.
+- Every object carries both family sections, even when a family holds nothing, so the
+  shape of a file does not depend on its contents. A reader still tolerates a missing
+  family, because objects written before that rule exist.
 - A writer holds the whole tree in memory. A build larger than RAM is out of scope.
 - One writer per directory (enforced by a lock). Readers are unlimited and need no lock.
 - The CLI reads and writes objects whose value type is an integer (`snap.u8:v1` through

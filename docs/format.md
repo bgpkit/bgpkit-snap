@@ -178,6 +178,13 @@ A section whose kind is `V4` is at id 2 and a section whose kind is `V6` is at
 id 3. A reader rejects any other pairing rather than ignoring the section,
 because ignoring it turns a disagreement into an empty answer.
 
+A writer emits both family sections on every object, even when a family holds no
+entries: the empty archive costs 32 bytes, and an object whose shape depends on
+its contents makes every client carry the question of which families are present.
+A reader must still accept an object with one family section missing, because
+objects written before this rule exist; there, an absent family is not the same
+as an empty one.
+
 The `CNT` section is `required = false` on purpose, and it carries no data the
 tries need. A reader that does not implement id 4 skips it and loses nothing; a
 reader that does can report the entry count without knowing the value type,

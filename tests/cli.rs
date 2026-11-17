@@ -132,8 +132,9 @@ fn json_output_is_one_object_per_command() {
         serde_json::from_slice(&info.stdout).expect("info --json is one object");
     assert_eq!(info_json["type_id"], "snap.u32:v1");
     assert_eq!(info_json["consistent"], true);
-    // the input is all IPv4: one family section plus the recorded counts
-    assert_eq!(info_json["sections"], 2);
+    // the input is all IPv4, and every object carries both family sections plus the
+    // recorded counts
+    assert_eq!(info_json["sections"], 3);
 
     let verify = Command::new(bin())
         .args(["--json", "verify"])
