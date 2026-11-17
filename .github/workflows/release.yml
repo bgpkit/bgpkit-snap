@@ -51,11 +51,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
-                   --commit "$GITHUB_SHA" --limit 20 --json status,conclusion)
-          python3 - "$runs" <<'PY'
+          # ask for runs on this exact sha, then keep the ones from the ci workflow: this
+          # job's own run is on the same sha and must not count as evidence
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&per_page=50" \
+            --jq '[.workflow_runs[] | select(.name == "ci") | {status, conclusion}]' > /tmp/ci-runs.json
+          python3 - <<'PY'
           import json, sys
-          runs = json.loads(sys.argv[1])
+          runs = json.load(open("/tmp/ci-runs.json"))
           if not runs:
               sys.exit("no ci run for this commit: push it to main and wait for ci before tagging")
           bad = [r for r in runs if r.get("status") != "completed" or r.get("conclusion") != "success"]
